@@ -196,14 +196,14 @@ done
 total=$(( row - 1 ))
 echo ""
 printf "  ${GREEN}★ LIVE${NC}    ${CYAN}⊙ OPEN${NC}    ${RED}✗ FAIL${NC}    ${DIM}  dead${NC}\n"
-echo -e "  ${DIM}serial-discover${NC}           fresh probe"
-echo -e "  ${DIM}serial-discover --gen-udev${NC}  stable port names across reboots"
+echo -e "  use ${DIM}serial-discover${NC}            to force a fresh probe"
+echo -e "  use ${DIM}serial-discover --gen-udev${NC}  for stable port names across reboots"
 echo ""
 
 trap 'printf "\n"; exit 0' INT
 
 while true; do
-    read -rp "Port [1-${total} or #-p#]: " choice || { printf "\n"; exit 0; }
+    read -rp "Port [1-${total} or P#]: " choice || { printf "\n"; exit 0; }
     # Accept N-pM (e.g. 2-p1) as shorthand for the Chip-P column value
     if [[ "$choice" =~ ^[0-9]+-p[0-9]+$ ]]; then
         choice="${ROW_BY_CHIPPORT[$choice]:-}"
