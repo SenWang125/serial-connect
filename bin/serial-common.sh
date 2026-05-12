@@ -12,17 +12,9 @@ DIM=$'\033[2m'; RED=$'\033[31m'; NC=$'\033[0m'
 _COMMON_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BOARD_CFG="${BOARD_CFG:-$_COMMON_DIR/serial-boards.conf}"
 
-# ── Built-in defaults ─────────────────────────────────────────────────────────
-# These work without any conf file. serial-boards.conf adds/overrides on top.
-declare -A CHIP_NAMES=(
-  [0403:6001]=FT232RL  [0403:6010]=FT2232H   [0403:6011]=FT4232H
-  [0403:6014]=FT232H   [0403:6015]=FT231X    [0451:bef3]=XDS110
-  [0451:bef4]=XDS110   [2e8a:000c]=RPiProbe  [10c4:ea60]=CP210x
-  [10c4:ea70]=CP2105   [10c4:ea71]=CP2108    [067b:2303]=PL2303
-  [1a86:7523]=CH340    [1a86:55d4]=CH343P
-)
-declare -A CHIP_BAUD=() CFG_LABEL CFG_BAUD
-PROBE_BAUDS=(115200 9600 19200 38400 57600 230400 460800 921600 1500000)
+# All defaults live in serial-boards.conf. Structures initialised empty here.
+declare -A CHIP_NAMES=() CHIP_BAUD=() CFG_LABEL CFG_BAUD
+declare -a PROBE_BAUDS=()
 PROBE_PARALLEL=0 PROBE_READ_MS=100 PROBE_DRAIN_MS=10
 
 # ── parse_baud ─────────────────────────────────────────────────────────────────
