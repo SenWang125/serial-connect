@@ -153,7 +153,7 @@ rule_w=$(( 2 + 1 + 5 + dev_w + 2 + 6 + 4 + board_w + 2 + chip_w + 2 + 5 + 13 ))
 
 # ── Menu ───────────────────────────────────────────────────────────────────────
 echo -e "${BOLD}Select serial port:${NC}\n"
-printf "  ${BOLD}%-1s  %4s  %-${dev_w}s  %-6s    %-${board_w}s  %-${chip_w}s  %-3s  %s${NC}\n" \
+printf "  ${BOLD}%-1s  %4s  %-${dev_w}s  %-6s    %-${board_w}s  %-${chip_w}s  %-5s  %s${NC}\n" \
     "·" "#" "Port" "Status" "Board" "Chip" "P#" "Baud"
 printf '─%.0s' $(seq 1 "$rule_w"); echo
 
@@ -196,9 +196,9 @@ done
 total=$(( row - 1 ))
 echo ""
 printf "  ${GREEN}★ LIVE${NC}    ${CYAN}⊙ OPEN${NC}    ${RED}✗ FAIL${NC}    ${DIM}  dead${NC}\n"
-echo -e "  use ${DIM}serial-discover${NC}            to force a fresh probe"
-echo -e "  use ${DIM}serial-discover --gen-udev${NC}   for stable port names across reboots"
-echo -e "  use ${DIM}serial-discover --tmp-udev${NC}   for stable port names this session only"
+echo -e "  use ${DIM}serial-discover${NC}             to force a fresh probe"
+echo -e "  use ${DIM}serial-discover --gen-udev${NC}  for stable port names across reboots"
+echo -e "  use ${DIM}serial-discover --tmp-udev${NC}  for stable port names current session"
 echo ""
 
 trap 'printf "\n"; exit 0' INT
