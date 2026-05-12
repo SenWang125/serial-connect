@@ -12,6 +12,10 @@ DIM=$'\033[2m'; RED=$'\033[31m'; NC=$'\033[0m'
 _COMMON_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 BOARD_CFG="${BOARD_CFG:-$_COMMON_DIR/serial-boards.conf}"
 
+# Shared probe cache — both serial-discover and serial-connect read/write these.
+SIG_FILE="/tmp/serial-connect.sig"
+CACHE_FILE="/tmp/serial-connect.cache"
+
 # All defaults live in serial-boards.conf. Structures initialised empty here.
 declare -A CHIP_NAMES=() CHIP_BAUD=() CFG_LABEL CFG_BAUD
 declare -a PROBE_BAUDS=()
@@ -168,6 +172,31 @@ probe_tty() {
     else id="${captured:0:30}"
     fi
     printf 'LIVE|%s|%s\n' "$detected" "$id"
+}
+
+# ── cache helpers ─────────────────────────────────────────────────────────────
+# Shared by serial-discover and serial-connect so running either one updates
+# the cache the other reads.
+save_cache() {
+    local probe_dir="$1"
+    local sig=""
+    for i in "${!DEVS[@]}"; do sig+="${VIDS[$i]}:${PIDS[$i]}:${SERS[$i]}"$'\n'; done
+    printf '%s' "$(printf '%s' "$sig" | sort -u)" > "$SIG_FILE"
+    : > "$CACHE_FILE"
+    for i in "${!DEVS[@]}"; do
+        local key="${VIDS[$i]}:${PIDS[$i]}:${SERS[$i]}:${IFNS[$i]}"
+        local result; result=$(cat "$probe_dir/$(basename "${DEVS[$i]}")" 2>/dev/null || echo "FAIL|")
+        echo "${key}|${result}" >> "$CACHE_FILE"
+    done
+}
+
+load_cache() {
+    local probe_dir="$1"
+    for i in "${!DEVS[@]}"; do
+        local key="${VIDS[$i]}:${PIDS[$i]}:${SERS[$i]}:${IFNS[$i]}"
+        local cached; cached=$(grep "^${key}|" "$CACHE_FILE" 2>/dev/null | head -1 | cut -d'|' -f2-)
+        echo "${cached:-DEAD|}" > "$probe_dir/$(basename "${DEVS[$i]}")"
+    done
 }
 
 # ── run_probes ─────────────────────────────────────────────────────────────────

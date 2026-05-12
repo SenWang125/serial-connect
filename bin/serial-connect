@@ -9,8 +9,6 @@
 source "$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)/serial-common.sh"
 
 SERIAL_TERM="${SERIAL_TERM:-tio}"
-SIG_FILE="/tmp/serial-connect.sig"
-CACHE_FILE="/tmp/serial-connect.cache"
 
 # ── baud_valid / baud_prompt ───────────────────────────────────────────────────
 baud_valid() {
@@ -66,23 +64,6 @@ launch() {
     esac
 }
 
-# ── Cache helpers ──────────────────────────────────────────────────────────────
-save_cache() {
-    local probe_dir="$1"; : > "$CACHE_FILE"
-    for i in "${!DEVS[@]}"; do
-        local key="${VIDS[$i]}:${PIDS[$i]}:${SERS[$i]}:${IFNS[$i]}"
-        local result; result=$(cat "$probe_dir/$(basename "${DEVS[$i]}")" 2>/dev/null || echo "FAIL|")
-        echo "${key}|${result}" >> "$CACHE_FILE"
-    done
-}
-load_cache() {
-    local probe_dir="$1"
-    for i in "${!DEVS[@]}"; do
-        local key="${VIDS[$i]}:${PIDS[$i]}:${SERS[$i]}:${IFNS[$i]}"
-        local cached; cached=$(grep "^${key}|" "$CACHE_FILE" 2>/dev/null | head -1 | cut -d'|' -f2-)
-        echo "${cached:-DEAD|}" > "$probe_dir/$(basename "${DEVS[$i]}")"
-    done
-}
 
 # ── Init ───────────────────────────────────────────────────────────────────────
 load_config

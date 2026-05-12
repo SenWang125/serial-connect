@@ -15,6 +15,7 @@ port_indices
 PROBE_DIR=$(mktemp -d /tmp/serial-probe.XXXXXX)
 trap 'rm -rf "$PROBE_DIR"' EXIT
 run_probes "${!DEVS[@]}"
+save_cache "$PROBE_DIR"   # share results with serial-connect
 
 # ── BOARD_ID: best known name per USB serial (label > probed hostname) ─────────
 declare -A BOARD_ID
