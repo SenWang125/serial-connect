@@ -1,232 +1,111 @@
 # serial-connect
 
-Serial port management tools for embedded Linux development.
+Serial port tools for embedded Linux development — discover boards, connect interactively, and automate via CLI.
 
-Designed for engineers working with development boards (TI AM62x, Raspberry Pi,
-Rockchip, etc.) that expose a Linux console over USB serial. Replaces ad-hoc
-`minicom`/`pyserial` workflows with a consistent, automation-friendly toolset.
-
----
-
-## What's included
-
-| Tool | Purpose |
-|------|---------|
-| `serial-discover` | Probe all USB serial ports, auto-detect baud, identify boards from console output |
-| `serial-connect` | Interactive menu → launch terminal session (tio/screen/minicom) |
-| `tio.sh` | Quick tmux+tio session launcher with session sharing |
-| `serial-agent` | Background daemon + 25-command CLI for agent/automation use |
-
----
-
-## Prerequisites
-
-**Required:**
-- Linux with `/dev/ttyUSB*` or `/dev/ttyACM*` devices
-- `bash` ≥ 5.1 (for `wait -t`)
-- `python3` ≥ 3.8
-- `tio` — recommended terminal (`sudo apt install tio`)
-- User in `dialout` group: `sudo usermod -aG dialout $USER`
-
-**Optional (but recommended):**
-- `ser2net` — serial port multiplexer, allows human + agent simultaneous access (`sudo apt install ser2net`)
-- `inotify-tools` — instant event notifications instead of polling (`sudo apt install inotify-tools`)
-- `screen` — alternative terminal with session sharing (`sudo apt install screen`)
-
----
-
-## Installation
+## Install
 
 ```bash
-git clone https://github.com/youruser/serial-connect.git
+git clone https://github.com/senwang125/serial-connect.git
 cd serial-connect
-./install.sh
+./install.sh          # interactive: asks terminal preference, installs deps
 ```
 
-Or install to a custom directory:
+Or non-interactive:
 ```bash
-./install.sh /usr/local/bin
+./install.sh --term tio          # recommended
+./install.sh --term screen       # shareable sessions
+./install.sh /usr/local/bin --term minicom
 ```
 
-The install script copies the tools to `~/bin/` (default) and creates a starter
-`~/.config/serial-boards.conf` if one doesn't already exist.
+**Requirements:** bash ≥ 5.1, python3, user in `dialout` group
+**Optional:** `tio` (recommended terminal), `ser2net` (human+agent coexistence), `inotify-tools` (faster event notifications)
 
 ---
 
 ## Quick start
 
-### 1. Discover connected boards
-
 ```bash
-serial-discover
+serial-discover              # probe all USB serial ports, show live boards
+serial-connect               # pick a board from a menu and connect
+serial-connect /dev/ttyUSB1  # connect directly (skips menu)
 ```
 
-Probes all USB serial ports, auto-detects baud rate (115200 → 1.5M → 921.6K → ...),
-captures the board's hostname from its console output.
-
-```
-  ·  Device     Status    Board             Chip      P#   Baud
-────────────────────────────────────────────────────────────────
-  ★  ttyUSB1    LIVE      am62dxx-evm       FT4232H   p1   115.2K
-     ttyUSB0    dead      FT4232H-161       FT4232H   p0
-     ttyUSB4    dead      CP210x-0001       CP210x    p0
-```
-
-### 2. Connect interactively
-
+Label your boards by USB serial number (stable across reboots):
 ```bash
-serial-connect
-```
-
-Shows a menu of all ports with live status. Select a number to connect.
-
-### 3. Label your boards
-
-Once a board is LIVE and you know what it is, add it to `~/.config/serial-boards.conf`:
-
-```
-# Format: USB_SERIAL_NUMBER=BOARD_LABEL
-# Find the serial number from the LIVE row in serial-discover
-46241800161=MY-BOARD-A
-45241640028=MY-BOARD-B
-```
-
-Or use auto-label to generate names from the board's own hostname:
-```bash
-serial-agent auto-label -y
-```
-
-### 4. Start the agent daemon (for automation)
-
-```bash
-# Direct connection
-serial-agent start /dev/ttyUSB1
-
-# Via ser2net (coexists with human tio session)
-serial-agent start /dev/ttyUSB1 --tcp localhost:3001
+serial-agent auto-label -y   # auto-generates labels from board hostnames
+# or edit ~/.config/serial-boards.conf manually:
+#   46241800161=MY-BOARD
 ```
 
 ---
 
-## Configuration (`~/.config/serial-boards.conf`)
+## Tools
 
-Maps USB adapter serial numbers to board labels. The serial number is the
-stable hardware identifier — it follows the physical adapter across reboots
-and USB re-enumeration.
+### `serial-discover`
+Probes all `/dev/ttyUSB*` and `/dev/ttyACM*` ports. Auto-detects baud rate (115.2K → 1.5M → 921.6K → ...), captures the board's hostname from its console output.
 
 ```
-# SERIAL=LABEL
-# SERIAL=LABEL:BAUD    (explicit baud override, e.g. 1500000 for Rockchip boards)
-
-46241800161=MY-AM62-BOARD
-0001=OrangePi5Plus:1500000
-E663B035979A7725=RPi4B
+  ★  ttyUSB1    LIVE    am62dxx-evm       FT4232H   p1   115.2K
+     ttyUSB0    dead    FT4232H-161       FT4232H   p0
+     ttyUSB4    dead    CP210x-0001       CP210x    p0
 ```
 
-Run `serial-discover` to see USB serial numbers for connected devices.
+### `serial-connect`
+Interactive menu showing all ports with live/dead/open status. Select a number to connect via your configured terminal (tio/screen/minicom).
+
+- Caches probe results — re-probes only when topology changes or unknown boards appear
+- Groups ports by physical device (stable even if ttyUSBN order changes after reboot)
+- Override terminal: `SERIAL_TERM=screen serial-connect`
+
+### `serial-agent`
+Background daemon + CLI for automation. Reads all serial output continuously into a ring buffer. Agents query the buffer without touching the serial port directly.
+
+```bash
+serial-agent connect --board MY-BOARD --wait-shell  # discover + start + wait
+serial-agent send /dev/ttyUSB1 "uname -r" --json    # → {"output":"6.6.0","elapsed_ms":50}
+serial-agent reboot /dev/ttyUSB1 --setup-terminal   # reboot + wait for shell
+serial-agent upload /dev/ttyUSB1 ./driver.ko /tmp/  # file transfer (no network needed)
+serial-agent health /dev/ttyUSB1                    # memory/load/kernel JSON
+serial-agent list                                    # show running daemons
+```
+
+State machine: `SHELL` → `RUNNING` → `SHELL`  |  `BOOTING` → `LOGIN` → `SHELL`  |  `PANIC` → reboot
 
 ---
 
-## serial-agent reference
+## Human + agent on the same port
 
-The daemon reads all serial output continuously and exposes it via CLI. Agents
-never need to open the serial port directly.
+Without `ser2net`, a human terminal and a background daemon split the byte stream. With `ser2net`:
 
 ```bash
-# Session setup
-serial-agent list                              # show running daemons
-serial-agent auto-label -y                    # label connected boards
-serial-agent connect --board MY-BOARD --wait-shell --setup-terminal
-
-# Sending commands (structured output)
-serial-agent send /dev/ttyUSB1 "uname -r" --json
-# → {"output":"6.6.0","state":"SHELL","elapsed_ms":50,"exit_code":null}
-
-serial-agent send /dev/ttyUSB1 "make test" --json --exit-code --timeout 120
-
-# State-aware waiting (event-driven, uses inotifywait if available)
-serial-agent wait-state /dev/ttyUSB1 SHELL --timeout 90   # wait for boot
-serial-agent expect /dev/ttyUSB1 \
-    --on "READY=~#" --on "PANIC=Kernel panic" --timeout 120
-
-# Embedded dev operations
-serial-agent reboot  /dev/ttyUSB1 --setup-terminal --timeout 120
-serial-agent upload  /dev/ttyUSB1 ./my-driver.ko /lib/modules/extra/
-serial-agent run     /dev/ttyUSB1 ./test-script.sh --json --timeout 60
-serial-agent health  /dev/ttyUSB1    # memory/load/kernel/uptime JSON
-```
-
-Full command reference: `serial-agent --help` or see `docs/SERIAL_AGENT_GUIDE.md`.
-
----
-
-## Coexistence: human + agent on same port
-
-Without ser2net, a human tio session and a background agent daemon share bytes
-(data corruption). With ser2net:
-
-```
-board → /dev/ttyUSB1 → ser2net:3001
-                            ├─→ tio (human session, full stream)
-                            └─→ serial-agent daemon (full stream)
-```
-
-Setup:
-```bash
-serial-agent ser2net-gen                     # generates /etc/ser2net.yaml
-sudo cp /tmp/ser2net.yaml /etc/ser2net.yaml
+serial-agent ser2net-gen && sudo cp /tmp/ser2net.yaml /etc/ser2net.yaml
 sudo systemctl restart ser2net
 
-serial-agent start /dev/ttyUSB1 --tcp localhost:3001
-tio.sh 1                                     # human session via TCP
+serial-agent start /dev/ttyUSB1 --tcp localhost:3001  # daemon via ser2net
+serial-connect                                         # human session via TCP
 ```
 
 ---
 
-## Terminal backends
+## Configuration
 
-`serial-connect` supports multiple terminal emulators via `$SERIAL_TERM`:
-
-```bash
-SERIAL_TERM=tio     serial-connect   # default, modern, auto-reconnects
-SERIAL_TERM=screen  serial-connect   # shareable sessions (screen -x ttyUSBx)
-SERIAL_TERM=minicom serial-connect   # classic
-```
-
----
-
-## Known limitations
-
-- **`/dev/ttyACM` ports are not probed** — USB CDC ACM devices (XDS110, RPi Debug Probe)
-  block the kernel for ~12s per baud attempt when the remote device is inactive.
-  They show as OPEN (if held) or dead (if free) and can still be selected manually.
-
-- **Terminal wrapping** — Use `send --no-wrap` or `connect --setup-terminal` to run
-  `stty cols 220` on the board and prevent line wrapping in captured output.
-
-- **File upload speed** — Base64 serial transfer (~1 KB/s). Use
-  `upload --via-network` when the board has network access (~1 MB/s via wget).
-
----
-
-## File layout
+`~/.config/serial-boards.conf` maps USB adapter serial numbers to board labels:
 
 ```
-~/.config/serial-boards.conf    ← board labels (edit this)
-~/bin/serial-discover            ← port discovery
-~/bin/serial-connect             ← interactive terminal launcher
-~/bin/tio.sh                     ← tmux+tio session launcher
-~/bin/serial-agent               ← daemon + CLI
-~/var/serial-agent/ttyUSBx/     ← runtime state (buf.log, status.json, events.log)
-/tmp/serial-agent → ~/var/...   ← symlink (auto-created, clears on reboot)
+# SERIAL=LABEL  or  SERIAL=LABEL:BAUD
+46241800161=MY-AM62-BOARD
+0001=OrangePi5Plus:1500000
 ```
+
+The USB serial number is the key — it follows the hardware across reboots.
+Find serial numbers with: `serial-discover` (shown in the Board column for unknown boards).
 
 ---
 
 ## Docs
 
 - [`docs/SERIAL_ARCH.md`](docs/SERIAL_ARCH.md) — Architecture and design reference
-- [`docs/SERIAL_AGENT_GUIDE.md`](docs/SERIAL_AGENT_GUIDE.md) — Agent automation patterns
+- [`docs/SERIAL_AGENT_GUIDE.md`](docs/SERIAL_AGENT_GUIDE.md) — Automation patterns for agents
 
 ---
 
