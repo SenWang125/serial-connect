@@ -48,13 +48,13 @@ Select serial port:
        2)  ttyACM1    dead      XDS110-S62H0161   XDS110    p1
 
        3)  ttyUSB0    dead      am62dxx-evm       FT4232H   p0
-  ★    4)  ttyUSB1    LIVE      am62dxx-evm       FT4232H   p1   115.2K
+  ★   4)  ttyUSB1    LIVE      am62dxx-evm       FT4232H   p1   115.2K
        5)  ttyUSB3    dead      am62dxx-evm       FT4232H   p2
        6)  ttyUSB4    dead      am62dxx-evm       FT4232H   p3
 
        7)  ttyUSB2    dead      CP210x-0001       CP210x    p0
 
-  ★    8)  ttyUSB5    LIVE      am62pxx-evm       FT4232H   p0   115.2K
+  ★   8)  ttyUSB5    LIVE      am62pxx-evm       FT4232H   p0   115.2K
        9)  ttyUSB6    dead      am62pxx-evm       FT4232H   p1
       10)  ttyUSB7    dead      am62pxx-evm       FT4232H   p2
       11)  ttyUSB8    dead      am62pxx-evm       FT4232H   p3
