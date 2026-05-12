@@ -241,24 +241,41 @@ run_probes() {
 # Populate DEVS VIDS PIDS SERS IFNS IFSTRS CHIPS LABELS BAUDS arrays.
 enumerate_devices() {
     declare -ga DEVS VIDS PIDS SERS IFNS IFSTRS CHIPS LABELS BAUDS
-    local idx=0
+
+    local -a dev_list=()
     for dev in $(ls /dev/ttyUSB* /dev/ttyACM* 2>/dev/null | sort -V); do
-        [[ -c "$dev" ]] || continue
-        local info; info=$(udevadm info -a "$dev" 2>/dev/null)
-        local vid pid ser ifn ifstr
-        vid=$(awk   -F'"' '/ATTRS\{idVendor\}/{print $2; exit}'         <<< "$info")
-        pid=$(awk   -F'"' '/ATTRS\{idProduct\}/{print $2; exit}'        <<< "$info")
-        ser=$(awk   -F'"' '/ATTRS\{serial\}/{print $2; exit}'           <<< "$info")
-        ifn=$(awk   -F'"' '/ATTRS\{bInterfaceNumber\}/{print $2; exit}' <<< "$info")
-        ifstr=$(awk -F'"' '/ATTRS\{interface\}/{print $2; exit}'        <<< "$info")
+        [[ -c "$dev" ]] && dev_list+=("$dev")
+    done
+
+    # Run all udevadm queries in parallel (-q property is faster than -a)
+    local _etmp; _etmp=$(mktemp -d /tmp/serial-enum.XXXXXX)
+    local -a _epids=()
+    for dev in "${dev_list[@]}"; do
+        udevadm info -q property -n "$dev" > "$_etmp/$(basename "$dev")" 2>/dev/null &
+        _epids+=($!)
+    done
+    wait "${_epids[@]}" 2>/dev/null
+
+    local idx=0
+    for dev in "${dev_list[@]}"; do
+        local vid="" pid="" ser="" ifn=""
+        while IFS='=' read -r key val; do
+            case "$key" in
+                ID_VENDOR_ID)         vid="$val" ;;
+                ID_MODEL_ID)          pid="$val" ;;
+                ID_SERIAL_SHORT)      ser="$val" ;;
+                ID_USB_INTERFACE_NUM) ifn="$val" ;;
+            esac
+        done < "$_etmp/$(basename "$dev")"
         local vp="${vid}:${pid}"
         DEVS[$idx]="$dev";  VIDS[$idx]="$vid";  PIDS[$idx]="$pid"
-        SERS[$idx]="$ser";  IFNS[$idx]="$ifn";  IFSTRS[$idx]="$ifstr"
+        SERS[$idx]="$ser";  IFNS[$idx]="$ifn";  IFSTRS[$idx]=""
         CHIPS[$idx]="${CHIP_NAMES[$vp]:-${CHIP_WILDCARD[${vp%%:*}]:-$vp}}"
         LABELS[$idx]="${CFG_LABEL[$ser]:-}"
         BAUDS[$idx]=$(get_baud "$vp" "$ser")
         (( idx++ )) || true
     done
+    rm -rf "$_etmp"
 }
 
 # ── port_indices ──────────────────────────────────────────────────────────────

@@ -103,6 +103,8 @@ elif [[ -f "$CACHE_FILE" ]]; then
         [[ -n "${CFG_LABEL[$ser]+x}" ]] && { _recog[$ser]=1; continue; }
         result=$(cat "$PROBE_DIR/$(basename "${DEVS[$i]}")" 2>/dev/null || echo "")
         [[ "$result" =~ ^(LIVE|OPEN)\| ]] && _recog[$ser]=1
+        # Already probed and all ports dead — skip re-probe; run serial-discover to refresh
+        [[ "$result" =~ ^(DEAD|FAIL)\| ]] && _recog[$ser]=1
     done
     declare -a _reprobe_idxs=()
     for i in "${!DEVS[@]}"; do
@@ -153,8 +155,8 @@ rule_w=$(( 2 + 1 + 5 + dev_w + 2 + 6 + 4 + board_w + 2 + chip_w + 2 + 5 + 13 ))
 
 # ── Menu ───────────────────────────────────────────────────────────────────────
 echo -e "${BOLD}Select serial port:${NC}\n"
-printf "  ${BOLD}%-1s  %4s  %-${dev_w}s  %-6s    %-${board_w}s  %-${chip_w}s  %-5s  %s${NC}\n" \
-    "·" "#" "Port" "Status" "Board" "Chip" "P#" "Baud"
+printf "  ${BOLD}%-1s  %-4s %-${dev_w}s  %-6s    %-${board_w}s  %-${chip_w}s  %-5s  %s${NC}\n" \
+    "·" "  #" "Port" "Status" "Board" "Chip" "P#" "Baud"
 printf '─%.0s' $(seq 1 "$rule_w"); echo
 
 display_order
