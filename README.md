@@ -91,8 +91,9 @@ Probes all `/dev/ttyUSB*` and `/dev/ttyACM*` ports fresh every run. Sends a carr
 serial-discover              # human display with baud, chip, board name
 serial-discover --json       # JSON output for scripts and agents
 serial-discover --gen-udev    # write rules to /tmp/ — copy to /etc/udev/rules.d/ to make permanent
+serial-discover --tmp-udev    # create /dev/tty<LABEL> symlinks this session (for external tools)
+serial-discover --rm-udev     # remove installed rules and session symlinks
 serial-discover --tmp-udev   # create /dev/tty<LABEL> symlinks for this session only
-serial-discover --rm-udev     # remove installed udev rules
 ```
 
 ---

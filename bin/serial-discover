@@ -6,8 +6,10 @@
 # --gen-udev   Write /tmp/99-serial-aliases.rules for permanent stable port names.
 #              Install: sudo cp /tmp/99-serial-aliases.rules /etc/udev/rules.d/
 #                       sudo udevadm control --reload-rules && sudo udevadm trigger
-# --tmp-udev  Create /dev/tty<LABEL> symlinks for this session only (no system changes).
-# --rm-udev    Remove installed rules from /etc/udev/rules.d/ and reload udev.
+# --tmp-udev   Create /dev/tty<LABEL> symlinks for this session only — no system
+#              changes. Useful when external tools need a stable /dev path directly
+#              (e.g. minicom -D /dev/ttyAM62D2-EVM). Symlinks removed on reboot.
+# --rm-udev    Remove installed udev rules and any /dev/tty<LABEL> session symlinks.
 
 source "$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)/serial-common.sh"
 
@@ -88,6 +90,23 @@ if [[ "${1:-}" == "--json" ]]; then
     exit 0
 fi
 
+if [[ "${1:-}" == "--tmp-udev" ]]; then
+    declare -A _tseen
+    for i in "${!DEVS[@]}"; do
+        raw=$(cut -d'|' -f1 "$PROBE_DIR/$(basename "${DEVS[$i]}")" 2>/dev/null)
+        [[ "$raw" != "LIVE" && "$raw" != "OPEN" ]] && continue
+        label="${LABELS[$i]}"; [[ -z "$label" ]] && continue
+        ser="${SERS[$i]}"; ifn="${IFNS[$i]}"
+        [[ -n "${_tseen[$ser:$ifn]+x}" ]] && continue; _tseen["$ser:$ifn"]=1
+        safe="${label//[^A-Za-z0-9_-]/_}"
+        sudo ln -sf "${DEVS[$i]}" "/dev/tty${safe}" && \
+            echo -e "  ${GREEN}✓${NC} /dev/tty${safe} → ${DEVS[$i]}" || \
+            echo -e "  ${RED}✗${NC} failed: /dev/tty${safe}"
+    done
+    echo -e "  ${DIM}Session only — symlinks removed on reboot. Use --gen-udev to make permanent.${NC}"
+    exit 0
+fi
+
 if [[ "${1:-}" == "--rm-udev" ]]; then
     RULES=/etc/udev/rules.d/99-serial-aliases.rules
     if [[ -f "$RULES" ]]; then
@@ -97,26 +116,16 @@ if [[ "${1:-}" == "--rm-udev" ]]; then
     else
         echo -e "${YELLOW}Not installed:${NC} $RULES"
     fi
+    # Also remove any session symlinks created by --tmp-udev
+    for i in "${!DEVS[@]}"; do
+        label="${LABELS[$i]}"; [[ -z "$label" ]] && continue
+        safe="${label//[^A-Za-z0-9_-]/_}"
+        link="/dev/tty${safe}"
+        [[ -L "$link" ]] && sudo rm -f "$link" && echo -e "${GREEN}Removed:${NC} $link"
+    done
     exit 0
 fi
 
-if [[ "${1:-}" == "--tmp-udev" ]]; then
-    declare -A _tseen
-    for i in "${!DEVS[@]}"; do
-        raw=$(cut -d'|' -f1 "$PROBE_DIR/$(basename "${DEVS[$i]}")" 2>/dev/null)
-        [[ "$raw" != "LIVE" && "$raw" != "OPEN" ]] && continue
-        label="${LABELS[$i]}"
-        [[ -z "$label" ]] && continue
-        ser="${SERS[$i]}"; ifn="${IFNS[$i]}"
-        [[ -n "${_tseen[$ser:$ifn]+x}" ]] && continue; _tseen["$ser:$ifn"]=1
-        safe="${label//[^A-Za-z0-9_-]/_}"
-        target="${DEVS[$i]}"
-        link="/dev/tty${safe}"
-        sudo ln -sf "$target" "$link" &&             echo -e "  ${GREEN}✓${NC} $link → $target" ||             echo -e "  ${RED}✗${NC} failed: $link"
-    done
-    echo -e "  ${DIM}Symlinks removed on reboot.${NC}"
-    exit 0
-fi
 
 # ── Human display ───────────────────────────────────────────────────────────────
 echo -e "${BOLD}USB Serial Port Discovery${NC}  $(date '+%Y-%m-%d %H:%M:%S')\n"
