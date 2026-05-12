@@ -197,7 +197,8 @@ total=$(( row - 1 ))
 echo ""
 printf "  ${GREEN}★ LIVE${NC}    ${CYAN}⊙ OPEN${NC}    ${RED}✗ FAIL${NC}    ${DIM}  dead${NC}\n"
 echo -e "  use ${DIM}serial-discover${NC}            to force a fresh probe"
-echo -e "  use ${DIM}serial-discover --gen-udev${NC}  for stable port names across reboots"
+echo -e "  use ${DIM}serial-discover --gen-udev${NC}   for stable port names across reboots"
+echo -e "  use ${DIM}serial-discover --tmp-udev${NC}   for stable port names this session only"
 echo ""
 
 trap 'printf "\n"; exit 0' INT
