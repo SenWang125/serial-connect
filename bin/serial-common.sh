@@ -17,7 +17,7 @@ SIG_FILE="/tmp/serial-connect.sig"
 CACHE_FILE="/tmp/serial-connect.cache"
 
 # All defaults live in serial-boards.conf. Structures initialised empty here.
-declare -A CHIP_NAMES=() CHIP_BAUD=() CFG_LABEL CFG_BAUD
+declare -A CHIP_NAMES=() CHIP_BAUD=() CHIP_WILDCARD=() CHIP_BAUD_WILDCARD=() CFG_LABEL CFG_BAUD
 declare -a PROBE_BAUDS=()
 PROBE_PARALLEL=0 PROBE_READ_MS=100 PROBE_DRAIN_MS=10
 
@@ -95,6 +95,16 @@ load_config() {
             fi
             continue
         fi
+        # Vendor wildcard: VID:xxxx=NAME or VID:xxxx=NAME:BAUD — matches any unlisted PID for that vendor
+        if [[ "$key" =~ ^[0-9a-fA-F]{4}:xxxx$ ]]; then
+            local vid="${key%%:*}" wname="${val%%:*}"
+            [[ -n "$wname" ]] && CHIP_WILDCARD["$vid"]="$wname"
+            if [[ "$val" == *:* ]]; then
+                local wcb; wcb=$(parse_baud "${val##*:}")
+                (( wcb > 0 )) && CHIP_BAUD_WILDCARD["$vid"]="$wcb"
+            fi
+            continue
+        fi
         # Board serial→label (and optional baud)
         local label="${val%%:*}" extra="${val##*:}"
         CFG_LABEL["$key"]="$label"
@@ -107,7 +117,7 @@ load_config() {
 
 # ── get_baud ───────────────────────────────────────────────────────────────────
 # Resolve baud for a device: per-board override > chip default > 115200
-get_baud() { echo "${CFG_BAUD[$2]:-${CHIP_BAUD[$1]:-115200}}"; }
+get_baud() { local vid="${1%%:*}"; echo "${CFG_BAUD[$2]:-${CHIP_BAUD[$1]:-${CHIP_BAUD_WILDCARD[$vid]:-115200}}}"; }
 
 # ── probe_tty ──────────────────────────────────────────────────────────────────
 # Probe a single tty: send CR, try each baud in PROBE_BAUDS order, detect live.
@@ -238,7 +248,7 @@ enumerate_devices() {
         local vp="${vid}:${pid}"
         DEVS[$idx]="$dev";  VIDS[$idx]="$vid";  PIDS[$idx]="$pid"
         SERS[$idx]="$ser";  IFNS[$idx]="$ifn";  IFSTRS[$idx]="$ifstr"
-        CHIPS[$idx]="${CHIP_NAMES[$vp]:-${vp}}"
+        CHIPS[$idx]="${CHIP_NAMES[$vp]:-${CHIP_WILDCARD[${vp%%:*}]:-$vp}}"
         LABELS[$idx]="${CFG_LABEL[$ser]:-}"
         BAUDS[$idx]=$(get_baud "$vp" "$ser")
         (( idx++ )) || true
