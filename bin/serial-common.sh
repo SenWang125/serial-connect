@@ -262,19 +262,29 @@ enumerate_devices() {
 }
 
 # ── port_indices ──────────────────────────────────────────────────────────────
-# Populate PORT_IDX[dev]=N — sequential 0-based index within each physical device.
+# Populate PORT_IDX[dev]=N and DEVICE_IDX[serial]=N.
+# PORT_IDX: 0-based port within each physical device.
+# DEVICE_IDX: 0-based device index in first-occurrence (ttyUSBN enumeration) order.
 port_indices() {
-    declare -gA PORT_IDX
+    declare -gA PORT_IDX DEVICE_IDX
     declare -A _ser_devs
     local i
     for i in "${!DEVS[@]}"; do _ser_devs[${SERS[$i]}]+="${IFNS[$i]}:${DEVS[$i]} "; done
-    local ser idx dev
+    local ser idx dev dev_count=0
     for ser in "${!_ser_devs[@]}"; do
         idx=0
         while IFS= read -r dev; do
             PORT_IDX[$dev]=$idx; (( idx++ )) || true
         done < <(tr ' ' '\n' <<< "${_ser_devs[$ser]}" \
                  | grep -v '^$' | sort -t: -k1 -n | cut -d: -f2-)
+    done
+    # Assign device indices in DEVS array order (first-occurrence = lowest ttyUSBN)
+    for i in "${!DEVS[@]}"; do
+        ser="${SERS[$i]}"
+        if [[ -z "${DEVICE_IDX[$ser]+x}" ]]; then
+            DEVICE_IDX[$ser]=$dev_count
+            (( dev_count++ )) || true
+        fi
     done
 }
 

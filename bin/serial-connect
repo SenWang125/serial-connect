@@ -149,12 +149,12 @@ for i in "${!DEVS[@]}"; do
     (( fb > board_w )) && board_w=$fb
 done
 (( board_w++ ))
-rule_w=$(( 2 + 1 + 5 + dev_w + 2 + 6 + 4 + board_w + 2 + chip_w + 2 + 4 + 7 ))
+rule_w=$(( 2 + 1 + 5 + dev_w + 2 + 6 + 4 + board_w + 2 + chip_w + 2 + 5 + 8 ))
 
 # ── Menu ───────────────────────────────────────────────────────────────────────
 echo -e "${BOLD}Select serial port:${NC}\n"
 printf "  ${BOLD}%-1s  %4s  %-${dev_w}s  %-6s    %-${board_w}s  %-${chip_w}s  %-3s  %s${NC}\n" \
-    "·" "#" "Device" "Status" "Board" "Chip" "P#" "Baud"
+    "·" "#" "Device" "Status" "Board" "Chip" "D-P" "Baud"
 printf '─%.0s' $(seq 1 "$rule_w"); echo
 
 display_order
@@ -185,9 +185,9 @@ for i in "${_disp_order[@]}"; do
         board_col="${DIM}$(printf "%-${board_w}s" "${chip}-${ser_disp}")${NC}"
     fi
     baud_col=""; [[ "$state" == "LIVE" || "$state" == "OPEN" ]] && baud_col=$(baud_display "$baud")
-    printf "  %b  %b%3d)${NC}  %b%-${dev_w}s${NC}  %b%-6s${NC}    %s  %-${chip_w}s  p%-2s  %s\n" \
+    printf "  %b  %b%3d)${NC}  %b%-${dev_w}s${NC}  %b%-6s${NC}    %s  %-${chip_w}s  %-5s  %s\n" \
         "$sym" "$BOLD" "$row" "$dc" "$devname" "$sc" "$state" \
-        "$board_col" "$chip" "${PORT_IDX[$dev]:-0}" "$baud_col"
+        "$board_col" "$chip" "${DEVICE_IDX[$ser]:-0}-p${PORT_IDX[$dev]:-0}" "$baud_col"
     (( row++ ))
 done
 
