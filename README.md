@@ -17,6 +17,13 @@ Or non-interactive:
 ./install.sh /usr/local/bin --term minicom
 ```
 
+To uninstall:
+```bash
+./uninstall.sh                   # removes from ~/bin
+./uninstall.sh /usr/local/bin    # custom install dir
+./uninstall.sh --purge           # also remove ~/.config/serial-boards.conf
+```
+
 **Requirements:** bash ≥ 5.1, python3, user in `dialout` group
 **Optional:** `tio` (recommended terminal), `ser2net` (human+agent coexistence), `inotify-tools` (faster event notifications)
 
