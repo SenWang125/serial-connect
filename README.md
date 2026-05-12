@@ -80,7 +80,7 @@ Port [1-19]:
 
 Override terminal: `SERIAL_TERM=screen serial-connect`
 Direct connect (skip menu): `serial-connect /dev/ttyUSB1`
-`--board` skips the menu by label: `serial-connect --board AM62D2-EVM`. Matches label or hostname (case-insensitive regex), picks the first LIVE port. Non-unique — if two boards share a label, use distinct labels in `serial-boards.conf` or use `serial-agent --serial` for a guaranteed unique match.
+
 
 ---
 
@@ -90,7 +90,8 @@ Probes all `/dev/ttyUSB*` and `/dev/ttyACM*` ports fresh every run. Sends a carr
 
 ```bash
 serial-discover              # human display with baud, chip, board name
-serial-discover --json       # JSON output for scripts and agents
+serial-discover --json                   # all ports as JSON
+serial-discover --json | jq '.[] | select(.label=="AM62D2-EVM")' # filter by label
 serial-discover --gen-udev   # write /tmp/99-serial-aliases.rules — copy to /etc/udev/rules.d/ to make permanent
 serial-discover --tmp-udev   # create /dev/tty<LABEL> symlinks for this session — useful for debugging
                              # or when external tools need a stable /dev path (e.g. minicom -D /dev/ttyMyBoard)
