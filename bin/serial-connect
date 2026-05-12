@@ -155,7 +155,7 @@ rule_w=$(( 2 + 1 + 5 + dev_w + 2 + 6 + 4 + board_w + 2 + chip_w + 2 + 5 + 13 ))
 
 # ── Menu ───────────────────────────────────────────────────────────────────────
 echo -e "${BOLD}Select serial port:${NC}\n"
-printf "  ${BOLD}%-1s  %-4s %-${dev_w}s  %-6s    %-${board_w}s  %-${chip_w}s  %-5s  %s${NC}\n" \
+printf "  ${BOLD}%-1s  %-4s  %-${dev_w}s  %-6s    %-${board_w}s  %-${chip_w}s  %-5s  %s${NC}\n" \
     "·" "  #" "Port" "Status" "Board" "Chip" "P#" "Baud"
 printf '─%.0s' $(seq 1 "$rule_w"); echo
 
