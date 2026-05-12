@@ -9,7 +9,7 @@ DIM=$'\033[2m'; RED=$'\033[31m'; NC=$'\033[0m'
 # ── Config path ────────────────────────────────────────────────────────────────
 # Defaults to serial-boards.conf in the same directory as the sourcing script.
 # Override at runtime: BOARD_CFG=/path/to/serial-boards.conf serial-connect
-_COMMON_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+_COMMON_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 BOARD_CFG="${BOARD_CFG:-$_COMMON_DIR/serial-boards.conf}"
 
 # All defaults live in serial-boards.conf. Structures initialised empty here.

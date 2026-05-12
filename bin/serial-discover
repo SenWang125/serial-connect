@@ -6,7 +6,7 @@
 #             serial, port, state, baud, label, hostname, alias}, ...]
 # --gen-udev  Generate /tmp/99-serial-aliases.rules from live/open ports.
 
-source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/serial-common.sh"
+source "$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)/serial-common.sh"
 
 load_config
 enumerate_devices

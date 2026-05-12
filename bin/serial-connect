@@ -6,7 +6,7 @@
 # set changes or new unrecognized boards appear.
 # Override terminal: SERIAL_TERM=screen serial-connect
 
-source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/serial-common.sh"
+source "$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)/serial-common.sh"
 
 SERIAL_TERM="${SERIAL_TERM:-tio}"
 SIG_FILE="/tmp/serial-connect.sig"
@@ -214,7 +214,8 @@ done
 total=$(( row - 1 ))
 echo ""
 printf "  ${GREEN}★ LIVE${NC}    ${CYAN}⊙ OPEN${NC}    ${RED}✗ FAIL${NC}    ${DIM}  dead${NC}\n"
-echo -e "  ${DIM}serial-discover — fresh probe   serial-discover --gen-udev — fix port numbering${NC}"
+echo -e "  ${DIM}Run serial-discover to force a fresh probe${NC}"
+echo -e "  ${DIM}Run serial-discover --gen-udev to fix port numbering across reboots${NC}"
 echo ""
 
 trap 'printf "\n"; exit 0' INT

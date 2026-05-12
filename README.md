@@ -1,23 +1,12 @@
 # serial-connect
 
-Serial port tools for embedded Linux development — discover boards, connect interactively, and automate via CLI.
+Three CLI tools for working with USB serial ports on embedded Linux development boards.
 
-## Repo layout
+- **serial-discover** — probe all connected boards, detect baud rate, show live status
+- **serial-connect** — pick a port from a menu and open a terminal session
+- **serial-agent**   — background daemon for scripted/automated board interaction
 
-```
-serial-connect/
-├── bin/                    ← all tools and config (deployed together)
-│   ├── serial-common.sh    shared functions, sourced by the other scripts
-│   ├── serial-discover     probe all USB serial ports, show live boards
-│   ├── serial-connect      interactive menu — pick a port and connect
-│   ├── serial-agent        background daemon + CLI for automation
-│   └── serial-boards.conf  configuration: chip table, probe settings, board labels
-├── docs/
-│   ├── SERIAL_ARCH.md
-│   └── SERIAL_AGENT_GUIDE.md
-├── install.sh
-└── uninstall.sh
-```
+---
 
 ## Install
 
@@ -27,32 +16,31 @@ cd serial-connect
 ./install.sh
 ```
 
-All files deploy to `~/.serial-connect/` (isolated, named folder). The three CLI tools are symlinked into `~/.local/bin/` which is already in PATH on modern Linux — no PATH changes needed.
+Files go to `~/.serial-connect/`. The three tools are symlinked into `~/.local/bin/` which is in PATH on modern Linux — no extra setup needed.
 
-Non-interactive install:
 ```bash
-./install.sh --term tio              # recommended
-./install.sh --term tio,screen       # install multiple terminals
-sudo ./install.sh /usr/local/bin --term tio   # system-wide
+./install.sh --term tio              # set default terminal (recommended)
+./install.sh --term tio,screen       # install multiple
+sudo ./install.sh /usr/local/bin     # system-wide
 ```
 
 Uninstall:
 ```bash
-./uninstall.sh    # removes ~/.serial-connect/ and symlinks in ~/.local/bin/
+./uninstall.sh    # removes ~/.serial-connect/ and the symlinks
 ```
 
 **Requirements:** bash ≥ 5.1, python3, user in `dialout` group
-**Optional:** `tio` (recommended), `screen` (shareable sessions), `ser2net` (human+agent on same port), `inotify-tools` (faster event notifications)
+**Optional:** `tio`, `screen`, `ser2net`, `inotify-tools`
 
 ---
 
-## Usage
+## serial-connect
+
+Pick a port and connect. Ports are grouped by physical device. Probe results are cached — re-probes only when the device set changes or a new unlabelled board appears.
 
 ```
 $ serial-connect
-```
 
-```
 Select serial port:
 
   ·     #  Device     Status    Board             Chip      P#   Baud
@@ -68,64 +56,75 @@ Select serial port:
        7)  ttyUSB2    dead      CP210x-0001       CP210x    p0
 
   ★    8)  ttyUSB5    LIVE      am62pxx-evm       FT4232H   p0   115.2K
+       9)  ttyUSB6    dead      am62pxx-evm       FT4232H   p1
+      10)  ttyUSB7    dead      am62pxx-evm       FT4232H   p2
+      11)  ttyUSB8    dead      am62pxx-evm       FT4232H   p3
+
+      12)  ttyUSB9    dead      am62dxx-evm       FT4232H   p0
+  ★   13)  ttyUSB10   LIVE      am62dxx-evm       FT4232H   p1   115.2K
+      14)  ttyUSB11   dead      am62dxx-evm       FT4232H   p2
+      15)  ttyUSB12   dead      am62dxx-evm       FT4232H   p3
+
+  ★   16)  ttyUSB13   LIVE      am62axx-evm       FT4232H   p0   115.2K
+      17)  ttyUSB14   dead      am62axx-evm       FT4232H   p1
+      18)  ttyUSB15   dead      am62axx-evm       FT4232H   p2
+      19)  ttyUSB16   dead      am62axx-evm       FT4232H   p3
 
   ★ LIVE    ⊙ OPEN    ✗ FAIL      dead
+  Run serial-discover to force a fresh probe
+  Run serial-discover --gen-udev to fix port numbering across reboots
 
-Port [1-8]:
+Port [1-19]:
 ```
 
-Ports are grouped by physical device. `★ LIVE` means an active console was detected. `⊙ OPEN` means another process holds the port (serial-connect will offer to force-close it). Override the terminal: `SERIAL_TERM=screen serial-connect`
+`★ LIVE` — active console detected. `⊙ OPEN` — port held by another process (will offer to force-close). Dead ports are still selectable.
+
+Override terminal: `SERIAL_TERM=screen serial-connect`
+Direct connect (skip menu): `serial-connect /dev/ttyUSB1`
 
 ---
 
-## Tools
+## serial-discover
 
-### `serial-discover`
-Probes all USB serial ports fresh every run. Auto-detects baud rate, captures board hostname from the console.
-
-```bash
-serial-discover              # human display
-serial-discover --json       # machine-readable output for agents
-serial-discover --gen-udev   # generate udev rules for stable port names
-```
-
-### `serial-connect`
-Interactive menu with cached probe results. Re-probes only on topology change or when a new unlabelled board appears.
-
-### `serial-agent`
-Background daemon + CLI for automation. Reads serial output into a ring buffer — agents query it without touching the port directly.
+Probes all `/dev/ttyUSB*` and `/dev/ttyACM*` ports fresh every run. Sends a carriage return, tries each baud rate in order, identifies the board from its console prompt.
 
 ```bash
-serial-agent connect --board AM62D2-EVM --wait-shell
-serial-agent send /dev/ttyUSB1 "uname -r" --json     # → {"output":"6.6.0","elapsed_ms":50}
-serial-agent reboot /dev/ttyUSB1 --setup-terminal
-serial-agent upload /dev/ttyUSB1 ./driver.ko /tmp/
-serial-agent health /dev/ttyUSB1
-serial-agent list
+serial-discover              # human display with baud, chip, board name
+serial-discover --json       # JSON output for scripts and agents
+serial-discover --gen-udev   # generate udev rules for stable port names across reboots
 ```
+
+---
+
+## serial-agent
+
+Background daemon that reads serial output continuously into a ring buffer. Scripts and agents query the buffer or send commands without fighting over the port with an interactive terminal.
+
+```bash
+serial-agent connect --board AM62D2-EVM --wait-shell   # start daemon, wait for shell prompt
+serial-agent send /dev/ttyUSB1 "uname -r" --json       # → {"output":"6.6.0","elapsed_ms":50}
+serial-agent reboot /dev/ttyUSB1 --setup-terminal      # reboot and wait for shell
+serial-agent upload /dev/ttyUSB1 ./driver.ko /tmp/     # file transfer over serial
+serial-agent health /dev/ttyUSB1                        # memory, load, kernel info as JSON
+serial-agent list                                       # show running daemons
+```
+
+Run `serial-agent --help` for the full command list.
 
 ---
 
 ## Configuration
 
-`serial-boards.conf` lives alongside the scripts in `~/.serial-connect/`. Open it — every setting is documented inline.
+`~/.serial-connect/serial-boards.conf` — open it to see all options with inline docs.
 
-**Label your boards** (find serial numbers with `serial-discover`):
+Label boards by USB serial number (stable across reboots and re-enumeration):
 ```
 46241800161=AM62D2-EVM
 45241640028=AM62P-EVM:115200
 ```
 
-Or auto-generate labels from board hostnames:
-```bash
-serial-agent auto-label -y
-```
-
-**Tune discovery speed** — edit these values directly in the conf:
-```
-PROBE_READ_MS=50       # halve response wait → halve worst-case probe time
-PROBE_PARALLEL=8       # cap parallel probes if USB bus gets congested
-```
+Find serial numbers: `serial-discover`
+Auto-generate labels from board hostnames: `serial-agent auto-label -y`
 
 ---
 
