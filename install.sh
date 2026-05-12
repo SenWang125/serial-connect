@@ -221,7 +221,7 @@ mkdir -p "$INSTALL_DIR"
 
 TOOLS=(serial-common.sh serial-discover serial-connect serial-agent)
 for tool in "${TOOLS[@]}"; do
-    src="$SCRIPT_DIR/$tool"
+    src="$SCRIPT_DIR/bin/$tool"
     [[ ! -f "$src" ]] && { red "  Missing source: $src"; exit 1; }
     cp "$src" "$INSTALL_DIR/$tool"
     chmod +x "$INSTALL_DIR/$tool"
@@ -238,7 +238,7 @@ fi
 
 # ── Config file (lives alongside the scripts) ──────────────────────────────────
 if [[ ! -f "$CONF_FILE" ]]; then
-    cp "$SCRIPT_DIR/serial-boards.conf" "$CONF_FILE"
+    cp "$SCRIPT_DIR/bin/serial-boards.conf" "$CONF_FILE"
     green "  ✓ serial-boards.conf  (created)"
 else
     dim   "  · serial-boards.conf  (exists — not modified)"
