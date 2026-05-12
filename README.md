@@ -40,7 +40,6 @@ Pick a port and connect. Ports are grouped by physical device. Probe results are
 
 ```
 $ serial-connect
-
 Select serial port:
 
   ·     #  Device     Status    Board             Chip      P#   Baud
