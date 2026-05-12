@@ -168,7 +168,7 @@ for i in "${_disp_order[@]}"; do
     prev_ser="$ser"
     IFS='|' read -r raw probe_baud _ \
         <<< "$(cat "$PROBE_DIR/$devname" 2>/dev/null || echo 'FAIL||')"
-    [[ "$raw" == "DEAD" ]] && state="dead" || state="$raw"
+    [[ -z "$raw" || "$raw" == "DEAD" ]] && state="dead" || state="$raw"
     [[ "$state" == "LIVE" && "$probe_baud" =~ ^[0-9]+$ ]] && baud="$probe_baud"
     ROW_DEV[$row]="$dev"; ROW_BAUD[$row]="$baud"; ROW_STATE[$row]="$state"
     case "$state" in
@@ -195,7 +195,7 @@ total=$(( row - 1 ))
 echo ""
 printf "  ${GREEN}★ LIVE${NC}    ${CYAN}⊙ OPEN${NC}    ${RED}✗ FAIL${NC}    ${DIM}  dead${NC}\n"
 echo -e "  ${DIM}Run serial-discover to force a fresh probe${NC}"
-echo -e "  ${DIM}Run serial-discover --gen-udev to fix port numbering across reboots${NC}"
+echo -e "  ${DIM}Run serial-discover --gen-udev   (permanent) or --temp-udev   (this session)${NC}"
 echo ""
 
 trap 'printf "\n"; exit 0' INT
