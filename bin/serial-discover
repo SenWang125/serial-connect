@@ -55,7 +55,7 @@ for i in "${!DEVS[@]}"; do
     (( fb > board_w )) && board_w=$fb
 done
 (( board_w++ ))
-rule_w=$(( 2 + 1 + dev_w + 2 + 6 + 4 + board_w + 2 + chip_w + 2 + 5 + 8 ))
+rule_w=$(( 2 + 1 + dev_w + 2 + 6 + 4 + board_w + 2 + chip_w + 2 + 5 + 13 ))
 
 # ── Alias map: /dev symlinks ────────────────────────────────────────────────────
 declare -A _dev_alias

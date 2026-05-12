@@ -149,7 +149,7 @@ for i in "${!DEVS[@]}"; do
     (( fb > board_w )) && board_w=$fb
 done
 (( board_w++ ))
-rule_w=$(( 2 + 1 + 5 + dev_w + 2 + 6 + 4 + board_w + 2 + chip_w + 2 + 5 + 8 ))
+rule_w=$(( 2 + 1 + 5 + dev_w + 2 + 6 + 4 + board_w + 2 + chip_w + 2 + 5 + 13 ))
 
 # ── Menu ───────────────────────────────────────────────────────────────────────
 echo -e "${BOLD}Select serial port:${NC}\n"
@@ -196,21 +196,21 @@ done
 total=$(( row - 1 ))
 echo ""
 printf "  ${GREEN}★ LIVE${NC}    ${CYAN}⊙ OPEN${NC}    ${RED}✗ FAIL${NC}    ${DIM}  dead${NC}\n"
-echo -e "  ${DIM}Run serial-discover to force a fresh probe${NC}"
-echo -e "  ${DIM}Run serial-discover --gen-udev   (permanent) or --tmp-udev   (this session)${NC}"
+echo -e "  ${DIM}serial-discover${NC}           fresh probe"
+echo -e "  ${DIM}serial-discover --gen-udev${NC}  stable port names across reboots"
 echo ""
 
 trap 'printf "\n"; exit 0' INT
 
 while true; do
-    read -rp "Port [1-${total} or N-pM]: " choice || { printf "\n"; exit 0; }
+    read -rp "Port [1-${total} or #-p#]: " choice || { printf "\n"; exit 0; }
     # Accept N-pM (e.g. 2-p1) as shorthand for the Chip-P column value
     if [[ "$choice" =~ ^[0-9]+-p[0-9]+$ ]]; then
         choice="${ROW_BY_CHIPPORT[$choice]:-}"
-        [[ -z "$choice" ]] && { echo "  No port with that Chip-P." >&2; continue; }
+        [[ -z "$choice" ]] && { echo "  No match for that P#." >&2; continue; }
     fi
     [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= total )) || {
-        echo "  Enter a row number or Chip-P (e.g. 2-p1)." >&2; continue
+        echo "  Enter a number 1-${total} or a P# (e.g. 2-p1)." >&2; continue
     }
     if [[ "${ROW_STATE[$choice]}" == "OPEN" ]]; then
         echo ""
