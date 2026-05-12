@@ -1,13 +1,17 @@
 #!/usr/bin/env bash
 # install.sh — Install serial-connect tools
 #
+# By default installs into ~/.serial-connect/ — a private, named directory
+# that does not pollute shared bin paths.  Add it to PATH once:
+#   export PATH="$HOME/.serial-connect:$PATH"   # add to ~/.bashrc
+#
 # Usage:
 #   ./install.sh                    # interactive (asks terminal preference)
 #   ./install.sh --term tio         # non-interactive: tio (recommended)
 #   ./install.sh --term screen      # non-interactive: screen
 #   ./install.sh --term minicom     # non-interactive: minicom
 #   ./install.sh --term picocom     # non-interactive: picocom
-#   ./install.sh /usr/local/bin     # custom install directory
+#   ./install.sh /usr/local/bin     # install to a shared bin directory
 #   sudo ./install.sh /usr/local/bin --term tio
 
 set -euo pipefail
@@ -25,7 +29,7 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-INSTALL_DIR="${INSTALL_DIR:-$HOME/bin}"
+INSTALL_DIR="${INSTALL_DIR:-$HOME/.serial-connect}"
 CONF_DIR="${HOME}/.config"
 CONF_FILE="${CONF_DIR}/serial-boards.conf"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -246,7 +250,7 @@ fi
 echo ""
 if [[ ":$PATH:" != *":$INSTALL_DIR:"* ]]; then
     yellow "Note: $INSTALL_DIR is not in \$PATH."
-    yellow "      Add to ~/.bashrc:  export PATH=\"\$HOME/bin:\$PATH\""
+    yellow "      Add to ~/.bashrc:  export PATH=\"${INSTALL_DIR}:\$PATH\""
     echo ""
 fi
 

@@ -17,10 +17,16 @@ Or non-interactive:
 ./install.sh /usr/local/bin --term minicom
 ```
 
-To uninstall:
+Scripts install to `~/.serial-connect/` by default — a private directory that
+doesn't mix with other tools. Add it to PATH once:
 ```bash
-./uninstall.sh                   # removes from ~/bin
-./uninstall.sh /usr/local/bin    # custom install dir
+echo 'export PATH="$HOME/.serial-connect:$PATH"' >> ~/.bashrc
+```
+
+To uninstall (removes the whole directory):
+```bash
+./uninstall.sh                   # removes ~/.serial-connect/
+./uninstall.sh /usr/local/bin    # if installed to a shared bin dir
 ./uninstall.sh --purge           # also remove ~/.config/serial-boards.conf
 ```
 

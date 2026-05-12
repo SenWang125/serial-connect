@@ -2,13 +2,13 @@
 # uninstall.sh — Remove serial-connect tools
 #
 # Usage:
-#   ./uninstall.sh                 # removes from ~/bin (default install location)
+#   ./uninstall.sh                 # removes from ~/.serial-connect (default)
 #   ./uninstall.sh /usr/local/bin  # custom install directory
 #   ./uninstall.sh --purge         # also remove ~/.config/serial-boards.conf
 
 set -euo pipefail
 
-INSTALL_DIR="${1:-$HOME/bin}"
+INSTALL_DIR="${1:-$HOME/.serial-connect}"
 PURGE=0
 for arg in "$@"; do
     [[ "$arg" == "--purge" ]] && PURGE=1
@@ -22,15 +22,21 @@ echo "=========================="
 echo ""
 
 TOOLS=(serial-discover serial-connect serial-agent)
-for tool in "${TOOLS[@]}"; do
-    f="$INSTALL_DIR/$tool"
-    if [[ -f "$f" ]]; then
-        rm -f "$f"
-        printf "  ${GREEN}✓${NC} removed %s\n" "$f"
-    else
-        printf "  ${YELLOW}·${NC} not found: %s\n" "$f"
-    fi
-done
+# If install dir is the default named directory, remove it wholesale
+if [[ "$INSTALL_DIR" == "$HOME/.serial-connect" && -d "$INSTALL_DIR" ]]; then
+    rm -rf "$INSTALL_DIR"
+    printf "  ${GREEN}✓${NC} removed directory %s\n" "$INSTALL_DIR"
+else
+    for tool in "${TOOLS[@]}"; do
+        f="$INSTALL_DIR/$tool"
+        if [[ -f "$f" ]]; then
+            rm -f "$f"
+            printf "  ${GREEN}✓${NC} removed %s\n" "$f"
+        else
+            printf "  ${YELLOW}·${NC} not found: %s\n" "$f"
+        fi
+    done
+fi
 
 if (( PURGE )); then
     conf="${HOME}/.config/serial-boards.conf"
