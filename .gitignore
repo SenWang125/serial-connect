@@ -1,0 +1,19 @@
+# Runtime state (created by serial-agent daemon)
+/tmp/serial-agent/
+*.sig
+*.cache
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store

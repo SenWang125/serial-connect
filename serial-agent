@@ -1,0 +1,1855 @@
+#!/usr/bin/env python3
+"""
+serial-agent — Serial console daemon and CLI for automation agents.
+
+══════════════════════════════════════════════════════════════════════════════
+ARCHITECTURE
+══════════════════════════════════════════════════════════════════════════════
+
+  ┌─────────────────┐   TCP/direct   ┌──────────────┐   ring buffer
+  │  ser2net / port │ ◄─────────────►│serial-daemon │──────────────► ~/var/serial-agent/ttyUSBx/
+  └─────────────────┘                └──────┬───────┘   buf.log, status.json, events.log
+           ▲                                │ FIFO input
+           │ TCP (shared)          ┌────────▼────────┐
+           │                       │  serial-agent   │ ← agent CLI
+  ┌────────┴────────┐              │                 │
+  │  tio.sh / human │              └─────────────────┘
+  └─────────────────┘
+
+Storage: ~/var/serial-agent/ (disk, not tmpfs)
+         /tmp/serial-agent → ~/var/serial-agent  (symlink, auto-created, clears on reboot)
+
+══════════════════════════════════════════════════════════════════════════════
+DYNAMIC DISCOVERY — no hardcoding device paths or board names
+══════════════════════════════════════════════════════════════════════════════
+
+  Fields in discover JSON:
+    label     User-set in ~/.config/serial-boards.conf — STABLE, USE THIS
+    hostname  Board console hostname — fragile (rootfs-dependent)
+    serial    USB adapter serial# — unique per physical device
+
+  One-shot setup (no manual chain):
+    serial-agent connect --board "$BOARD" --wait-shell
+
+  Full automation example:
+    BOARD="${BOARD:?Set BOARD= from serial-boards.conf}"
+    serial-agent connect --board "$BOARD" --wait-shell --timeout 90
+    result=$(serial-agent send "$dev" "uname -r" --json)
+    echo "$result" | python3 -c "import sys,json; print(json.load(sys.stdin)['output'])"
+
+  Label your boards:
+    serial-agent auto-label -y     # or manually in ~/.config/serial-boards.conf
+
+══════════════════════════════════════════════════════════════════════════════
+STATE MACHINE
+══════════════════════════════════════════════════════════════════════════════
+
+  State      Meaning                          Agent action
+  ─────────  ───────────────────────────────  ──────────────────────────────
+  SHELL      At a shell prompt                ✓ Safe to send; alive confirmed
+  RUNNING    Command executing                ✓ Alive; wait for SHELL before sending
+  LOGIN      Waiting for username             Send username; wait for Password
+  PASSWORD   Waiting for password             Send password; wait for SHELL
+  BOOTING    Kernel/init messages             Wait for SHELL (10-60s typical)
+  DEAD       No output for >30s              ✗ Board off or hung
+  UNKNOWN    Daemon just started              Run alive or connect
+
+  Status JSON fields:
+    state            — one of the above
+    last_output_ago  — seconds since any byte received
+    last_prompt_ago  — seconds since last shell prompt
+    prompt_text      — last detected prompt string
+
+══════════════════════════════════════════════════════════════════════════════
+MINIMISING TIMEOUTS
+══════════════════════════════════════════════════════════════════════════════
+
+  1. Check state first — never send to a RUNNING board
+  2. Match --timeout to the command (ls=3s, make=300s)
+  3. alive is instant for SHELL/RUNNING with recent output
+  4. wait-state uses inotifywait (instant) if available, else 50ms polling
+  5. send --json returns clean structured output — no parsing needed
+  6. expect handles multi-outcome boards (panic, login, shell) in one call
+
+══════════════════════════════════════════════════════════════════════════════
+COMMANDS
+══════════════════════════════════════════════════════════════════════════════
+
+  Discovery & setup (no hardcoding):
+    auto-label  [--dry-run] [-y]                   generate labels from probe
+    discover    [--board PAT] [--serial S] [--live] JSON port list
+    connect     [--board PAT] [--serial S] [--wait-shell] [--timeout N] [--json]
+    ser2net-gen [--start-port N] [--output FILE]   generate /etc/ser2net.yaml
+
+  Daemon lifecycle:
+    start   DEVICE [--tcp HOST:PORT] [--baud N] [--lines N]
+    stop    DEVICE
+    status  DEVICE                       JSON state + timestamps
+    path    DEVICE                       ~/var/serial-agent/ttyUSBx/
+    clean   [DEVICE]                     remove stale state dirs
+
+  Observation (no serial traffic):
+    read    DEVICE [--lines N] [--no-timestamps]
+    events  DEVICE [--lines N]
+    tail    DEVICE
+
+  Liveness checks:
+    alive      DEVICE [--timeout N]                exit 0=alive; fast cached path
+    wait-alive DEVICE [--timeout N]                block until SHELL/LOGIN/PASSWORD
+    wait-state DEVICE STATE[,STATE] [--timeout N]  event-driven, inotifywait if available
+
+  Sending:
+    send   DEVICE CMD [--wait PAT] [--timeout N]   sends + waits for pattern
+           [--json]     structured output {"output","state","elapsed_ms","exit_code"}
+           [--capture]  clean stdout only (no timestamps/prompt)
+           [--exit-code] append '; echo EXITCODE:$?' and parse result
+                        NOTE: commands containing 'exit' terminate the shell
+                        before the echo can run — use run DEVICE instead
+           [--no-wait]  fire and forget
+           [--no-wrap]  prepend COLUMNS=32767 to prevent board terminal wrapping
+           [--all]      send to ALL boards with running daemons (ignores DEVICE)
+    expect DEVICE --on KEY=REGEX [--on ...] [--timeout N]
+           wait for first of multiple patterns; JSON {"matched","output","elapsed_ms"}
+
+══════════════════════════════════════════════════════════════════════════════
+EMBEDDED MPU DEVELOPMENT PATTERNS (TI AM62x, AM62D2, etc.)
+══════════════════════════════════════════════════════════════════════════════
+
+  ── State machine ─────────────────────────────────────────────────────────
+  SHELL    at shell prompt          → send commands
+  RUNNING  command executing        → wait-state SHELL (never send to RUNNING)
+  UBOOT    U-Boot "=>" prompt       → send U-Boot commands
+  LOGIN    "login:" prompt          → serial-agent login DEVICE
+  PASSWORD "Password:" prompt       → serial-agent login DEVICE
+  BOOTING  kernel log timestamps    → wait-state SHELL --timeout 120
+  PANIC    "Kernel panic"/BUG/OOPS  → serial-agent reboot DEVICE
+  DEAD     no output 30s            → board off or hung
+
+  ── Speed reference ───────────────────────────────────────────────────────
+  Slow (avoid)                    Fast equivalent
+  time.sleep(5)                   wait-state DEVICE SHELL --timeout 90
+  poll alive every second         wait-state (inotifywait, 0ms latency)
+  read buf then grep              send CMD --json (50ms, structured)
+  discover+start+wait 3 calls     connect --board X --wait-shell
+  reboot + 4 commands             reboot DEVICE --setup-terminal (atomic)
+
+  ── One-time session setup ────────────────────────────────────────────────
+  serial-agent auto-label -y                    # label boards from USB serial#
+  serial-agent connect --board "$BOARD" \\
+      --wait-shell --setup-terminal --timeout 90
+
+  ── Kernel module test cycle ──────────────────────────────────────────────
+  serial-agent upload "$DEV" ./my-driver.ko /lib/modules/extra/
+  serial-agent send   "$DEV" "modprobe my-driver" --json --exit-code
+  serial-agent send   "$DEV" "dmesg | tail -20" --capture --no-wrap
+  serial-agent send   "$DEV" "rmmod my-driver" --json --exit-code
+
+  ── DTB overlay test ──────────────────────────────────────────────────────
+  serial-agent upload "$DEV" ./k3-am625-sk-audio.dtbo /boot/overlays/
+  serial-agent reboot "$DEV" --setup-terminal --timeout 90
+  serial-agent send   "$DEV" "ls /proc/device-tree/sound/" --capture
+
+  ── Reboot + verify ───────────────────────────────────────────────────────
+  serial-agent reboot "$DEV" --setup-terminal --timeout 120
+  serial-agent health "$DEV"
+  serial-agent send   "$DEV" "dmesg | grep -ci error" --json --no-wrap
+
+  ── Multi-outcome expect ──────────────────────────────────────────────────
+  serial-agent send   "$DEV" "reboot" --no-wait
+  serial-agent expect "$DEV" --on "READY=~#" --on "PANIC=Kernel panic" \\
+      --on "LOGIN=login:" --timeout 120
+
+  ── Multi-board parallel ──────────────────────────────────────────────────
+  serial-agent send --all "uname -r" --json   # all boards simultaneously
+
+  ── U-Boot interaction ────────────────────────────────────────────────────
+  serial-agent wait-state "$DEV" UBOOT --timeout 15
+  serial-agent send "$DEV" "printenv bootargs" --wait '=>' --timeout 3
+
+  ── run multi-line scripts ────────────────────────────────────────────────
+  cat << 'EOF' | serial-agent run "$DEV" - --json --timeout 30
+  aplay -l
+  arecord -l
+  amixer scontents | head -20
+  EOF
+"""
+
+import argparse, json, os, re, select, signal, socket, sys, termios, time
+from datetime import datetime
+from pathlib import Path
+from threading import Thread, Event
+
+# ── Storage ────────────────────────────────────────────────────────────────────
+_REAL_BASE = Path.home() / 'var' / 'serial-agent'
+_TMP_LINK  = Path('/tmp/serial-agent')
+AGENT_BASE = Path(os.environ.get('SERIAL_AGENT_DIR', str(_REAL_BASE)))
+
+# ── Tunables ───────────────────────────────────────────────────────────────────
+DEFAULT_LINES = 500
+MAX_EVENTS    = 200      # events.log rotation threshold
+DEAD_AFTER    = 30.0
+RUNNING_AFTER = 3.0
+EXITCODE_TAG  = 'SERIAL_EXITCODE'
+
+# ── Patterns ───────────────────────────────────────────────────────────────────
+RE_SHELL    = re.compile(r'[\$#>]\s*$')
+RE_SHELL2   = re.compile(r'\w[\w.\-]*@[\w.\-]+[:#~/][^\n]*[\$#>]\s*$')
+RE_LOGIN    = re.compile(r'(login|Username)\s*:\s*$', re.I)
+RE_PASSWORD = re.compile(r'(Password|passwd)\s*:\s*$', re.I)
+RE_BOOT     = re.compile(r'\[\s*\d+\.\d{3,6}\]')
+RE_UBOOT    = re.compile(r'^(=>|u-boot[#>])\s*$', re.I)   # U-Boot prompt
+RE_PANIC    = re.compile(r'Kernel panic|BUG:|OOPS:|Unable to handle kernel')
+RE_ANSI     = re.compile(r'\x1b(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
+RE_TIMESTAMP= re.compile(r'^\[\d{2}:\d{2}:\d{2}\.\d+\] ')
+RE_EXITCODE = re.compile(rf'^{EXITCODE_TAG}:(\d+)\s*$')
+
+
+def _strip_ansi(text: str) -> str:
+    return RE_ANSI.sub('', text)
+
+def _strip_timestamps(lines: list) -> list:
+    return [RE_TIMESTAMP.sub('', l) for l in lines]
+
+def _clean_output(raw_lines: list, sent_cmd: str = '') -> tuple:
+    """Strip timestamps+ANSI, remove command echo, remove trailing prompt.
+    Returns (clean_text, exit_code_or_None)."""
+    lines = _strip_timestamps(raw_lines)
+    lines = [_strip_ansi(l) for l in lines]
+    lines = [l.replace('\r', '') for l in lines]   # remove all CRs (mid-line wrapping)
+
+    # Remove command echo. Long commands wrap at terminal width, so the echo
+    # may span multiple lines. We skip leading lines as long as they are a
+    # contiguous prefix of the sent command (case-sensitive, ignoring whitespace).
+    cmd_stripped = sent_cmd.strip()
+    if cmd_stripped and lines:
+        consumed = ''
+        skip = 0
+        for line in lines:
+            chunk = line.strip()
+            if not chunk:
+                break
+            test = consumed + chunk
+            if cmd_stripped.startswith(test):
+                consumed = test
+                skip += 1
+                if consumed == cmd_stripped:
+                    break
+            elif cmd_stripped.startswith(consumed) and len(consumed) < len(cmd_stripped):
+                # Partial match so far but this line doesn't continue it — stop
+                break
+            else:
+                break
+        lines = lines[skip:]
+
+    # Extract exit code if present
+    exit_code = None
+    cleaned = []
+    for l in lines:
+        m = RE_EXITCODE.match(l.strip())
+        if m:
+            exit_code = int(m.group(1))
+        else:
+            cleaned.append(l)
+
+    # Remove trailing prompt line(s)
+    while cleaned and (RE_SHELL.search(cleaned[-1]) or RE_SHELL2.search(cleaned[-1])):
+        cleaned.pop()
+
+    # Remove trailing blank lines
+    while cleaned and not cleaned[-1].strip():
+        cleaned.pop()
+
+    return '\n'.join(cleaned), exit_code
+
+
+# ── Helpers ────────────────────────────────────────────────────────────────────
+def devname(device: str) -> str:
+    return Path(device).name
+
+def devdir(device: str) -> Path:
+    d = AGENT_BASE / devname(device)
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+def ensure_symlink():
+    try:
+        if not _TMP_LINK.exists() and not _TMP_LINK.is_symlink():
+            _REAL_BASE.mkdir(parents=True, exist_ok=True)
+            _TMP_LINK.symlink_to(_REAL_BASE)
+    except OSError:
+        pass
+
+def now() -> float:
+    return time.monotonic()
+
+def ts() -> str:
+    return datetime.now().strftime('%H:%M:%S.%f')[:-3]
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Daemon
+# ══════════════════════════════════════════════════════════════════════════════
+class Daemon:
+    def __init__(self, device, tcp, baud, lines):
+        self.device   = device
+        self.tcp      = tcp
+        self.baud     = baud
+        self.maxlines = lines
+        self.ddir     = devdir(device)
+        self.buf_file    = self.ddir / 'buf.log'
+        self.status_file = self.ddir / 'status.json'
+        self.fifo_file   = self.ddir / 'input.fifo'
+        self.pid_file    = self.ddir / 'daemon.pid'
+        self.events_file = self.ddir / 'events.log'
+
+        self.buf_lines: list = []
+        self._partial    = ''   # incomplete line between reads
+        self.state        = 'UNKNOWN'
+        self._prev_state  = 'UNKNOWN'
+        self.t_output     = 0.0
+        self.t_prompt     = 0.0
+        self.prompt_text  = ''
+        self._stop        = Event()
+        self._sock        = None
+        self._fd          = None
+
+    def _connect(self):
+        if self.tcp:
+            host, port = self.tcp
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.connect((host, port))
+            self._sock = s
+            return s.fileno()
+        else:
+            fd = os.open(self.device, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
+            bconst = {
+                9600: termios.B9600,   19200: termios.B19200,  38400: termios.B38400,
+                57600: termios.B57600, 115200: termios.B115200, 230400: termios.B230400,
+                460800: termios.B460800, 921600: termios.B921600,
+                1000000: getattr(termios, 'B1000000', termios.B115200),
+                1500000: getattr(termios, 'B1500000', termios.B115200),
+            }.get(self.baud, termios.B115200)
+            saved = termios.tcgetattr(fd)
+            attrs = list(saved)
+            attrs[2] |= termios.CLOCAL | termios.CREAD
+            attrs[2] &= ~termios.HUPCL
+            attrs[3] &= ~(termios.ICANON | termios.ECHO | termios.ECHOE)
+            attrs[0] &= ~termios.ICRNL
+            attrs[4] = bconst; attrs[5] = bconst
+            # attrs[6] is a list; elements may be single-byte bytes objects or ints.
+            # tcsetattr expects a list — convert elements to int but keep as list.
+            vchars = [(b[0] if isinstance(b, bytes) else b) for b in attrs[6]]
+            vchars[termios.VMIN] = 0; vchars[termios.VTIME] = 1
+            attrs[6] = vchars   # list, NOT bytes — tcsetattr requires list
+            termios.tcsetattr(fd, termios.TCSANOW, attrs)
+            # Set a wide terminal window so the board doesn't wrap output mid-line
+            import struct, fcntl
+            try:
+                winsize = struct.pack('HHHH', 50, 220, 0, 0)  # rows=50, cols=220
+                fcntl.ioctl(fd, termios.TIOCSWINSZ, winsize)
+            except Exception:
+                pass
+            self._fd = fd
+            return fd
+
+    def _send_raw(self, data: bytes):
+        if self._sock:
+            self._sock.sendall(data)
+        elif self._fd is not None:
+            os.write(self._fd, data)
+
+    def _update_state(self, text: str):
+        t = now()
+        # Strip ANSI codes before pattern matching (handles colored prompts)
+        clean = _strip_ansi(text)
+        lines = [l for l in clean.replace('\r', '').split('\n') if l.strip()]
+        last = lines[-1] if lines else ''
+
+        prev = self.state
+        if RE_PANIC.search(clean[-500:]):
+            self.state = 'PANIC'             # kernel panic / oops — board needs reboot
+        elif RE_UBOOT.search(last):
+            self.state = 'UBOOT'             # U-Boot interactive prompt
+            self.t_prompt = t
+            self.prompt_text = last.strip()
+        elif RE_LOGIN.search(last):
+            self.state = 'LOGIN'
+        elif RE_PASSWORD.search(last):
+            self.state = 'PASSWORD'
+        elif RE_SHELL2.search(last) or (RE_SHELL.search(last) and len(last) > 2):
+            self.state = 'SHELL'
+            self.t_prompt = t
+            self.prompt_text = last.strip()
+        elif RE_BOOT.search(clean[-300:]):
+            self.state = 'BOOTING'
+        elif t - self.t_output > DEAD_AFTER:
+            self.state = 'DEAD'
+        elif (self.t_output > self.t_prompt
+              and t - self.t_output > 0.2
+              and t - self.t_prompt > RUNNING_AFTER):
+            self.state = 'RUNNING'
+
+        if self.state != self._prev_state:
+            detail = f'  {self.prompt_text}' if self.state == 'SHELL' else ''
+            entry = f'[{ts()}] {self._prev_state} → {self.state}{detail}'
+            # Rotated append: keep last MAX_EVENTS lines
+            try:
+                existing = (self.events_file.read_text().splitlines()
+                            if self.events_file.exists() else [])
+                existing.append(entry)
+                if len(existing) > MAX_EVENTS:
+                    existing = existing[-MAX_EVENTS:]
+                self.events_file.write_text('\n'.join(existing) + '\n')
+            except OSError:
+                pass
+            self._prev_state = self.state
+
+    def _append(self, data: bytes):
+        text = data.decode('utf-8', errors='replace')
+        self.t_output = now()
+        self._update_state(text)
+        # Prepend any partial line buffered from the previous read to avoid
+        # splitting lines across os.read() boundaries (e.g. "6.18.13" + "-dirty\n")
+        full = self._partial + text
+        parts = re.split(r'\r?\n', full)
+        # If text didn't end with \n, the last element is an incomplete line
+        if full and not full.endswith('\n'):
+            self._partial = parts[-1]
+            parts = parts[:-1]
+        else:
+            self._partial = ''
+        for raw in parts:
+            line = raw.strip('\r')
+            if line:
+                self.buf_lines.append(f'[{ts()}] {line}')
+        if len(self.buf_lines) > self.maxlines:
+            self.buf_lines = self.buf_lines[-self.maxlines:]
+        try:
+            self.buf_file.write_text('\n'.join(self.buf_lines) + '\n')
+        except OSError:
+            pass
+        self._write_status()
+
+    def _write_status(self):
+        t = now()
+        s = {
+            'state':           self.state,
+            'last_output_ago': round(t - self.t_output, 1) if self.t_output else None,
+            'last_prompt_ago': round(t - self.t_prompt, 1) if self.t_prompt else None,
+            'prompt_text':     self.prompt_text,
+            'pid':             os.getpid(),
+            'device':          self.device,
+            'baud':            self.baud,
+            'via':             f'tcp:{self.tcp[0]}:{self.tcp[1]}' if self.tcp else 'direct',
+            'buf_file':        str(self.buf_file),
+            'buf_lines':       len(self.buf_lines),
+        }
+        try:
+            self.status_file.write_text(json.dumps(s, indent=2))
+        except OSError:
+            pass
+
+    def _writer(self):
+        while not self._stop.is_set():
+            try:
+                with open(self.fifo_file, 'rb') as f:
+                    while not self._stop.is_set():
+                        data = f.read(256)
+                        if not data:
+                            break
+                        self._send_raw(data)
+            except OSError:
+                time.sleep(0.1)
+
+    def run(self):
+        self.pid_file.write_text(str(os.getpid()))
+        self._write_status()
+        if not self.fifo_file.exists():
+            os.mkfifo(self.fifo_file)
+        signal.signal(signal.SIGTERM, lambda *_: self._stop.set())
+        signal.signal(signal.SIGINT,  lambda *_: self._stop.set())
+        Thread(target=self._writer, daemon=True).start()
+
+        backoff = 1.0
+        while not self._stop.is_set():
+            try:
+                rfd = self._connect()
+                backoff = 1.0
+                print(f'[serial-agent] {self.device} connected '
+                      f'via {"tcp" if self.tcp else "direct"}', flush=True)
+                while not self._stop.is_set():
+                    r, _, _ = select.select([rfd], [], [], 0.5)
+                    if r:
+                        data = os.read(rfd, 4096)
+                        if not data:
+                            break
+                        self._append(data)
+                    else:
+                        if self.t_output and now() - self.t_output > DEAD_AFTER:
+                            if self.state != 'DEAD':
+                                self.state = 'DEAD'
+                                self._write_status()
+            except (ConnectionRefusedError, OSError) as e:
+                print(f'[serial-agent] connect error: {e} — retry in {backoff}s', flush=True)
+                self.state = 'DEAD'
+                self._write_status()
+                time.sleep(backoff)
+                backoff = min(backoff * 2, 30)
+            finally:
+                if self._sock:
+                    try: self._sock.close()
+                    except: pass
+                    self._sock = None
+                if self._fd is not None:
+                    try: os.close(self._fd)
+                    except: pass
+                    self._fd = None
+
+        self.pid_file.unlink(missing_ok=True)
+        print('[serial-agent] stopped', flush=True)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Utilities
+# ══════════════════════════════════════════════════════════════════════════════
+def find_ser2net_port(device: str):
+    for cfg in ('/etc/ser2net.yaml', '/etc/ser2net.conf'):
+        try:
+            text = Path(cfg).read_text()
+        except OSError:
+            continue
+        lines = text.split('\n')
+        for i, line in enumerate(lines):
+            if device in line and 'serialdev' in line:
+                block = '\n'.join(lines[max(0, i-8):i+8])
+                m = re.search(r'accepter\s*:\s*(?:telnet,)?tcp[^,\n]*,\s*(\d+)', block, re.I)
+                if m:
+                    return f'localhost:{m.group(1)}'
+    return None
+
+
+def _wait_pattern(device, pattern, timeout, show=False, baseline_offset=None):
+    """Poll buf.log for `pattern`. Adaptive: 50ms for first second, 200ms after.
+    baseline_offset: byte offset in buf.log to start reading from — set this
+    to the file size BEFORE sending so only post-send output is captured."""
+    bf = devdir(device) / 'buf.log'
+    pat = re.compile(pattern)
+    deadline = time.time() + timeout
+    t_start = time.time()
+    baseline = baseline_offset if baseline_offset is not None else (
+        bf.stat().st_size if bf.exists() else 0)
+
+    while time.time() < deadline:
+        interval = 0.05 if (time.time() - t_start) < 1.0 else 0.2
+        time.sleep(interval)
+
+        if not bf.exists():
+            continue
+        sz = bf.stat().st_size
+        if sz <= baseline:
+            continue
+
+        try:
+            with open(bf, 'rb') as f:
+                f.seek(baseline)
+                new = f.read().decode('utf-8', errors='replace')
+        except OSError:
+            continue
+        baseline = sz
+
+        if new and show:
+            for line in new.splitlines():
+                print(RE_TIMESTAMP.sub('', line))
+            sys.stdout.flush()
+
+        if pat.search(_strip_ansi(new)):
+            return True
+
+    return False
+
+
+def _daemon_running(device: str) -> bool:
+    pf = devdir(device) / 'daemon.pid'
+    if not pf.exists():
+        return False
+    try:
+        os.kill(int(pf.read_text().strip()), 0)
+        return True
+    except (OSError, ValueError):
+        return False
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CLI commands
+# ══════════════════════════════════════════════════════════════════════════════
+def cmd_start(args):
+    tcp = None
+    if args.tcp:
+        host, port = args.tcp.rsplit(':', 1)
+        tcp = (host, int(port))
+
+    ensure_symlink()
+    AGENT_BASE.mkdir(parents=True, exist_ok=True)
+
+    ddir = devdir(args.device)
+    # Remove ALL transient files so old daemon can't steal commands or data
+    for stale in ('buf.log', 'status.json', 'daemon.pid', 'input.fifo', 'events.log'):
+        (ddir / stale).unlink(missing_ok=True)
+
+    pid = os.fork()
+    if pid:
+        time.sleep(0.6)
+        sf = ddir / 'status.json'
+        if sf.exists():
+            s = json.loads(sf.read_text())
+            print(f"daemon PID {s['pid']}  {args.device}  via {s['via']}")
+            print(f"  buf:  {s['buf_file']}")
+            print(f"  tail: tail -f {s['buf_file']}")
+        return
+
+    os.setsid()
+    if os.fork():
+        os._exit(0)
+
+    sys.stdin  = open('/dev/null', 'r')
+    sys.stdout = open(ddir / 'daemon.log', 'a', buffering=1)
+    sys.stderr = sys.stdout
+    Daemon(args.device, tcp, args.baud, args.lines).run()
+
+
+def cmd_stop(args):
+    pf = devdir(args.device) / 'daemon.pid'
+    killed = []
+    if pf.exists():
+        try:
+            pid = int(pf.read_text().strip())
+            os.kill(pid, signal.SIGTERM)
+            killed.append(pid)
+        except (OSError, ValueError):
+            pass
+        pf.unlink(missing_ok=True)
+    # Also kill any other processes still holding the device (stale restarts)
+    import subprocess
+    try:
+        r = subprocess.run(['fuser', args.device], capture_output=True, text=True)
+        for p in r.stdout.split():
+            try:
+                pid2 = int(p)
+                if pid2 not in killed:
+                    os.kill(pid2, signal.SIGTERM)
+                    killed.append(pid2)
+            except (OSError, ValueError):
+                pass
+    except FileNotFoundError:
+        pass
+    if killed:
+        print(f'SIGTERM → PIDs {killed}')
+    else:
+        print(f'no daemon running for {args.device}')
+
+
+def cmd_status(args):
+    sf = devdir(args.device) / 'status.json'
+    if not sf.exists():
+        print(json.dumps({'state': 'NO_DAEMON', 'device': args.device}))
+        sys.exit(1)
+    print(sf.read_text())
+
+
+def cmd_alive(args):
+    sf = devdir(args.device) / 'status.json'
+    if not sf.exists():
+        print('NO_DAEMON'); sys.exit(1)
+    s = json.loads(sf.read_text())
+    state = s.get('state', 'UNKNOWN')
+
+    if state == 'SHELL':
+        ago = s.get('last_prompt_ago')
+        if ago is not None and ago < args.timeout:
+            print(f'ALIVE  state=SHELL  prompt {ago:.0f}s ago'); sys.exit(0)
+
+    # RUNNING = board is alive, just busy — don't probe (would interrupt command!)
+    if state == 'RUNNING':
+        ago = s.get('last_output_ago')
+        if ago is not None and ago < args.timeout:
+            print(f'ALIVE  state=RUNNING  output {ago:.1f}s ago'); sys.exit(0)
+
+    # Any recent output = alive (covers BOOTING, LOGIN, etc.)
+    ago = s.get('last_output_ago')
+    if ago is not None and ago < 2.0:
+        print(f'ALIVE  state={state}  output {ago:.1f}s ago'); sys.exit(0)
+
+    # Slow path: probe with CR
+    fifo = devdir(args.device) / 'input.fifo'
+    bf   = devdir(args.device) / 'buf.log'
+    if fifo.exists():
+        with open(fifo, 'wb') as f:
+            f.write(b'\r')
+        deadline = time.time() + args.timeout
+        prev = bf.stat().st_size if bf.exists() else 0
+        while time.time() < deadline:
+            time.sleep(0.15)
+            if bf.exists() and bf.stat().st_size > prev:
+                s2 = json.loads(sf.read_text())
+                st2 = s2.get('state', '')
+                if st2 in ('SHELL', 'RUNNING', 'LOGIN', 'PASSWORD'):
+                    print(f'ALIVE  state={st2}  (probe response)'); sys.exit(0)
+                prev = bf.stat().st_size
+
+    print(f'DEAD_OR_UNKNOWN  state={state}'); sys.exit(1)
+
+
+def cmd_read(args):
+    bf = devdir(args.device) / 'buf.log'
+    if not bf.exists():
+        sys.exit(0)
+    lines = bf.read_text().splitlines()
+    tail = lines[-args.lines:]
+    if args.no_timestamps:
+        tail = _strip_timestamps(tail)
+    print('\n'.join(tail))
+
+
+def cmd_send(args):
+    # ── Fan-out: send to ALL running daemons ──────────────────────────────────
+    if args.all:
+        targets = []
+        if AGENT_BASE.exists():
+            for ddir_p in AGENT_BASE.iterdir():
+                if not ddir_p.is_dir(): continue
+                dev = f'/dev/{ddir_p.name}'
+                if _daemon_running(dev):
+                    targets.append(dev)
+        if not targets:
+            print('No running daemons found.', file=sys.stderr); sys.exit(1)
+
+        import threading
+        results = {}
+        def _send_one(dev):
+            ns = argparse.Namespace(**vars(args))
+            ns.device = dev; ns.all = False
+            results[dev] = _send_impl(ns)
+
+        threads = [threading.Thread(target=_send_one, args=(d,)) for d in targets]
+        for t in threads: t.start()
+        for t in threads: t.join()
+
+        if args.json:
+            print(json.dumps(results, indent=2))
+        else:
+            for dev, r in results.items():
+                print(f'\n── {dev} ──')
+                if isinstance(r, dict):
+                    print(r.get('output', ''))
+        sys.exit(0 if all(not r.get('timed_out') for r in results.values() if isinstance(r, dict)) else 1)
+
+    result = _send_impl(args)
+    if result is None:
+        return  # --no-wait
+
+    if args.json:
+        print(json.dumps(result, indent=2))
+        sys.exit(0 if not result.get('timed_out') else 1)
+    elif args.capture:
+        print(result.get('output', ''))
+        ec = result.get('exit_code')
+        if ec is not None and ec != 0:
+            sys.exit(ec)
+        sys.exit(0 if not result.get('timed_out') else 1)
+    else:
+        sys.exit(0 if not result.get('timed_out') else 1)
+
+
+def _send_impl(args):
+    """Core send implementation. Returns dict (for --json/--capture) or None."""
+    fifo = devdir(args.device) / 'input.fifo'
+    if not fifo.exists():
+        print(f'no daemon for {args.device}', file=sys.stderr); sys.exit(1)
+
+    bf = devdir(args.device) / 'buf.log'
+    t0 = time.time()
+    baseline_offset = bf.stat().st_size if bf.exists() else 0
+
+    cmd = args.command.rstrip('\n')
+    if getattr(args, 'no_wrap', False):
+        # Prevent board terminal from wrapping long output lines
+        cmd = f'COLUMNS=32767 LINES=200 {cmd}'
+    if args.exit_code:
+        cmd = f'{cmd}; echo "{EXITCODE_TAG}:$?"'
+    cmd_bytes = (cmd + '\n').encode()
+
+    # Use O_NONBLOCK so we never block waiting for the daemon's reader.
+    # Retry briefly if the daemon's _writer thread isn't ready yet.
+    sent = False
+    for attempt in range(20):   # up to 2s (20 × 0.1s)
+        try:
+            fd = os.open(str(fifo), os.O_WRONLY | os.O_NONBLOCK)
+            try:
+                os.write(fd, cmd_bytes)
+            finally:
+                os.close(fd)
+            sent = True
+            break
+        except OSError:
+            time.sleep(0.1)
+    if not sent:
+        print(f'daemon not accepting input for {args.device}', file=sys.stderr)
+        sys.exit(1)
+
+    # --no-wait: fire and forget
+    if args.wait is None and not (args.json or args.capture or args.exit_code):
+        return None
+
+    wait_pat = args.wait if args.wait is not None else r'[\$#>]\s*$'
+    show = not (args.json or args.capture)
+    ok = _wait_pattern(args.device, wait_pat, args.timeout,
+                       show=show, baseline_offset=baseline_offset)
+    elapsed_ms = int((time.time() - t0) * 1000)
+
+    if args.json or args.capture or args.exit_code:
+        new_lines = []
+        if bf.exists():
+            with open(bf, 'rb') as f:
+                f.seek(baseline_offset)
+                raw = f.read().decode('utf-8', errors='replace')
+            new_lines = raw.splitlines()
+        output, exit_code = _clean_output(new_lines, cmd.strip())  # use actual sent cmd for echo detection
+        sf = devdir(args.device) / 'status.json'
+        state = json.loads(sf.read_text()).get('state', '?') if sf.exists() else '?'
+        return {
+            'output':     output,
+            'state':      state,
+            'elapsed_ms': elapsed_ms,
+            'exit_code':  exit_code,
+            'timed_out':  not ok,
+        }
+    return {'timed_out': not ok}
+
+
+def cmd_expect(args):
+    """Wait for first of multiple patterns. Returns JSON with matched key and output."""
+    bf = devdir(args.device) / 'buf.log'
+    baseline_offset = bf.stat().st_size if bf.exists() else 0
+    deadline = time.time() + args.timeout
+    t0 = time.time()
+
+    patterns = {}
+    for p in args.on:
+        if '=' not in p:
+            print(f'Bad --on format (use KEY=REGEX): {p}', file=sys.stderr); sys.exit(1)
+        key, regex = p.split('=', 1)
+        patterns[key] = re.compile(regex)
+
+    import shutil
+    use_inotify = bool(shutil.which('inotifywait')) and bf.parent.exists()
+    baseline = baseline_offset
+
+    while time.time() < deadline:
+        if use_inotify:
+            remaining = max(0.1, deadline - time.time())
+            try:
+                import subprocess
+                subprocess.run(
+                    ['inotifywait', '-q', '-e', 'modify,create',
+                     '--timeout', str(min(remaining, 5)), str(bf.parent)],
+                    capture_output=True, timeout=remaining + 1)
+            except Exception:
+                use_inotify = False
+        else:
+            interval = 0.05 if (time.time() - t0) < 1.0 else 0.2
+            time.sleep(interval)
+
+        if not bf.exists(): continue
+        sz = bf.stat().st_size
+        if sz <= baseline: continue
+
+        try:
+            with open(bf, 'rb') as f:
+                f.seek(baseline_offset); all_new = f.read().decode('utf-8', errors='replace')
+            with open(bf, 'rb') as f:
+                f.seek(baseline); inc = f.read().decode('utf-8', errors='replace')
+        except OSError:
+            continue
+        baseline = sz
+
+        clean_inc = _strip_ansi(inc)
+        for key, pat in patterns.items():
+            if pat.search(clean_inc):
+                lines, _ = _clean_output(all_new.splitlines())
+                print(json.dumps({
+                    'matched':    key,
+                    'output':     lines,
+                    'elapsed_ms': int((time.time() - t0) * 1000),
+                }))
+                sys.exit(0)
+
+    # Timed out
+    lines = ''
+    if bf.exists():
+        with open(bf, 'rb') as f:
+            f.seek(baseline_offset)
+            raw, _ = _clean_output(f.read().decode('utf-8', errors='replace').splitlines())
+        lines = raw
+    print(json.dumps({
+        'matched':    None,
+        'output':     lines,
+        'elapsed_ms': int((time.time() - t0) * 1000),
+        'timed_out':  True,
+    }))
+    sys.exit(1)
+
+
+def cmd_wait(args):
+    sys.exit(0 if _wait_pattern(args.device, args.pattern, args.timeout) else 1)
+
+
+def cmd_wait_state(args):
+    """Block until board reaches target state. Uses inotifywait (instant) if available."""
+    import shutil
+    ef = devdir(args.device) / 'events.log'
+    sf = devdir(args.device) / 'status.json'
+    targets = {s.strip().upper() for s in args.state.split(',')}
+
+    if sf.exists():
+        s = json.loads(sf.read_text())
+        if s.get('state', '') in targets:
+            print(f'ALREADY  state={s["state"]}'); sys.exit(0)
+
+    deadline = time.time() + args.timeout
+    t_start = time.time()
+    baseline = ef.stat().st_size if ef.exists() else 0
+    use_inotify = bool(shutil.which('inotifywait'))
+
+    while time.time() < deadline:
+        if use_inotify:
+            remaining = max(0.1, deadline - time.time())
+            try:
+                import subprocess
+                # Watch the directory containing events.log
+                subprocess.run(
+                    ['inotifywait', '-q', '-e', 'modify,create',
+                     '--timeout', str(min(remaining, 10)), str(ef.parent)],
+                    capture_output=True, timeout=remaining + 2)
+            except Exception:
+                use_inotify = False
+        else:
+            interval = 0.05 if (time.time() - t_start) < 2.0 else 0.2
+            time.sleep(interval)
+
+        if not ef.exists(): continue
+        sz = ef.stat().st_size
+        if sz > baseline:
+            with open(ef) as f:
+                f.seek(baseline); new_lines = f.read()
+            baseline = sz
+            for line in new_lines.splitlines():
+                m = re.search(r'→\s+(\w+)', line)
+                if m and m.group(1) in targets:
+                    print(f'REACHED  {line.strip()}')
+                    sys.exit(0)
+
+    state = json.loads(sf.read_text()).get('state', '?') if sf.exists() else '?'
+    print(f'TIMEOUT  state={state}  waited={args.timeout}s  target={args.state}')
+    sys.exit(1)
+
+
+def cmd_events(args):
+    ef = devdir(args.device) / 'events.log'
+    if not ef.exists():
+        print('No events yet.'); return
+    lines = ef.read_text().splitlines()
+    print('\n'.join(lines[-args.lines:]))
+
+
+def cmd_tail(args):
+    bf = devdir(args.device) / 'buf.log'
+    if not bf.exists():
+        print('no buffer (daemon not started?)', file=sys.stderr); sys.exit(1)
+    lines = bf.read_text().splitlines()
+    for l in lines[-20:]:
+        print(RE_TIMESTAMP.sub('', l) if args.no_timestamps else l)
+    offset = bf.stat().st_size
+    try:
+        while True:
+            time.sleep(0.1)
+            sz = bf.stat().st_size if bf.exists() else 0
+            if sz > offset:
+                with open(bf, 'rb') as f:
+                    f.seek(offset); new = f.read().decode('utf-8', errors='replace')
+                for l in new.splitlines():
+                    print(RE_TIMESTAMP.sub('', l) if args.no_timestamps else l)
+                sys.stdout.flush()
+                offset = sz
+    except KeyboardInterrupt:
+        pass
+
+
+def cmd_connect(args):
+    """One-shot: discover board, start daemon if needed, optionally wait for shell."""
+    import subprocess, shutil
+    sd = shutil.which('serial-discover')
+    if not sd:
+        print('serial-discover not found', file=sys.stderr); sys.exit(1)
+
+    try:
+        raw = subprocess.check_output([sd, '--json'], stderr=subprocess.DEVNULL, timeout=15)
+        devices = json.loads(raw)
+    except Exception as e:
+        print(f'serial-discover failed: {e}', file=sys.stderr); sys.exit(1)
+
+    if args.board:
+        pat = re.compile(args.board, re.I)
+        devices = [d for d in devices
+                   if pat.search(d.get('label', '')) or pat.search(d.get('hostname', ''))
+                   or pat.search(d.get('devname', ''))]
+    if args.serial:
+        devices = [d for d in devices if args.serial in d.get('serial', '')]
+    if not args.board and not args.serial:
+        # default: only LIVE or OPEN boards
+        devices = [d for d in devices if d.get('state') in ('LIVE', 'OPEN')]
+
+    if not devices:
+        what = f"board '{args.board}'" if args.board else 'any live board'
+        print(f'No match for {what}. Run serial-agent auto-label and serial-discover first.',
+              file=sys.stderr); sys.exit(1)
+
+    # Prefer a LIVE or OPEN port (console port) over dead ports
+    live = [d for d in devices if d.get('state') in ('LIVE', 'OPEN')]
+    d = live[0] if live else devices[0]
+    device = d['device']
+    ensure_symlink()
+
+    # Start daemon if not running
+    if not _daemon_running(device):
+        tcp = find_ser2net_port(device)
+        cmd = [sys.argv[0], 'start', device, '--baud', str(d['baud'])]
+        if tcp: cmd += ['--tcp', tcp]
+        subprocess.run(cmd, check=True)
+        time.sleep(0.4)
+
+    if args.wait_shell:
+        ns = argparse.Namespace(device=device, state='SHELL,LOGIN,PASSWORD', timeout=args.timeout)
+        cmd_wait_state(ns)
+        if args.setup_terminal:
+            # Set wide terminal so the board doesn't wrap output lines
+            _send_impl(argparse.Namespace(
+                device=device, command='stty cols 220 rows 50',
+                wait=r'[\$#>]\s*$', timeout=5,
+                json=False, capture=False, exit_code=False, all=False, no_wrap=False))
+
+    if args.json:
+        sf = devdir(device) / 'status.json'
+        info = {'device': device, 'label': d['label'], 'hostname': d['hostname'],
+                'baud': d['baud'], 'state': None}
+        if sf.exists():
+            info['state'] = json.loads(sf.read_text()).get('state')
+        print(json.dumps(info))
+    else:
+        label = d['label'] or d['hostname'] or d['devname']
+        print(f'Connected: {device} ({label})')
+        sf = devdir(device) / 'status.json'
+        if sf.exists():
+            state = json.loads(sf.read_text()).get('state', '?')
+            print(f'  state: {state}')
+
+
+def cmd_path(args):
+    print(devdir(args.device))
+
+
+def cmd_auto_label(args):
+    """Generate unique labels for unlabeled boards and update serial-boards.conf.
+    Format: hostname-last6serial — unique even for two identical board types."""
+    import subprocess, shutil
+    sd = shutil.which('serial-discover')
+    if not sd:
+        print('serial-discover not found', file=sys.stderr); sys.exit(1)
+
+    try:
+        raw = subprocess.check_output([sd, '--json'], stderr=subprocess.DEVNULL, timeout=15)
+        devices = json.loads(raw)
+    except Exception as e:
+        print(f'serial-discover failed: {e}', file=sys.stderr); sys.exit(1)
+
+    cfg = Path.home() / '.config' / 'serial-boards.conf'
+    existing_text = cfg.read_text() if cfg.exists() else ''
+
+    seen, to_label = set(), {}
+    for d in devices:
+        ser = d['serial']
+        if not ser or ser in seen: continue
+        seen.add(ser)
+        if d.get('label') or ser in existing_text: continue
+        hostname = d.get('hostname', '')
+        if d['state'] in ('LIVE', 'OPEN') or hostname:
+            to_label[ser] = {'hostname': hostname or d['chip'].lower(),
+                             'chip': d['chip'], 'devname': d['devname'],
+                             'state': d['state'], 'baud': d['baud']}
+
+    if not to_label:
+        print('Nothing to label — all boards already have entries.'); return
+
+    entries = []
+    for ser, info in to_label.items():
+        suffix = ser[-6:] if len(ser) >= 6 else ser
+        label = f"{info['hostname']}-{suffix}"
+        entries.append((ser, label, info))
+
+    print(f'Proposed additions to {cfg}:\n')
+    for ser, label, info in entries:
+        baud_str = f" baud={info['baud']}" if info['baud'] != 115200 else ''
+        print(f'  {ser} = {label}  ({info["chip"]} / {info["devname"]} / {info["state"]}{baud_str})')
+
+    print()
+    if args.dry_run:
+        print('(dry-run — nothing written)'); return
+    if not args.yes:
+        confirm = input('Write to serial-boards.conf? [y/N]: ').strip().lower()
+        if confirm != 'y':
+            print('Aborted.'); return
+
+    with open(cfg, 'a') as f:
+        f.write('\n# Auto-labeled by serial-agent auto-label\n')
+        for ser, label, info in entries:
+            baud_suffix = f':{info["baud"]}' if info['baud'] != 115200 else ''
+            f.write(f'{ser}={label}{baud_suffix}\n')
+    print(f'Added {len(entries)} label(s). Edit {cfg} to rename.')
+    print('Labels track USB serial# — stable across sessions and replug.')
+
+
+def cmd_discover(args):
+    """Discover ports, augment with ser2net + daemon info. No hardcoding needed."""
+    import subprocess, shutil
+    sd = shutil.which('serial-discover')
+    if not sd:
+        print('serial-discover not found', file=sys.stderr); sys.exit(1)
+    try:
+        raw = subprocess.check_output([sd, '--json'], stderr=subprocess.DEVNULL, timeout=15)
+        devices = json.loads(raw)
+    except Exception as e:
+        print(f'serial-discover failed: {e}', file=sys.stderr); sys.exit(1)
+
+    if args.board:
+        pat = re.compile(args.board, re.I)
+        devices = [d for d in devices
+                   if pat.search(d.get('label', '')) or pat.search(d.get('hostname', ''))
+                   or pat.search(d.get('devname', ''))]
+    if args.serial:
+        devices = [d for d in devices if args.serial in d.get('serial', '')]
+    if args.live:
+        devices = [d for d in devices if d.get('state') in ('LIVE', 'OPEN')]
+
+    for d in devices:
+        dev = d['device']
+        tcp = find_ser2net_port(dev)
+        d['ser2net_tcp'] = tcp
+        d['daemon_running'] = False
+        d['daemon_state']   = None
+        sf = AGENT_BASE / d['devname'] / 'status.json'
+        pf = AGENT_BASE / d['devname'] / 'daemon.pid'
+        if sf.exists() and pf.exists():
+            try:
+                os.kill(int(pf.read_text().strip()), 0)
+                d['daemon_running'] = True
+                d['daemon_state'] = json.loads(sf.read_text()).get('state')
+            except (OSError, ValueError, json.JSONDecodeError):
+                pass
+        cmd = ['serial-agent', 'start', dev, '--baud', str(d['baud'])]
+        if tcp: cmd += ['--tcp', tcp]
+        d['start_cmd'] = ' '.join(cmd)
+
+    print(json.dumps(devices, indent=2))
+
+
+def _do_send(device, command, wait=r'[\$#>]\s*$', timeout=10, no_wrap=False):
+    """Helper: fire a send and return the result dict."""
+    return _send_impl(argparse.Namespace(
+        device=device, command=command, wait=wait, timeout=timeout,
+        json=True, capture=False, exit_code=False, all=False, no_wrap=no_wrap))
+
+
+def cmd_reboot(args):
+    """Reboot the board and wait for it to come back up.
+
+    Sends 'reboot' (or a custom --cmd), watches for DEAD, then waits for
+    SHELL/LOGIN/UBOOT. Optionally auto-logs in and sets up the terminal.
+
+    Typical MPU workflow:
+      serial-agent reboot DEVICE --login --setup-terminal --timeout 120
+    """
+    device = args.device
+
+    # Send the reboot command — don't wait for prompt (shell dies immediately)
+    fifo = devdir(device) / 'input.fifo'
+    if fifo.exists():
+        cmd_bytes = (args.cmd + '\n').encode()
+        for _ in range(20):
+            try:
+                fd = os.open(str(fifo), os.O_WRONLY | os.O_NONBLOCK)
+                try: os.write(fd, cmd_bytes)
+                finally: os.close(fd)
+                break
+            except OSError:
+                time.sleep(0.1)
+
+    if not args.quiet:
+        print(f'Rebooting {device}...')
+
+    # Wait for board to go down (DEAD or BOOTING)
+    ns = argparse.Namespace(device=device, state='DEAD,BOOTING', timeout=30)
+    cmd_wait_state(ns)
+
+    # Wait for board to come back
+    target = 'SHELL,LOGIN,UBOOT' if not args.no_login else 'SHELL,UBOOT'
+    ns = argparse.Namespace(device=device, state=target, timeout=args.timeout)
+    cmd_wait_state(ns)
+
+    # Auto-login if board is at LOGIN prompt
+    sf = devdir(device) / 'status.json'
+    state = json.loads(sf.read_text()).get('state', '') if sf.exists() else ''
+    if state == 'LOGIN' and not args.no_login:
+        _do_send(device, args.user, wait=r'Password|[\$#>]\s*$', timeout=10)
+        state = json.loads(sf.read_text()).get('state', '') if sf.exists() else ''
+        if state == 'PASSWORD' and args.password is not None:
+            _do_send(device, args.password or '', wait=r'[\$#>]\s*$', timeout=10)
+
+    if args.setup_terminal and state == 'SHELL':
+        _do_send(device, 'stty cols 220 rows 50', timeout=5)
+
+    state = json.loads(sf.read_text()).get('state', '?') if sf.exists() else '?'
+    if args.json:
+        print(json.dumps({'state': state, 'device': device}))
+    elif not args.quiet:
+        print(f'Board back: state={state}')
+    sys.exit(0 if state in ('SHELL', 'UBOOT') else 1)
+
+
+def cmd_login(args):
+    """Handle the board login sequence (username + optional password).
+
+    Detects current state and sends credentials accordingly.
+    TI boards: root with no password (default).
+
+    Can be called after reboot or whenever the board is at a login prompt.
+    """
+    device = args.device
+    sf = devdir(device) / 'status.json'
+    if not sf.exists():
+        print(f'No daemon for {device}', file=sys.stderr); sys.exit(1)
+
+    state = json.loads(sf.read_text()).get('state', 'UNKNOWN')
+    if state == 'SHELL':
+        print('Already at shell'); return
+    if state not in ('LOGIN', 'UNKNOWN'):
+        print(f'Unexpected state: {state} (need LOGIN)', file=sys.stderr); sys.exit(1)
+
+    # Send username
+    _do_send(device, args.user, wait=r'Password|[\$#>]\s*$', timeout=10)
+
+    # Check if password was requested
+    state = json.loads(sf.read_text()).get('state', '') if sf.exists() else ''
+    if state == 'PASSWORD':
+        _do_send(device, args.password or '', wait=r'[\$#>]\s*$', timeout=10)
+
+    # Verify shell
+    ns = argparse.Namespace(device=device, state='SHELL', timeout=5)
+    cmd_wait_state(ns)
+    state = json.loads(sf.read_text()).get('state', '?') if sf.exists() else '?'
+    print(f'Logged in: state={state}')
+    sys.exit(0 if state == 'SHELL' else 1)
+
+
+def _get_host_ip_for(board_ip):
+    """Find the host IP on the same subnet as the board."""
+    import socket
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect((board_ip, 80))
+        return s.getsockname()[0]
+    except Exception:
+        return None
+    finally:
+        s.close()
+
+
+def _upload_via_network(args):
+    """Upload via temporary HTTP server — ~1MB/s vs ~1KB/s for serial base64.
+    Board needs network access and wget. Inspired by Hermes deploy_serial.py pattern."""
+    import http.server, threading, socket
+    host_path = Path(args.hostfile)
+    if not host_path.exists():
+        print(f'Not found: {host_path}', file=sys.stderr); sys.exit(1)
+
+    board_path = args.boardpath
+    if board_path.endswith('/'):
+        board_path += host_path.name
+
+    # Detect board IP from args or from the board itself
+    board_ip = args.board_ip
+    if not board_ip:
+        # Ask the board for its IP
+        result = _do_send(args.device,
+            "ip route get 1.1.1.1 2>/dev/null | awk '{print $7;exit}' || hostname -I | awk '{print $1}'",
+            timeout=5, no_wrap=True)
+        board_ip = (result.get('output', '') if result else '').strip().split()[0] if result else ''
+        if not board_ip:
+            print('Cannot detect board IP. Specify --board-ip.', file=sys.stderr); sys.exit(1)
+
+    host_ip = _get_host_ip_for(board_ip)
+    if not host_ip:
+        print(f'Cannot find host IP on same subnet as {board_ip}', file=sys.stderr); sys.exit(1)
+
+    # Start temporary HTTP server serving just this file's directory
+    serve_dir = str(host_path.parent)
+    port = args.http_port
+
+    class SilentHandler(http.server.SimpleHTTPRequestHandler):
+        def __init__(self, *a, **kw):
+            super().__init__(*a, directory=serve_dir, **kw)
+        def log_message(self, *_): pass  # suppress logs
+
+    httpd = http.server.HTTPServer(('0.0.0.0', port), SilentHandler)
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+
+    url = f'http://{host_ip}:{port}/{host_path.name}'
+    size = host_path.stat().st_size
+    if not args.quiet:
+        print(f'HTTP server: {url}  ({size} bytes)')
+
+    try:
+        # Ensure destination directory exists
+        _do_send(args.device, f'mkdir -p "$(dirname \'{board_path}\')"', timeout=5)
+
+        # Download on the board
+        result = _do_send(args.device,
+            f'wget -q -O "{board_path}" "{url}" && wc -c < "{board_path}"',
+            timeout=60, no_wrap=True)
+
+        if result and not result.get('timed_out'):
+            actual = result.get('output', '').strip()
+            if actual.isdigit() and int(actual) == size:
+                print(f'✓ {board_path} ({size} bytes) via HTTP')
+                return
+            else:
+                print(f'Size mismatch: expected {size}, got {actual!r}', file=sys.stderr)
+        else:
+            print('Upload timed out or failed', file=sys.stderr)
+        sys.exit(1)
+    finally:
+        httpd.shutdown()
+
+
+def cmd_upload(args):
+    """Upload a file to the board.
+
+    Two modes:
+      Serial (default): base64 encoding over serial. No network needed.
+        Speed: ~1 KB/s. Good for small files (modules, DTBs, scripts).
+      Network (--via-network): starts HTTP server on host, board uses wget.
+        Speed: ~1 MB/s. Requires board to have network access and wget.
+        Automatically detects host IP on the board's subnet.
+
+    Examples:
+      serial-agent upload DEVICE ./my.ko /lib/modules/6.x/extra/
+      serial-agent upload DEVICE ./large.bin /tmp/ --via-network
+      serial-agent upload DEVICE ./large.bin /tmp/ --via-network --board-ip 192.168.1.100
+    """
+    if args.via_network:
+        _upload_via_network(args)
+        return
+    import base64
+    device = args.device
+    host_path = Path(args.hostfile)
+    if not host_path.exists():
+        print(f'Not found: {host_path}', file=sys.stderr); sys.exit(1)
+
+    board_path = args.boardpath
+    if board_path.endswith('/'):
+        board_path += host_path.name
+
+    data = host_path.read_bytes()
+    b64  = base64.b64encode(data).decode('ascii')
+    size = len(data)
+
+    if not args.quiet:
+        print(f'Uploading {host_path.name} ({size} bytes) → {board_path}')
+
+    # Ensure destination directory exists
+    _do_send(device, f'mkdir -p "$(dirname \'{board_path}\')"', timeout=5)
+
+    # Write base64 in chunks via printf (avoids shell expansion issues)
+    tmp = '/tmp/_sa_upload.b64'
+    _do_send(device, f'printf "" > {tmp}', timeout=5)  # create/truncate
+
+    CHUNK = 72   # base64 chars per chunk (54 raw bytes); stays well within command limits
+    chunks = [b64[i:i+CHUNK] for i in range(0, len(b64), CHUNK)]
+    total  = len(chunks)
+
+    for i, chunk in enumerate(chunks, 1):
+        if not args.quiet and (i % 50 == 0 or i == total):
+            print(f'  {i}/{total} chunks ({i*100//total}%)', flush=True)
+        _do_send(device, f'printf "%s" "{chunk}" >> {tmp}', timeout=5)
+
+    # Decode and verify
+    result = _do_send(device,
+        f'base64 -d {tmp} > "{board_path}" && rm {tmp} '
+        f'&& wc -c < "{board_path}"',
+        timeout=30, no_wrap=True)
+
+    if result and not result.get('timed_out'):
+        actual = result.get('output', '').strip()
+        if actual.isdigit() and int(actual) == size:
+            print(f'✓ {board_path} ({size} bytes)')
+            sys.exit(0)
+        else:
+            print(f'Size mismatch: expected {size}, got {actual}', file=sys.stderr)
+    sys.exit(1)
+
+
+def cmd_run(args):
+    """Execute a multi-line shell script on the board via base64 transfer.
+
+    Writes the script to /tmp, executes it, captures output, cleans up.
+    Useful for complex test sequences, board configuration, or any multi-step
+    operation that would be tedious to send line by line.
+
+    Example:
+      serial-agent run DEVICE test_audio.sh --json --timeout 60
+      echo 'aplay -l; arecord -l' | serial-agent run DEVICE - --capture
+    """
+    import base64
+    device = args.device
+
+    # Read script
+    script_src = args.script
+    if script_src == '-':
+        script = sys.stdin.read()
+    elif Path(script_src).exists():
+        script = Path(script_src).read_text()
+    else:
+        script = script_src  # treat as inline script text
+
+    if not script.strip():
+        print('Empty script', file=sys.stderr); sys.exit(1)
+
+    # Verify board is ready before uploading script
+    sf = devdir(device) / 'status.json'
+    s = json.loads(sf.read_text()) if sf.exists() else {}
+    state = s.get('state', 'UNKNOWN')
+    if state in ('LOGIN', 'PASSWORD', 'BOOTING', 'PANIC'):
+        print(f'Board not at shell (state={state}). Run: serial-agent login {device}',
+              file=sys.stderr); sys.exit(1)
+    if state == 'RUNNING':
+        ns = argparse.Namespace(device=device, state='SHELL', timeout=30)
+        cmd_wait_state(ns)
+    # DEAD is ok if board had a shell prompt before (just quiet) — let the timeout decide
+
+    # Encode and transfer script
+    b64 = base64.b64encode(script.encode()).decode('ascii')
+    tmp = '/tmp/_sa_run.sh'
+    _do_send(device, f'printf "%s" "{b64}" | base64 -d > {tmp} && chmod +x {tmp}', timeout=10)
+
+    # Execute and capture (set wide terminal so script output doesn't wrap)
+    result = _do_send(device,
+        f'stty cols 220 rows 50 2>/dev/null; {tmp}; echo "{EXITCODE_TAG}:$?"; rm -f {tmp}',
+        wait=rf'{EXITCODE_TAG}:\d+|[\$#>]\s*$',
+        timeout=args.timeout, no_wrap=False)
+
+    if result:
+        # Parse exit code from output
+        output = result.get('output', '')
+        exit_code = None
+        lines = output.splitlines()
+        clean = []
+        for l in lines:
+            m = RE_EXITCODE.match(l.strip())
+            if m:
+                exit_code = int(m.group(1))
+            else:
+                clean.append(l)
+        result['output'] = '\n'.join(clean).strip()
+        result['exit_code'] = exit_code
+
+        if args.json:
+            print(json.dumps(result, indent=2))
+        elif args.capture:
+            print(result['output'])
+        else:
+            print(result['output'])
+        sys.exit(exit_code if exit_code is not None else (0 if not result.get('timed_out') else 1))
+    sys.exit(1)
+
+
+def cmd_health(args):
+    """Quick board health snapshot: state, memory, load, kernel, uptime.
+
+    Returns JSON with board vitals. Useful as a pre-flight check before
+    running tests, or for monitoring board health between test runs.
+    """
+    device = args.device
+    sf = devdir(device) / 'status.json'
+    if not sf.exists():
+        print(json.dumps({'state': 'NO_DAEMON'})); sys.exit(1)
+
+    s = json.loads(sf.read_text())
+    state = s.get('state', 'UNKNOWN')
+    health = {'state': state, 'device': device,
+              'last_output_ago': s.get('last_output_ago'),
+              'prompt': s.get('prompt_text')}
+
+    if state in ('SHELL', 'RUNNING'):
+        # Gather vitals with a single compound command
+        vitals_cmd = (
+            'printf "UNAME:%s\\n" "$(uname -r)"; '
+            'printf "UPTIME:%s\\n" "$(cut -d. -f1 /proc/uptime)"; '
+            'printf "MEM_FREE:%s\\n" "$(grep MemAvailable /proc/meminfo | awk \'{print $2}\')"; '
+            'printf "MEM_TOTAL:%s\\n" "$(grep MemTotal /proc/meminfo | awk \'{print $2}\')"; '
+            'printf "LOAD:%s\\n" "$(cut -d\' \' -f1 /proc/loadavg)"'
+        )
+        result = _do_send(device, vitals_cmd, timeout=10, no_wrap=True)
+        if result and not result.get('timed_out'):
+            for line in result.get('output', '').splitlines():
+                if ':' in line:
+                    k, v = line.split(':', 1)
+                    k = k.strip().lower()
+                    v = v.strip()
+                    if k == 'mem_free':
+                        health['mem_free_kb'] = int(v) if v.isdigit() else v
+                    elif k == 'mem_total':
+                        health['mem_total_kb'] = int(v) if v.isdigit() else v
+                    elif k == 'uptime':
+                        health['uptime_sec'] = int(v) if v.isdigit() else v
+                    elif k in ('uname', 'load'):
+                        health[k] = v
+            if 'mem_free_kb' in health and 'mem_total_kb' in health:
+                health['mem_pct_used'] = round(
+                    100 * (health['mem_total_kb'] - health['mem_free_kb'])
+                    / health['mem_total_kb'], 1)
+
+    print(json.dumps(health, indent=2))
+
+
+def cmd_ser2net_gen(args):
+    """Generate /etc/ser2net.yaml from serial-boards.conf + current device state.
+    Assigns TCP ports starting from --start-port. Run after plugging boards in."""
+    import subprocess, shutil
+    sd = shutil.which('serial-discover')
+    if not sd:
+        print('serial-discover not found', file=sys.stderr); sys.exit(1)
+
+    try:
+        raw = subprocess.check_output([sd, '--json'], stderr=subprocess.DEVNULL, timeout=15)
+        devices = json.loads(raw)
+    except Exception as e:
+        print(f'serial-discover failed: {e}', file=sys.stderr); sys.exit(1)
+
+    # Deduplicate by serial. For each serial, prefer LIVE/OPEN port (the console port)
+    # over dead ports — ser2net needs a valid device path for the right interface.
+    seen = {}
+    for d in devices:
+        ser = d['serial']
+        if not ser or not d.get('label'):
+            continue
+        if ser not in seen:
+            seen[ser] = d
+        elif d['state'] in ('LIVE', 'OPEN') and seen[ser]['state'] not in ('LIVE', 'OPEN'):
+            seen[ser] = d   # upgrade to live port
+
+    if not seen:
+        print('No labeled boards found. Run serial-agent auto-label first.',
+              file=sys.stderr); sys.exit(1)
+
+    port = args.start_port
+    blocks = []
+    mapping = []
+    for ser, d in seen.items():
+        label = d['label']
+        safe  = re.sub(r'[^A-Za-z0-9_-]', '_', label)
+        baud  = d['baud']
+        dev   = d['device']
+        blocks.append(
+            f'connection: &{safe}\n'
+            f'  accepter: tcp,{port}\n'
+            f'  connector: serialdev,{dev},{baud}n81,local\n'
+            f'  options:\n'
+            f'    banner: "\\r\\n{label} ({ser}) @ {baud}\\r\\n"\n'
+        )
+        mapping.append((label, dev, port, baud))
+        port += 1
+
+    from datetime import date
+    yaml_out = (
+        f'# Generated by serial-agent ser2net-gen  {date.today()}\n'
+        f'# sudo cp {args.output} /etc/ser2net.yaml && sudo systemctl restart ser2net\n'
+        f'%YAML 1.1\n---\n\n'
+        + '\n'.join(blocks)
+    )
+
+    if args.output == '-':
+        print(yaml_out)
+    else:
+        Path(args.output).write_text(yaml_out)
+        print(f'Written to {args.output}')
+
+    print('\nBoard → TCP port:')
+    for label, dev, tcp_port, baud in mapping:
+        print(f'  {label:25} {dev}  →  tcp:{tcp_port}  ({baud} baud)')
+    print(f'\nInstall:')
+    print(f'  sudo cp {args.output} /etc/ser2net.yaml')
+    print(f'  sudo systemctl restart ser2net')
+    print(f'\nThen:')
+    print(f'  serial-agent discover   # ser2net_tcp field will be populated')
+    print(f'  tio.sh 1                # auto-connects via TCP if daemon is running')
+
+
+def cmd_list(args):
+    """List all devices with running serial-agent daemons.
+    Quick overview — use 'status DEVICE' for full detail on one device."""
+    if not AGENT_BASE.exists():
+        print('No daemons running'); return
+    rows = []
+    for ddir in sorted(AGENT_BASE.iterdir()):
+        if not ddir.is_dir(): continue
+        pf = ddir / 'daemon.pid'; sf = ddir / 'status.json'
+        if not pf.exists(): continue
+        try:
+            os.kill(int(pf.read_text().strip()), 0)
+        except (OSError, ValueError):
+            continue
+        state = via = '?'; buf_lines = 0; prompt = ''
+        if sf.exists():
+            try:
+                s = json.loads(sf.read_text())
+                state = s.get('state','?'); via = s.get('via','?')
+                buf_lines = s.get('buf_lines', 0); prompt = s.get('prompt_text','')
+            except Exception: pass
+        rows.append((ddir.name, state, via, buf_lines, prompt))
+    if not rows:
+        print('No daemons running'); return
+    if args.json:
+        print(json.dumps([{'device': f'/dev/{r[0]}', 'state': r[1], 'via': r[2],
+                           'buf_lines': r[3], 'prompt': r[4]} for r in rows], indent=2))
+        return
+    print(f"{'Device':<14} {'State':<9} {'Via':<22} {'Buf':>5}  Prompt")
+    print('─' * 70)
+    for name, state, via, buf_lines, prompt in rows:
+        print(f'{name:<14} {state:<9} {via:<22} {buf_lines:>5}  {prompt}')
+
+
+def cmd_attach(args):
+    """Launch the configured terminal directly on a daemon's device.
+    Shorthand for: serial-connect /dev/DEVICE  (bypasses the menu)"""
+    import shutil
+    sc = shutil.which('serial-connect')
+    if not sc:
+        print('serial-connect not found in PATH', file=sys.stderr); sys.exit(1)
+    os.execv(sc, [sc, args.device])
+
+
+def cmd_clean(args):
+    import shutil
+    if args.device:
+        device = args.device
+        if re.match(r'^\d+$', device): device = f'/dev/ttyUSB{device}'
+        ddir = AGENT_BASE / devname(device)
+        if ddir.exists():
+            shutil.rmtree(ddir); print(f'Cleaned {ddir}')
+        else:
+            print(f'Nothing to clean for {device}')
+    else:
+        if not AGENT_BASE.exists(): print('Nothing to clean'); return
+        cleaned = 0
+        for d in AGENT_BASE.iterdir():
+            if not d.is_dir(): continue
+            pf = d / 'daemon.pid'
+            if pf.exists():
+                try:
+                    os.kill(int(pf.read_text().strip()), 0)
+                    print(f'  Skipping {d.name} (daemon running)'); continue
+                except (OSError, ValueError): pass
+            shutil.rmtree(d); print(f'  Cleaned {d.name}'); cleaned += 1
+        print(f'Cleaned {cleaned} dir(s)')
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Argument parsing
+# ══════════════════════════════════════════════════════════════════════════════
+def main():
+    p = argparse.ArgumentParser(
+        prog='serial-agent',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description='Serial console daemon and CLI for automation agents\n'
+                    'Run with any subcommand -h for details.')
+    sub = p.add_subparsers(dest='cmd', required=True)
+
+    def dev(sp, required=True):
+        sp.add_argument('device', **(dict() if required else dict(nargs='?', default=None)),
+                        help='/dev/ttyUSBx or just the number e.g. 1')
+
+    # ── Daemon lifecycle ───────────────────────────────────────────────────────
+    sp = sub.add_parser('start'); dev(sp); sp.set_defaults(func=cmd_start)
+    sp.add_argument('--tcp',  metavar='HOST:PORT')
+    sp.add_argument('--baud', type=int, default=115200)
+    sp.add_argument('--lines',type=int, default=DEFAULT_LINES)
+
+    sp = sub.add_parser('stop');   dev(sp); sp.set_defaults(func=cmd_stop)
+    sp = sub.add_parser('status'); dev(sp); sp.set_defaults(func=cmd_status)
+    sp = sub.add_parser('path');   dev(sp); sp.set_defaults(func=cmd_path)
+
+    # ── Liveness ───────────────────────────────────────────────────────────────
+    sp = sub.add_parser('alive'); dev(sp); sp.set_defaults(func=cmd_alive)
+    sp.add_argument('--timeout', type=float, default=5.0)
+
+    sp = sub.add_parser('wait-alive'); dev(sp)
+    sp.add_argument('--timeout', type=float, default=120.0)
+    def _wait_alive(a): a.state = 'SHELL,LOGIN,PASSWORD'; cmd_wait_state(a)
+    sp.set_defaults(func=_wait_alive)
+
+    sp = sub.add_parser('wait-state',
+        help='Block until state reached (inotifywait if available, else 50ms poll)')
+    dev(sp); sp.set_defaults(func=cmd_wait_state)
+    sp.add_argument('state', help='e.g. SHELL  or  SHELL,LOGIN')
+    sp.add_argument('--timeout', type=float, default=120.0)
+
+    # ── Observation ────────────────────────────────────────────────────────────
+    sp = sub.add_parser('read'); dev(sp); sp.set_defaults(func=cmd_read)
+    sp.add_argument('--lines', type=int, default=50)
+    sp.add_argument('--no-timestamps', action='store_true',
+                    help='Strip [HH:MM:SS.mmm] prefix — clean output for text processing')
+
+    sp = sub.add_parser('events'); dev(sp); sp.set_defaults(func=cmd_events)
+    sp.add_argument('--lines', type=int, default=20)
+
+    sp = sub.add_parser('tail'); dev(sp); sp.set_defaults(func=cmd_tail)
+    sp.add_argument('--no-timestamps', action='store_true')
+
+    # ── Sending ────────────────────────────────────────────────────────────────
+    sp = sub.add_parser('send',
+        help='Send command; --json for structured output, --capture for clean stdout')
+    dev(sp); sp.set_defaults(func=cmd_send)
+    sp.add_argument('command')
+    sp.add_argument('--wait', metavar='PATTERN', default=r'[\$#>]\s*$',
+                    help='Wait for regex after sending (default: shell prompt)')
+    sp.add_argument('--no-wait', dest='wait', action='store_const', const=None,
+                    help='Fire and forget — do not wait for response')
+    sp.add_argument('--timeout', type=float, default=30.0)
+    sp.add_argument('--no-wrap', action='store_true',
+                    help='Prepend COLUMNS=32767 to prevent board terminal from wrapping output')
+    sp.add_argument('--json', action='store_true',
+                    help='Return {"output","state","elapsed_ms","exit_code","timed_out"}')
+    sp.add_argument('--capture', action='store_true',
+                    help='Print only clean stdout (no timestamps, no prompt, no echo)')
+    sp.add_argument('--exit-code', action='store_true',
+                    help='Append ; echo EXITCODE:$? and parse exit code into result')
+    sp.add_argument('--all', action='store_true',
+                    help='Send to ALL boards with running daemons (ignores DEVICE)')
+
+    sp = sub.add_parser('expect',
+        help='Wait for first of multiple patterns; returns JSON {"matched","output","elapsed_ms"}')
+    dev(sp); sp.set_defaults(func=cmd_expect)
+    sp.add_argument('--on', action='append', metavar='KEY=REGEX', required=True,
+                    help='Pattern to watch for, e.g. --on READY="~#" --on PANIC="Kernel panic"')
+    sp.add_argument('--timeout', type=float, default=60.0)
+
+    sp = sub.add_parser('wait'); dev(sp); sp.set_defaults(func=cmd_wait)
+    sp.add_argument('pattern')
+    sp.add_argument('--timeout', type=float, default=30.0)
+
+    # ── Discovery & setup ──────────────────────────────────────────────────────
+    sp = sub.add_parser('discover',
+        help='JSON list of all ports with ser2net/daemon info; no hardcoding needed')
+    sp.set_defaults(func=cmd_discover)
+    sp.add_argument('--board',  metavar='PATTERN', help='Filter by label/hostname (regex)')
+    sp.add_argument('--serial', metavar='PARTIAL', help='Filter by USB serial (partial match)')
+    sp.add_argument('--live',   action='store_true', help='Only LIVE or OPEN ports')
+
+    sp = sub.add_parser('connect',
+        help='Discover + start daemon + optionally wait — one call replaces the chain')
+    sp.set_defaults(func=cmd_connect)
+    sp.add_argument('--board',      metavar='PATTERN')
+    sp.add_argument('--serial',     metavar='PARTIAL')
+    sp.add_argument('--wait-shell', action='store_true',
+                    help='Block until SHELL/LOGIN/PASSWORD reached')
+    sp.add_argument('--setup-terminal', action='store_true',
+                    help='After --wait-shell, run stty cols 220 rows 50 to prevent wrapping')
+    sp.add_argument('--timeout',    type=float, default=60.0)
+    sp.add_argument('--json',       action='store_true')
+
+    sp = sub.add_parser('auto-label',
+        help='Generate unique labels (hostname-serial6) for unlabeled LIVE boards')
+    sp.set_defaults(func=cmd_auto_label)
+    sp.add_argument('--dry-run', action='store_true')
+    sp.add_argument('--yes', '-y', action='store_true')
+
+    # ── Embedded dev operations ────────────────────────────────────────────────
+    sp = sub.add_parser('reboot',
+        help='Reboot board, wait for it to return, optionally auto-login')
+    dev(sp); sp.set_defaults(func=cmd_reboot)
+    sp.add_argument('--cmd',            default='reboot', help='Reboot command (default: reboot)')
+    sp.add_argument('--timeout',        type=float, default=120.0)
+    sp.add_argument('--no-login',       action='store_true', help='Do not auto-login after reboot')
+    sp.add_argument('--login',          action='store_true', help='(no-op, auto-login is default)')
+    sp.add_argument('--user',           default='root')
+    sp.add_argument('--password',       default=None, help='Login password (None=skip if not prompted)')
+    sp.add_argument('--setup-terminal', action='store_true', help='Run stty cols 220 after shell')
+    sp.add_argument('--quiet',          action='store_true')
+    sp.add_argument('--json',           action='store_true')
+
+    sp = sub.add_parser('login',
+        help='Send username/password and wait for shell prompt')
+    dev(sp); sp.set_defaults(func=cmd_login)
+    sp.add_argument('--user',     default='root')
+    sp.add_argument('--password', default=None)
+
+    sp = sub.add_parser('upload',
+        help='Upload file: base64 serial (default, no network) or --via-network (wget, ~1MB/s)')
+    dev(sp); sp.set_defaults(func=cmd_upload)
+    sp.add_argument('hostfile',        help='Local file to upload')
+    sp.add_argument('boardpath',       help='Destination path on board (dir/ appends filename)')
+    sp.add_argument('--via-network',   action='store_true',
+                    help='Use HTTP server + wget (~1MB/s vs ~1KB/s serial); board needs network+wget')
+    sp.add_argument('--board-ip',      metavar='IP',
+                    help='Board IP (auto-detected if omitted; only for --via-network)')
+    sp.add_argument('--http-port',     type=int, default=8877,
+                    help='Temporary HTTP server port (default 8877)')
+    sp.add_argument('--quiet',         action='store_true')
+
+    sp = sub.add_parser('run',
+        help='Execute a shell script on the board (file, - for stdin, or inline text)')
+    dev(sp); sp.set_defaults(func=cmd_run)
+    sp.add_argument('script',     help='Script file, - for stdin, or inline shell text')
+    sp.add_argument('--timeout',  type=float, default=60.0)
+    sp.add_argument('--json',     action='store_true')
+    sp.add_argument('--capture',  action='store_true')
+    sp.add_argument('--no-wrap',  action='store_true')
+
+    sp = sub.add_parser('health',
+        help='Board health snapshot: state, memory, load, kernel version')
+    dev(sp); sp.set_defaults(func=cmd_health)
+
+    sp = sub.add_parser('ser2net-gen',
+        help='Generate /etc/ser2net.yaml from serial-boards.conf')
+    sp.set_defaults(func=cmd_ser2net_gen)
+    sp.add_argument('--start-port', type=int, default=3001)
+    sp.add_argument('--output', default='/tmp/ser2net.yaml',
+                    help='Output path, or - for stdout')
+
+    sp = sub.add_parser('list', help='List all devices with running daemons')
+    sp.set_defaults(func=cmd_list)
+    sp.add_argument('--json', action='store_true')
+
+    sp = sub.add_parser('attach', help='Launch terminal directly on daemon device (bypasses menu)')
+    dev(sp); sp.set_defaults(func=cmd_attach)
+
+    sp = sub.add_parser('clean'); sp.set_defaults(func=cmd_clean)
+    sp.add_argument('device', nargs='?', default=None)
+
+    args = p.parse_args()
+    if hasattr(args, 'device') and args.device and re.match(r'^\d+$', args.device):
+        args.device = f'/dev/ttyUSB{args.device}'
+    args.func(args)
+
+
+if __name__ == '__main__':
+    main()

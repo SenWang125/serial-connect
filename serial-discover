@@ -1,0 +1,438 @@
+#!/bin/bash
+# serial-discover - Probe USB serial ports and display with JTAG/UART classification
+# Usage: serial-discover [--gen-udev | --json]
+#
+# --json  Machine-readable JSON output for agents and scripts.
+#         Each element: {device, devname, chip, serial, port, state, baud, board, alias}
+#         state: LIVE | OPEN | dead | FAIL
+#         board: self-identified hostname (from probe) or config label, "" if unknown
+#
+# Always probes fresh. Board labels and optional baud overrides:
+# ~/.config/serial-boards.conf  (format: SERIAL=LABEL or SERIAL=LABEL:BAUD)
+
+BOLD=$'\033[1m'; GREEN=$'\033[32m'; CYAN=$'\033[36m'; YELLOW=$'\033[33m'
+DIM=$'\033[2m'; RED=$'\033[31m'; NC=$'\033[0m'
+
+BOARD_CFG="${HOME}/.config/serial-boards.conf"
+
+declare -A CHIP_NAMES=(
+  ["0403:6001"]="FT232RL"    ["0403:6010"]="FT2232H"
+  ["0403:6011"]="FT4232H"    ["0403:6014"]="FT232H"
+  ["0403:6015"]="FT231X"     ["0451:bef3"]="XDS110"
+  ["0451:bef4"]="XDS110"     ["2e8a:000c"]="RPiProbe"
+  ["10c4:ea60"]="CP210x"     ["10c4:ea70"]="CP2105"
+  ["10c4:ea71"]="CP2108"     ["067b:2303"]="PL2303"
+  ["1a86:7523"]="CH340"      ["1a86:55d4"]="CH343P"
+)
+# Default baud for all chips is 115200 — override per-board in serial-boards.conf
+declare -A CHIP_BAUD=(
+  ["0451:bef3"]="115200"  ["0451:bef4"]="115200"  ["2e8a:000c"]="115200"
+  ["0403:6011"]="115200"  ["0403:6010"]="115200"  ["0403:6001"]="115200"
+  ["0403:6015"]="115200"  ["0403:6014"]="115200"  ["10c4:ea60"]="115200"
+  ["067b:2303"]="115200"  ["1a86:7523"]="115200"  ["1a86:55d4"]="115200"
+)
+declare -A CFG_LABEL CFG_BAUD
+
+# Parse human-readable baud rate — supports M and K suffixes (case-insensitive):
+#   1.5M → 1500000,  1M → 1000000,  115.2K → 115200,  921.6K → 921600,  115200 → 115200
+parse_baud() {
+    local s="${1^^}"; s="${s//[[:space:]]/}"
+    local int frac flen fi
+    if [[ "$s" =~ ^([0-9]+)(\.([0-9]*))?M$ ]]; then
+        int="${BASH_REMATCH[1]}"; frac="${BASH_REMATCH[3]}"
+        flen=${#frac}; fi=0
+        (( flen > 0 )) && fi=$(( frac * 1000000 / (10 ** flen) ))
+        echo $(( int * 1000000 + fi ))
+    elif [[ "$s" =~ ^([0-9]+)(\.([0-9]*))?K$ ]]; then
+        int="${BASH_REMATCH[1]}"; frac="${BASH_REMATCH[3]}"
+        flen=${#frac}; fi=0
+        (( flen > 0 )) && fi=$(( frac * 1000 / (10 ** flen) ))
+        echo $(( int * 1000 + fi ))
+    elif [[ "$s" =~ ^[0-9]+$ ]]; then echo "$s"
+    else echo "115200"
+    fi
+}
+
+# Display baud as human-readable:
+#   ≥1M           → M notation  (1500000→1.5M, 1000000→1M)
+#   ≥10K, %100=0  → K notation  (115200→115.2K, 921600→921.6K, 57600→57.6K)
+#   else           → raw number  (9600, 4800)
+baud_display() {
+    local b="$1" int frac
+    if (( b >= 1000000 )); then
+        int=$(( b / 1000000 )); frac=$(( (b % 1000000) / 100000 ))
+        [[ $frac -gt 0 ]] && echo "${int}.${frac}M" || echo "${int}M"
+    elif (( b >= 10000 && b % 100 == 0 )); then
+        int=$(( b / 1000 )); frac=$(( (b % 1000) / 100 ))
+        [[ $frac -gt 0 ]] && echo "${int}.${frac}K" || echo "${int}K"
+    else
+        echo "$b"
+    fi
+}
+
+load_config() {
+    [[ -f "$BOARD_CFG" ]] || return
+    while IFS='=' read -r key val; do
+        [[ "$key" =~ ^[[:space:]]*# || -z "${key// /}" ]] && continue
+        key="${key// /}"; val="${val%%#*}"; val="${val// /}"
+        local label="${val%%:*}" extra="${val##*:}"
+        CFG_LABEL["$key"]="$label"
+        if [[ "$val" == *:* && -n "$extra" ]]; then
+            local b; b=$(parse_baud "$extra")
+            (( b > 9600 )) && CFG_BAUD["$key"]="$b"
+        fi
+    done < "$BOARD_CFG"
+}
+
+get_baud() { echo "${CFG_BAUD[$2]:-${CHIP_BAUD[$1]:-115200}}"; }
+
+# ── TTY probe ──────────────────────────────────────────────────────────────────
+# ── TTY probe: try common baud rates in order, take first that yields valid text ─
+# Baud probing is sequential per port (parallel stty on the same fd causes races).
+# Ports are probed in parallel across all devices — wall time = max(per-port time).
+# Wrong baud → garbage bytes → non-printable → cleans to empty → next baud.
+# Correct baud → valid console text → LIVE + detected baud recorded.
+#
+# Outputs: STATUS|BAUD|board_id
+#   STATUS   = LIVE | DEAD | OPEN | FAIL
+#   BAUD     = detected baud (LIVE) or default (others)
+#   board_id = extracted hostname (LIVE only)
+probe_tty() {
+    local dev="$1" cfg_baud="${2:-115200}"
+
+    # fuser can't see root-owned processes (e.g. sudo minicom) — try sudo as fallback
+    { fuser "$dev" &>/dev/null 2>&1 || sudo -n fuser "$dev" &>/dev/null 2>&1; } \
+        && { printf 'OPEN|%s|\n' "$cfg_baud"; return; }
+
+    # ttyACM (CDC ACM) devices: tcsetattr for baud changes triggers a USB
+    # CDC_SET_LINE_CODING control request. Some devices (e.g. RPi Debug Probe)
+    # block for ~12s per baud attempt when the remote end isn't active.
+    # Skip probing — show as DEAD (selectable in serial-connect, minicom opens fine).
+    [[ "$dev" =~ /dev/ttyACM ]] && { printf 'DEAD|%s|\n' "$cfg_baud"; return; }
+
+    local fd
+    exec {fd}<>"$dev" 2>/dev/null || { printf 'FAIL|%s|\n' "$cfg_baud"; return; }
+    local saved; saved=$(stty -F "$dev" -g 2>/dev/null)
+
+    # 115200 first (most common), then cfg_baud if different, then the rest
+    local -a try_bauds=(115200)
+    [[ "$cfg_baud" != "115200" ]] && try_bauds+=("$cfg_baud")
+    for b in 1500000 921600 460800 230400 57600 38400 19200 9600; do
+        local dup=0
+        for already in "${try_bauds[@]}"; do [[ "$b" == "$already" ]] && dup=1 && break; done
+        (( dup )) || try_bauds+=("$b")
+    done
+
+    local detected="" captured=""
+    for baud in "${try_bauds[@]}"; do
+        stty -F "$dev" "$baud" raw -echo min 0 time 1 2>/dev/null
+        printf '\r' >&$fd
+        local raw=""
+        IFS= read -t 0.1 -r -d '' -n 200 -u $fd raw 2>/dev/null
+        local clean; clean=$(printf '%s' "$raw" \
+            | tr -dc '[:print:][:space:]' | tr -s '[:space:]' ' ' \
+            | sed 's/^ //; s/ $//')
+        # Wrong baud → ~30% of bytes are printable by chance.
+        # Correct baud → ~95%+ are printable.
+        # Require ≥80% of bytes printable to reject wrong-baud false positives.
+        # Pure bash ratio check — no subprocesses.
+        # ${#raw} counts chars in the bash string (may undercount binary due to
+        # null/multibyte, but wrong-baud garbage still has far more stripped chars).
+        local raw_len="${#raw}" clean_len="${#clean}"
+        if (( clean_len >= 4 && raw_len > 0 && clean_len * 100 >= raw_len * 80 )); then
+            detected="$baud"; captured="$clean"; break
+        fi
+    done
+
+    [[ -n "$saved" ]] && stty -F "$dev" "$saved" 2>/dev/null
+    # Clear HUPCL before closing so DTR/RTS are NOT deasserted on close.
+    # Without this, the board's shell gets SIGHUP and prints "Killed".
+    stty -F "$dev" -hupcl 2>/dev/null
+    exec {fd}>&-
+
+    if [[ -z "$detected" ]]; then
+        printf 'DEAD|%s|\n' "$cfg_baud"; return
+    fi
+
+    local id=""
+    if   [[ "$captured" =~ @([A-Za-z0-9._-]+)[[:space:]]*: ]];       then id="${BASH_REMATCH[1]}"
+    elif [[ "$captured" =~ ([A-Za-z0-9._-]+)[[:space:]]+login: ]];    then id="${BASH_REMATCH[1]}"
+    elif [[ "$captured" =~ [Bb]oard:[[:space:]]*([A-Za-z0-9._-]+) ]]; then id="${BASH_REMATCH[1]}"
+    else id="${captured:0:30}"
+    fi
+
+    printf 'LIVE|%s|%s\n' "$detected" "$id"
+}
+# Export so 'timeout bash -c' subshells can call it
+
+# ── Refine DEAD using USB interface string + chip rules ────────────────────────
+# Status values: LIVE  OPEN  dead  FAIL  — purely from the probe, no classification guesses
+
+# ── Init ───────────────────────────────────────────────────────────────────────
+load_config
+declare -a DEVS VIDS PIDS SERS IFNS IFSTRS CHIPS LABELS BAUDS
+idx=0
+for dev in $(ls /dev/ttyUSB* /dev/ttyACM* 2>/dev/null | sort -V); do
+    [[ -c "$dev" ]] || continue
+    info=$(udevadm info -a "$dev" 2>/dev/null)
+    vid=$(awk   -F'"' '/ATTRS\{idVendor\}/{print $2; exit}'         <<< "$info")
+    pid=$(awk   -F'"' '/ATTRS\{idProduct\}/{print $2; exit}'        <<< "$info")
+    ser=$(awk   -F'"' '/ATTRS\{serial\}/{print $2; exit}'           <<< "$info")
+    ifn=$(awk   -F'"' '/ATTRS\{bInterfaceNumber\}/{print $2; exit}' <<< "$info")
+    ifstr=$(awk -F'"' '/ATTRS\{interface\}/{print $2; exit}'        <<< "$info")
+    vp="${vid}:${pid}"
+    DEVS[$idx]="$dev";  VIDS[$idx]="$vid";  PIDS[$idx]="$pid"
+    SERS[$idx]="$ser";  IFNS[$idx]="$ifn";  IFSTRS[$idx]="$ifstr"
+    CHIPS[$idx]="${CHIP_NAMES[$vp]:-${vp}}"
+    LABELS[$idx]="${CFG_LABEL[$ser]:-}"
+    BAUDS[$idx]=$(get_baud "$vp" "$ser")
+    (( idx++ )) || true
+done
+
+# ── Compute sequential port index within each physical device ─────────────────
+# Assigns 0,1,2,3... based on interface number order, so devices like XDS110
+# (which exposes if00 and if03 as TTY) show p0/p1 instead of if00/if03.
+declare -A PORT_IDX
+declare -A _ser_devs
+for i in "${!DEVS[@]}"; do
+    ser="${SERS[$i]}"
+    _ser_devs[$ser]+="${IFNS[$i]}:${DEVS[$i]} "
+done
+for ser in "${!_ser_devs[@]}"; do
+    idx=0
+    while read -r dev; do
+        PORT_IDX[$dev]=$idx; (( idx++ )) || true
+    done < <(tr ' ' '\n' <<< "${_ser_devs[$ser]}" \
+             | grep -v '^$' \
+             | sort -t: -k1 -n \
+             | cut -d: -f2-)
+done
+
+# ── Parallel probe (always fresh in serial-discover) ──────────────────────────
+# Simple forks — no bash startup overhead. wait -t 2 kills any probe that
+# blocks on open (e.g. ttyACM with no carrier signal).
+PROBE_DIR=$(mktemp -d /tmp/serial-probe.XXXXXX)
+trap 'rm -rf "$PROBE_DIR"' EXIT
+_probe_pids=()
+for i in "${!DEVS[@]}"; do
+    ( probe_tty "${DEVS[$i]}" "${BAUDS[$i]}" \
+        > "$PROBE_DIR/$(basename "${DEVS[$i]}")" ) &
+    _probe_pids+=($!)
+done
+# Watchdog: kill any probe still blocking after 2s (e.g. ttyACM with no carrier).
+# Normal probes finish in ~1s (9 bauds × 0.1s); 2s is a safe margin.
+( sleep 2; kill -9 "${_probe_pids[@]}" 2>/dev/null ) &
+_watchdog=$!
+wait "${_probe_pids[@]}" 2>/dev/null
+# SIGKILL the watchdog so its "kill -9 ${_probe_pids}" never runs.
+# SIGTERM is ignored by bash while it waits for "sleep 2", causing a 2s stall
+# and the kill-9 firing on stale PIDs that may have been recycled.
+kill -9 "$_watchdog" 2>/dev/null; wait "$_watchdog" 2>/dev/null
+unset _probe_pids _watchdog
+
+# ── Build BOARD_ID map: best known name per USB serial number ──────────────────
+# Priority: config label > captured hostname from any LIVE port of that serial.
+# This ensures all ports of the same physical device share the same board name.
+declare -A BOARD_ID
+for i in "${!DEVS[@]}"; do
+    ser="${SERS[$i]}"
+    if [[ -n "${CFG_LABEL[$ser]:-}" ]]; then
+        BOARD_ID[$ser]="${CFG_LABEL[$ser]}"
+    elif [[ -z "${BOARD_ID[$ser]+x}" ]]; then
+        IFS='|' read -r _r _b cap \
+            <<< "$(cat "$PROBE_DIR/$(basename "${DEVS[$i]}")" 2>/dev/null || echo 'FAIL||')"
+        [[ "$_r" == "LIVE" && -n "$cap" ]] && BOARD_ID[$ser]="$cap"
+    fi
+done
+
+# ── Dynamic column widths from actual data ─────────────────────────────────────
+dev_w=6; chip_w=6
+for i in "${!DEVS[@]}"; do
+    dn=$(basename "${DEVS[$i]}")
+    (( ${#dn}          > dev_w  )) && dev_w=${#dn}
+    (( ${#CHIPS[$i]}   > chip_w )) && chip_w=${#CHIPS[$i]}
+done
+(( dev_w++ )); (( chip_w++ ))
+
+board_w=6
+for ser in "${!BOARD_ID[@]}"; do
+    (( ${#BOARD_ID[$ser]} > board_w )) && board_w=${#BOARD_ID[$ser]}
+done
+for i in "${!DEVS[@]}"; do
+    [[ -n "${BOARD_ID[${SERS[$i]}]+x}" ]] && continue
+    ser="${SERS[$i]}"
+    # Fallback label is "chip-serial" — compute its width
+    ser_disp="${ser}"; (( ${#ser} > 12 )) && ser_disp="${ser:0:10}"
+    fb=$(( ${#CHIPS[$i]} + 1 + ${#ser_disp} ))
+    (( fb > board_w )) && board_w=$fb
+done
+(( board_w++ ))
+
+rule_w=$(( 2 + 1 + dev_w + 2 + 6 + 4 + board_w + 2 + chip_w + 2 + 4 + 7 ))
+
+# ── Precompute alias map: /dev path → custom symlink name (one pass, not per-row) ──
+declare -A _dev_alias
+while IFS= read -r sl; do
+    tgt=$(readlink -f "$sl" 2>/dev/null)
+    [[ -n "$tgt" ]] && _dev_alias[$tgt]=$(basename "$sl")
+done < <(find /dev -maxdepth 1 -type l ! -path "/dev/serial/*" 2>/dev/null)
+
+# ── JSON output (skip human display entirely) ─────────────────────────────────
+if [[ "${1:-}" == "--json" ]]; then
+    # label   = user-set name from serial-boards.conf (stable, matches USB serial#)
+    # hostname = self-reported from board console prompt (rootfs-dependent, fragile)
+    # board   = label if set, else hostname (convenience field for display)
+    # Agents should match against 'label' — it's user-controlled and hardware-independent.
+    echo '['
+    sep=""
+    for i in "${!DEVS[@]}"; do
+        dev="${DEVS[$i]}"; devname=$(basename "$dev")
+        raw=$(cat "$PROBE_DIR/$devname" 2>/dev/null || echo "FAIL||")
+        state=$(cut -d'|' -f1 <<< "$raw")
+        baud_raw=$(cut -d'|' -f2 <<< "$raw")
+        [[ "$state" == "DEAD" ]] && state="dead"
+        [[ -z "$baud_raw" || ! "$baud_raw" =~ ^[0-9]+$ ]] && baud_raw="${BAUDS[$i]}"
+        label="${CFG_LABEL[${SERS[$i]}]:-}"          # user-set in serial-boards.conf
+        board="${BOARD_ID[${SERS[$i]}]:-}"            # label OR probe-captured hostname
+        hostname="${board}"
+        [[ -n "$label" ]] && hostname="${board#$label}"  # strip label to get hostname
+        [[ "$hostname" == "$board" && -n "$label" ]] && hostname=""
+        # If board == label, hostname unknown from this port; if board != label, board IS the hostname
+        [[ -z "$label" ]] && hostname="$board"
+        [[ -n "$label" ]] && hostname="${BOARD_ID[${SERS[$i]}]:-}"
+        # Simpler: label from config, hostname from probe capture separately
+        probe_id=$(cut -d'|' -f3 <<< "$raw")
+        [[ -n "$probe_id" ]] && hostname="$probe_id"
+        alias_val="${_dev_alias[${DEVS[$i]}]:-}"
+        label="${label//\"/\'}"; hostname="${hostname//\"/\'}"; alias_val="${alias_val//\"/\'}"
+        printf '%s\n  {"device":"%s","devname":"%s","chip":"%s","serial":"%s","port":%d,"state":"%s","baud":%d,"label":"%s","hostname":"%s","alias":"%s"}' \
+            "$sep" "${DEVS[$i]}" "$devname" "${CHIPS[$i]}" "${SERS[$i]}" \
+            "${PORT_IDX[$dev]:-0}" "$state" "$baud_raw" "$label" "$hostname" "$alias_val"
+        sep=","
+    done
+    echo ''; echo ']'
+    exit 0
+fi
+
+# ── Human-readable display ─────────────────────────────────────────────────────
+echo -e "${BOLD}USB Serial Port Discovery${NC}  $(date '+%Y-%m-%d %H:%M:%S')\n"
+printf "  ${BOLD}%-1s  %-${dev_w}s  %-6s    %-${board_w}s  %-${chip_w}s  %-3s  %s${NC}\n" \
+    "·" "Device" "Status" "Board" "Chip" "P#" "Baud"
+printf '─%.0s' $(seq 1 "$rule_w"); echo
+
+# Re-order: group by serial (first-occurrence order), then interface within serial.
+# A device with a different serial (e.g. CP210x at ttyUSB2) no longer splits
+# a multi-port adapter's group (e.g. FT4232H at ttyUSB0/1/3/4).
+declare -A _sd_fpos
+for i in "${!DEVS[@]}"; do
+    [[ -z "${_sd_fpos[${SERS[$i]}]+x}" ]] && _sd_fpos[${SERS[$i]}]=$i
+done
+declare -a _sd_order
+while IFS=: read -r _ _ i; do _sd_order+=("$i"); done < <(
+    for i in "${!DEVS[@]}"; do
+        printf "%05d:%04d:%d\n" \
+            "${_sd_fpos[${SERS[$i]}]}" \
+            "$(( 10#${IFNS[$i]:-0} ))" \
+            "$i"
+    done | sort)
+unset _sd_fpos
+
+prev_ser="__unset__"
+for i in "${_sd_order[@]}"; do
+    dev="${DEVS[$i]}"; devname=$(basename "$dev")
+    vp="${VIDS[$i]}:${PIDS[$i]}"
+    ser="${SERS[$i]}"; ifn="${IFNS[$i]}"; ifstr="${IFSTRS[$i]}"
+    chip="${CHIPS[$i]}"; baud="${BAUDS[$i]}"
+
+    [[ "$ser" != "$prev_ser" && "$prev_ser" != "__unset__" ]] && echo ""
+    prev_ser="$ser"
+
+    IFS='|' read -r raw probe_baud _ \
+        <<< "$(cat "$PROBE_DIR/$devname" 2>/dev/null || echo 'FAIL||')"
+    [[ "$raw" == "DEAD" ]] && state="dead" || state="$raw"
+    # For LIVE ports, show the auto-detected baud; others show configured default
+    [[ "$state" == "LIVE" && "$probe_baud" =~ ^[0-9]+$ ]] && baud="$probe_baud"
+
+    alias="${_dev_alias[$dev]:-}"
+
+    case "$state" in
+        LIVE) sym="${GREEN}★${NC}"; dc="$NC";   sc="$GREEN" ;;
+        OPEN) sym="${CYAN}⊙${NC}";  dc="$CYAN"; sc="$CYAN"  ;;
+        dead) sym=" ";              dc="$DIM";  sc="$DIM"   ;;
+        FAIL) sym="${RED}✗${NC}";   dc="$RED";  sc="$RED"   ;;
+    esac
+
+    board_name="${BOARD_ID[$ser]:-}"
+    if [[ -n "$board_name" ]]; then
+        board_col=$(printf "%-${board_w}s" "$board_name")
+    else
+        ser_disp="${ser}"; (( ${#ser} > 12 )) && ser_disp="${ser:0:10}"
+        board_col="${DIM}$(printf "%-${board_w}s" "${chip}-${ser_disp}")${NC}"
+    fi
+
+    baud_col=""
+    [[ "$state" == "LIVE" || "$state" == "OPEN" ]] && baud_col=$(baud_display "$baud")
+    [[ -n "$alias" ]] && baud_col+="${baud_col:+ }${CYAN}→${alias}${NC}"
+
+    printf "  %b  %b%-${dev_w}s${NC}  %b%-6s${NC}    %s  %-${chip_w}s  p%-2s  %b\n" \
+        "$sym" "$dc" "$devname" "$sc" "$state" \
+        "$board_col" "$chip" "${PORT_IDX[$dev]:-0}" "$baud_col"
+done
+
+(( ${#DEVS[@]} == 0 )) && echo -e "${RED}No serial devices found.${NC}"
+
+# ── Legend ─────────────────────────────────────────────────────────────────────
+echo ""
+printf "  ${GREEN}★ LIVE${NC}    ${CYAN}⊙ OPEN${NC}    ${RED}✗ FAIL${NC}    ${DIM}  dead${NC}\n"
+echo -e "  ${DIM}Labels: ${BOARD_CFG}${NC}"
+
+echo -e "\n${BOLD}Stable by-id symlinks:${NC}"
+if ls /dev/serial/by-id/ &>/dev/null 2>&1; then
+    ls -la /dev/serial/by-id/ | awk 'NR>3 {
+        n=split($0,a," "); tgt=a[n]; link=a[n-2]
+        sub(".*/","",link); sub("../../","/dev/",tgt)
+        printf "  %-58s → %s\n", link, tgt
+    }'
+else echo "  (none)"; fi
+
+# ── udev rule generation ───────────────────────────────────────────────────────
+[[ "${1:-}" != "--gen-udev" ]] && exit 0
+OUTFILE="/tmp/99-serial-aliases.rules"
+{
+echo "# Generated by serial-discover --gen-udev  $(date '+%Y-%m-%d')"
+echo "# Power all boards on before running --gen-udev."
+echo "# sudo cp ${OUTFILE} /etc/udev/rules.d/"
+echo "# sudo udevadm control --reload-rules && sudo udevadm trigger"
+echo ""
+echo "# Single-port chips"
+cat <<'GENERIC'
+SUBSYSTEM=="tty", ATTRS{idVendor}=="10c4", ATTRS{idProduct}=="ea60", \
+    SYMLINK+="ttyCP210x_$env{ID_SERIAL_SHORT}", MODE="0660", GROUP="dialout"
+SUBSYSTEM=="tty", ATTRS{idVendor}=="1a86", ATTRS{idProduct}=="7523", \
+    SYMLINK+="ttyCH340_$env{ID_SERIAL_SHORT}", MODE="0660", GROUP="dialout"
+SUBSYSTEM=="tty", ATTRS{idVendor}=="0403", ATTRS{idProduct}=="6001", \
+    SYMLINK+="ttyFT232_$env{ID_SERIAL_SHORT}", MODE="0660", GROUP="dialout"
+
+GENERIC
+echo "# Live/open multi-port interfaces"
+declare -A _seen
+for i in "${!DEVS[@]}"; do
+    raw=$(cut -d'|' -f1 "$PROBE_DIR/$(basename "${DEVS[$i]}")" 2>/dev/null)
+    [[ "$raw" != "LIVE" && "$raw" != "OPEN" ]] && continue
+    vid="${VIDS[$i]}"; pid="${PIDS[$i]}"; ser="${SERS[$i]}"; ifn="${IFNS[$i]}"
+    vp="${vid}:${pid}"
+    case "$vp" in "10c4:ea60"|"1a86:7523"|"0403:6001") continue ;; esac
+    [[ -n "${_seen[$ser:$ifn]+x}" ]] && continue; _seen["$ser:$ifn"]=1
+    label="${LABELS[$i]}"
+    [[ -z "$label" ]] && { echo "# SKIP $(basename "${DEVS[$i]}") serial=${ser} — no label"; continue; }
+    safe="${label//[^A-Za-z0-9_-]/_}"
+    echo "# ${label} — ${CHIPS[$i]} if${ifn}"
+    echo "SUBSYSTEM==\"tty\", ATTRS{idVendor}==\"${vid}\", ATTRS{idProduct}==\"${pid}\", \\"
+    echo "    ATTRS{serial}==\"${ser}\", ATTRS{bInterfaceNumber}==\"${ifn}\", \\"
+    echo "    SYMLINK+=\"tty${safe}\", MODE=\"0660\", GROUP=\"dialout\""
+    echo ""
+done
+} > "$OUTFILE"
+echo -e "\n${GREEN}Rules written to:${NC} ${OUTFILE}"
+echo -e "  sudo cp ${OUTFILE} /etc/udev/rules.d/"
+echo -e "  sudo udevadm control --reload-rules && sudo udevadm trigger"

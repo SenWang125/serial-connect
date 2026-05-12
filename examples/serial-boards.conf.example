@@ -1,0 +1,33 @@
+# ~/.config/serial-boards.conf
+# Maps USB serial number → board label, with optional baud rate override.
+#
+# Format:  SERIAL=LABEL         (baud auto-selected by chip type)
+#          SERIAL=LABEL:BAUD    (explicit baud, e.g. 1500000 or 921600)
+#
+# Ports are identified by live probing (CR sent, response checked).
+# Labels here are purely for display — add one only after you've confirmed
+# which physical board a serial number belongs to.
+#
+# To identify a new FTDI board:
+#   1. Power the board on
+#   2. Run: serial-discover        (★ shows which port responded)
+#   3. Note the serial number from the LIVE row
+#   4. Add: SERIAL=BOARD_NAME
+#
+# Default bauds by chip:
+#   FTDI, XDS110, RPi Debug Probe  → 115200
+#   CP210x                         → 1500000
+#
+# ─────────────────────────────────────────────────────────────────
+
+# Add entries here once you've confirmed which board a serial number belongs to.
+# The LIVE probe will show the board's self-reported hostname in yellow.
+# Example: 46241800161=AM62D2-EVM
+
+# FTDI FT4232H adapters — add entries after confirming which board each serial belongs to:
+# Run: serial-discover  (★ LIVE row shows the board's self-reported hostname)
+# Then: serial-agent auto-label -y   (auto-generates hostname-serial6 labels)
+# Or add manually:
+# 46241800161=MY_BOARD_A
+# 45241640028=MY_BOARD_B
+# 46241800053=MY_BOARD_C
