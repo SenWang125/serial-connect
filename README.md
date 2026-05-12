@@ -5,126 +5,109 @@ Serial port tools for embedded Linux development — discover boards, connect in
 ## Install
 
 ```bash
-git clone https://github.com/senwang125/serial-connect.git
+git clone https://github.com/SenWang125/serial-connect.git
 cd serial-connect
 ./install.sh          # interactive: asks terminal preference, installs deps
 ```
 
-Or non-interactive:
+Non-interactive:
 ```bash
 ./install.sh --term tio          # recommended
-./install.sh --term screen       # shareable sessions
-./install.sh /usr/local/bin --term minicom
+./install.sh --term tio,screen   # install multiple
+./install.sh /usr/local/bin --term tio
 ```
 
-Scripts install to `~/.serial-connect/` by default — a private directory that
-doesn't mix with other tools. Add it to PATH once:
+Scripts install to `~/.serial-connect/` by default. Add to PATH once:
 ```bash
 echo 'export PATH="$HOME/.serial-connect:$PATH"' >> ~/.bashrc
 ```
 
-To uninstall (removes the whole directory):
+Uninstall:
 ```bash
-./uninstall.sh                   # removes ~/.serial-connect/
-./uninstall.sh /usr/local/bin    # if installed to a shared bin dir
-./uninstall.sh --purge           # also remove ~/.config/serial-boards.conf
+./uninstall.sh           # removes ~/.serial-connect/ entirely
+./uninstall.sh --purge   # also remove serial-boards.conf
 ```
 
 **Requirements:** bash ≥ 5.1, python3, user in `dialout` group
-**Optional:** `tio` (recommended terminal), `ser2net` (human+agent coexistence), `inotify-tools` (faster event notifications)
 
 ---
 
-## Quick start
+## Usage
 
-```bash
-serial-discover              # probe all USB serial ports, show live boards
-serial-connect               # pick a board from a menu and connect
-serial-connect /dev/ttyUSB1  # connect directly (skips menu)
+```
+$ serial-connect
 ```
 
-Label your boards by USB serial number (stable across reboots):
-```bash
-serial-agent auto-label -y   # auto-generates labels from board hostnames
-# or edit ~/.config/serial-boards.conf manually:
-#   46241800161=MY-BOARD
 ```
+Select serial port:
+
+  ·     #  Device     Status    Board             Chip      P#   Baud
+────────────────────────────────────────────────────────────────────
+       1)  ttyACM0    dead      XDS110-S62H0161   XDS110    p0
+       2)  ttyACM1    dead      XDS110-S62H0161   XDS110    p1
+
+       3)  ttyUSB0    dead      am62dxx-evm       FT4232H   p0
+  ★    4)  ttyUSB1    LIVE      am62dxx-evm       FT4232H   p1   115.2K
+       5)  ttyUSB3    dead      am62dxx-evm       FT4232H   p2
+       6)  ttyUSB4    dead      am62dxx-evm       FT4232H   p3
+
+       7)  ttyUSB2    dead      CP210x-0001       CP210x    p0
+
+  ★    8)  ttyUSB5    LIVE      am62pxx-evm       FT4232H   p0   115.2K
+
+  ★ LIVE    ⊙ OPEN    ✗ FAIL      dead
+
+Port [1-8]:
+```
+
+Select a port number to connect. Ports are grouped by physical device.
+`★ LIVE` ports have an active console; `⊙ OPEN` ports are held by another process (prompts to force-close).
+
+Override terminal: `SERIAL_TERM=screen serial-connect`
 
 ---
 
 ## Tools
 
 ### `serial-discover`
-Probes all `/dev/ttyUSB*` and `/dev/ttyACM*` ports. Auto-detects baud rate (115.2K → 1.5M → 921.6K → ...), captures the board's hostname from its console output.
-
-```
-  ★  ttyUSB1    LIVE    am62dxx-evm       FT4232H   p1   115.2K
-     ttyUSB0    dead    FT4232H-161       FT4232H   p0
-     ttyUSB4    dead    CP210x-0001       CP210x    p0
-```
+Probes all USB serial ports, auto-detects baud rate, captures board hostname. Always fresh — no cache.
 
 ### `serial-connect`
-Interactive menu showing all ports with live/dead/open status. Select a number to connect via your configured terminal (tio/screen/minicom).
-
-- Caches probe results — re-probes only when topology changes or unknown boards appear
-- Groups ports by physical device (stable even if ttyUSBN order changes after reboot)
-- Override terminal: `SERIAL_TERM=screen serial-connect`
+Interactive menu with cached probe results. Re-probes only on topology change or unknown boards.
 
 ### `serial-agent`
-Background daemon + CLI for automation. Reads all serial output continuously into a ring buffer. Agents query the buffer without touching the serial port directly.
+Background daemon + CLI for automation. Maintains a ring buffer of serial output; agents query it without touching the port directly.
 
 ```bash
-serial-agent connect --board MY-BOARD --wait-shell  # discover + start + wait
-serial-agent send /dev/ttyUSB1 "uname -r" --json    # → {"output":"6.6.0","elapsed_ms":50}
-serial-agent reboot /dev/ttyUSB1 --setup-terminal   # reboot + wait for shell
-serial-agent upload /dev/ttyUSB1 ./driver.ko /tmp/  # file transfer (no network needed)
-serial-agent health /dev/ttyUSB1                    # memory/load/kernel JSON
-serial-agent list                                    # show running daemons
-```
-
-State machine: `SHELL` → `RUNNING` → `SHELL`  |  `BOOTING` → `LOGIN` → `SHELL`  |  `PANIC` → reboot
-
----
-
-## Human + agent on the same port
-
-Without `ser2net`, a human terminal and a background daemon split the byte stream. With `ser2net`:
-
-```bash
-serial-agent ser2net-gen && sudo cp /tmp/ser2net.yaml /etc/ser2net.yaml
-sudo systemctl restart ser2net
-
-serial-agent start /dev/ttyUSB1 --tcp localhost:3001  # daemon via ser2net
-serial-connect                                         # human session via TCP
+serial-agent connect --board AM62D2-EVM --wait-shell
+serial-agent send /dev/ttyUSB1 "uname -r" --json     # → {"output":"6.6.0","elapsed_ms":50}
+serial-agent reboot /dev/ttyUSB1 --setup-terminal
+serial-agent upload /dev/ttyUSB1 ./driver.ko /tmp/
+serial-agent health /dev/ttyUSB1
+serial-agent list
 ```
 
 ---
 
 ## Configuration
 
-`~/.config/serial-boards.conf` is installed automatically. Edit it to label your boards and tune discovery. The file is self-documented — every option has a comment explaining it.
+`serial-boards.conf` lives in the same directory as the scripts (`~/.serial-connect/serial-boards.conf` by default). The file is self-documented — open it to see all options. Key things to edit:
 
-**Label a board** (USB serial number is the stable key across reboots):
+**Label your boards** (USB serial number → name, stable across reboots):
 ```
-46241800161=MY-AM62-BOARD
+46241800161=AM62D2-EVM
 45241640028=AM62P-EVM:115200
 ```
-Find serial numbers with `serial-discover` (Board column of unlabelled ports), or generate labels automatically:
+
+**Tune discovery speed:**
+```
+PROBE_READ_MS=50     # halve response wait → halve worst-case probe time
+PROBE_PARALLEL=8     # cap parallel probes if USB bus gets congested
+```
+
+Find serial numbers with `serial-discover`, or auto-generate labels:
 ```bash
 serial-agent auto-label -y
-```
-
-**Tune discovery speed** (uncomment and adjust as needed):
-```
-PROBE_READ_MS=50        # halve response wait → halve worst-case probe time
-PROBE_PARALLEL=8        # cap simultaneous probes if USB bus gets congested
-PROBE_BAUDS=115.2K,9600,19200,38400,57600,230.4K,460.8K,921.6K,1.5M
-```
-
-**Add an unlisted chip**:
-```
-0403:6011=FT4232H:115200
-abcd:1234=MyCustomChip
 ```
 
 ---

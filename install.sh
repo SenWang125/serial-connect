@@ -30,8 +30,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 INSTALL_DIR="${INSTALL_DIR:-$HOME/.serial-connect}"
-CONF_DIR="${HOME}/.config"
-CONF_FILE="${CONF_DIR}/serial-boards.conf"
+CONF_FILE="${INSTALL_DIR}/serial-boards.conf"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # ── Colour helpers ─────────────────────────────────────────────────────────────
@@ -220,7 +219,7 @@ echo ""
 
 mkdir -p "$INSTALL_DIR"
 
-TOOLS=(serial-discover serial-connect serial-agent)
+TOOLS=(serial-common.sh serial-discover serial-connect serial-agent)
 for tool in "${TOOLS[@]}"; do
     src="$SCRIPT_DIR/bin/$tool"
     [[ ! -f "$src" ]] && { red "  Missing source: $src"; exit 1; }
@@ -237,13 +236,12 @@ if [[ "$TERM_CHOICE" != "tio" ]]; then
     dim "    Override any time: SERIAL_TERM=tio serial-connect"
 fi
 
-# ── Config file ────────────────────────────────────────────────────────────────
-mkdir -p "$CONF_DIR"
+# ── Config file (lives alongside the scripts) ──────────────────────────────────
 if [[ ! -f "$CONF_FILE" ]]; then
     cp "$SCRIPT_DIR/serial-boards.conf" "$CONF_FILE"
-    green "  ✓ ~/.config/serial-boards.conf  (created from example)"
+    green "  ✓ serial-boards.conf  (created)"
 else
-    dim   "  · ~/.config/serial-boards.conf  (exists — not modified)"
+    dim   "  · serial-boards.conf  (exists — not modified)"
 fi
 
 # ── PATH check ─────────────────────────────────────────────────────────────────

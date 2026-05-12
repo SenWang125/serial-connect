@@ -1,237 +1,57 @@
 #!/bin/bash
-# serial-connect - Interactive serial terminal with live TTY probing
+# serial-connect — Interactive serial terminal with live TTY probing and cache.
 # Usage: serial-connect [/dev/ttyXXX]
 #
-# Probe results are CACHED per device topology — no re-probing on repeated runs
-# with the same boards connected. Probes only happen when the device set changes.
-# Run serial-discover to force a fresh probe at any time.
+# Probe results are cached per device topology. Re-probes only when the device
+# set changes or new unrecognized boards appear.
+# Override terminal: SERIAL_TERM=screen serial-connect
 
-# ─── Terminal backend ─────────────────────────────────────────────────────────
-# Choices:
-#   minicom  — classic, -w word-wrap -c color  (exclusive port hold)
-#   tio      — modern, --local ignores DTR/DCD  (reconnects on reset, less fighting)
-#   screen   — GNU screen; share session with: screen -x /dev/ttyXXX
-#   picocom  — minimal, no frills
-# tio is recommended: --local prevents HUPCL kills; `tio --list` shows ports.
-SERIAL_TERM="${SERIAL_TERM:-tio}"   # override: SERIAL_TERM=minicom serial-connect
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/serial-common.sh"
+
+SERIAL_TERM="${SERIAL_TERM:-tio}"
 SIG_FILE="/tmp/serial-connect.sig"
 CACHE_FILE="/tmp/serial-connect.cache"
 
-BOLD=$'\033[1m'; GREEN=$'\033[32m'; CYAN=$'\033[36m'; YELLOW=$'\033[33m'
-DIM=$'\033[2m'; RED=$'\033[31m'; NC=$'\033[0m'
-
-BOARD_CFG="${HOME}/.config/serial-boards.conf"
-
-declare -A CHIP_NAMES=(
-  ["0403:6001"]="FT232RL"    ["0403:6010"]="FT2232H"
-  ["0403:6011"]="FT4232H"    ["0403:6014"]="FT232H"
-  ["0403:6015"]="FT231X"     ["0451:bef3"]="XDS110"
-  ["0451:bef4"]="XDS110"     ["2e8a:000c"]="RPiProbe"
-  ["10c4:ea60"]="CP210x"     ["10c4:ea70"]="CP2105"
-  ["10c4:ea71"]="CP2108"     ["067b:2303"]="PL2303"
-  ["1a86:7523"]="CH340"      ["1a86:55d4"]="CH343P"
-)
-# Default baud for all chips is 115200 — override per-chip or per-board in serial-boards.conf
-declare -A CHIP_BAUD=(
-  ["0451:bef3"]="115200"  ["0451:bef4"]="115200"  ["2e8a:000c"]="115200"
-  ["0403:6011"]="115200"  ["0403:6010"]="115200"  ["0403:6001"]="115200"
-  ["0403:6015"]="115200"  ["0403:6014"]="115200"  ["10c4:ea60"]="115200"
-  ["067b:2303"]="115200"  ["1a86:7523"]="115200"  ["1a86:55d4"]="115200"
-)
-declare -A CFG_LABEL CFG_BAUD
-# Default probe baud scan list. Override in serial-boards.conf: PROBE_BAUDS=115.2K,9600,...,1.5M
-PROBE_BAUDS=(115200 9600 19200 38400 57600 230400 460800 921600 1500000)
-PROBE_PARALLEL=0    # max simultaneous port probes (0 = unlimited)
-PROBE_READ_MS=100   # ms to wait for board response per baud attempt
-PROBE_DRAIN_MS=10   # ms to drain stale tty bytes after each baud switch
-
-parse_baud() {
-    local s="${1^^}"; s="${s//[[:space:]]/}"
-    local int frac flen fi
-    if [[ "$s" =~ ^([0-9]+)(\.([0-9]*))?M$ ]]; then
-        int="${BASH_REMATCH[1]}"; frac="${BASH_REMATCH[3]}"
-        flen=${#frac}; fi=0
-        (( flen > 0 )) && fi=$(( frac * 1000000 / (10 ** flen) ))
-        echo $(( int * 1000000 + fi ))
-    elif [[ "$s" =~ ^([0-9]+)(\.([0-9]*))?K$ ]]; then
-        int="${BASH_REMATCH[1]}"; frac="${BASH_REMATCH[3]}"
-        flen=${#frac}; fi=0
-        (( flen > 0 )) && fi=$(( frac * 1000 / (10 ** flen) ))
-        echo $(( int * 1000 + fi ))
-    elif [[ "$s" =~ ^[0-9]+$ ]]; then echo "$s"
-    else echo "115200"
-    fi
-}
-
-baud_display() {
-    local b="$1" int frac
-    if (( b >= 1000000 )); then
-        int=$(( b / 1000000 )); frac=$(( (b % 1000000) / 100000 ))
-        [[ $frac -gt 0 ]] && echo "${int}.${frac}M" || echo "${int}M"
-    elif (( b >= 10000 && b % 100 == 0 )); then
-        int=$(( b / 1000 )); frac=$(( (b % 1000) / 100 ))
-        [[ $frac -gt 0 ]] && echo "${int}.${frac}K" || echo "${int}K"
-    else
-        echo "$b"
-    fi
-}
-
-load_config() {
-    [[ -f "$BOARD_CFG" ]] || return
-    while IFS='=' read -r key val; do
-        [[ "$key" =~ ^[[:space:]]*# || -z "${key// /}" ]] && continue
-        key="${key// /}"; val="${val%%#*}"; val="${val// /}"
-        # Global settings
-        if [[ "$key" =~ ^PROBE_(PARALLEL|READ_MS|DRAIN_MS)$ ]]; then
-            [[ "$val" =~ ^[0-9]+$ ]] && printf -v "$key" '%s' "$val"
-            continue
-        fi
-        if [[ "$key" == "PROBE_BAUDS" ]]; then
-            PROBE_BAUDS=()
-            local _b _braw
-            IFS=',' read -ra _blist <<< "$val"
-            for _b in "${_blist[@]}"; do
-                _b="${_b// /}"
-                _braw=$(parse_baud "$_b")
-                (( _braw > 0 )) && PROBE_BAUDS+=("$_braw")
-            done
-            continue
-        fi
-        # Hardware chip descriptors: VID:PID=NAME or VID:PID=NAME:BAUD
-        if [[ "$key" =~ ^[0-9a-fA-F]{4}:[0-9a-fA-F]{4}$ ]]; then
-            local chip_name="${val%%:*}"
-            [[ -n "$chip_name" ]] && CHIP_NAMES["$key"]="$chip_name"
-            if [[ "$val" == *:* ]]; then
-                local cb; cb=$(parse_baud "${val##*:}")
-                (( cb > 0 )) && CHIP_BAUD["$key"]="$cb"
-            fi
-            continue
-        fi
-        # Board serial→label mappings
-        local label="${val%%:*}" extra="${val##*:}"
-        CFG_LABEL["$key"]="$label"
-        if [[ "$val" == *:* && -n "$extra" ]]; then
-            local b; b=$(parse_baud "$extra")
-            (( b > 9600 )) && CFG_BAUD["$key"]="$b"
-        fi
-    done < "$BOARD_CFG"
-}
-
-get_baud() { echo "${CFG_BAUD[$2]:-${CHIP_BAUD[$1]:-115200}}"; }
-
-# Validate a baud string before parsing (empty = use default = valid)
+# ── baud_valid / baud_prompt ───────────────────────────────────────────────────
 baud_valid() {
     [[ -z "$1" ]] && return 0
     local s="${1^^}"; s="${s//[[:space:]]/}"
     [[ "$s" =~ ^[0-9]+(\.[0-9]+)?[MK]$ || "$s" =~ ^[0-9]+$ ]]
 }
-
-# Baud prompt: "Baud [115200 or 115.2K]" when they differ, "Baud [9600]" when same
 baud_prompt() {
     local b="$1" d; d=$(baud_display "$b")
     [[ "$d" != "$b" ]] && echo "Baud [$d or $b]" || echo "Baud [$b]"
 }
 
-# ── TTY probe (single fd — avoids close/reopen race) ──────────────────────────
-# Outputs: STATUS|board_id
-probe_tty() {
-    local dev="$1" cfg_baud="${2:-115200}"
-    { fuser "$dev" &>/dev/null 2>&1 || sudo -n fuser "$dev" &>/dev/null 2>&1; } \
-        && { printf 'OPEN|%s|\n' "$cfg_baud"; return; }
-    [[ "$dev" =~ /dev/ttyACM ]] && { printf 'DEAD|%s|\n' "$cfg_baud"; return; }
-    local fd
-    exec {fd}<>"$dev" 2>/dev/null || { printf 'FAIL|%s|\n' "$cfg_baud"; return; }
-    local saved; saved=$(stty -F "$dev" -g 2>/dev/null)
-
-    # Order driven entirely by PROBE_BAUDS (configurable in serial-boards.conf).
-    # Per-board cfg_baud is elevated to position 0 if not already first.
-    local -a try_bauds=()
-    [[ "$cfg_baud" != "${PROBE_BAUDS[0]}" ]] && try_bauds+=("$cfg_baud")
-    local b
-    for b in "${PROBE_BAUDS[@]}"; do
-        local dup=0
-        for already in "${try_bauds[@]}"; do [[ "$b" == "$already" ]] && dup=1 && break; done
-        (( dup )) || try_bauds+=("$b")
-    done
-
-    local read_t drain_t
-    read_t="$(( PROBE_READ_MS  / 1000 )).$(printf '%03d' $(( PROBE_READ_MS  % 1000 )))"
-    drain_t="$(( PROBE_DRAIN_MS / 1000 )).$(printf '%03d' $(( PROBE_DRAIN_MS % 1000 )))"
-
-    local detected="" captured=""
-    for baud in "${try_bauds[@]}"; do
-        stty -F "$dev" "$baud" raw -echo min 0 time 1 2>/dev/null
-        # Drain bytes buffered at the previous baud rate before reading fresh response.
-        IFS= read -t "$drain_t" -r -d '' -n 1024 -u $fd _drain 2>/dev/null || true
-        printf '\r' >&$fd
-        local raw=""
-        IFS= read -t "$read_t" -r -d '' -n 200 -u $fd raw 2>/dev/null
-        local clean; clean=$(printf '%s' "$raw" \
-            | tr -dc '[:print:][:space:]' | tr -s '[:space:]' ' ' \
-            | sed 's/^ //; s/ $//')
-        local raw_len="${#raw}" clean_len="${#clean}"
-        if (( clean_len >= 4 && raw_len > 0 && clean_len * 100 >= raw_len * 80 )); then
-            detected="$baud"; captured="$clean"; break
-        fi
-    done
-
-    [[ -n "$saved" ]] && stty -F "$dev" "$saved" 2>/dev/null
-    stty -F "$dev" -hupcl 2>/dev/null   # prevent DTR deassert on close → no board SIGHUP
-    exec {fd}>&-
-
-    if [[ -z "$detected" ]]; then
-        printf 'DEAD|%s|\n' "$cfg_baud"; return
-    fi
-
-    local id=""
-    if   [[ "$captured" =~ @([A-Za-z0-9._-]+)[[:space:]]*: ]];       then id="${BASH_REMATCH[1]}"
-    elif [[ "$captured" =~ ([A-Za-z0-9._-]+)[[:space:]]+login: ]];    then id="${BASH_REMATCH[1]}"
-    elif [[ "$captured" =~ [Bb]oard:[[:space:]]*([A-Za-z0-9._-]+) ]]; then id="${BASH_REMATCH[1]}"
-    else id="${captured:0:30}"
-    fi
-    printf 'LIVE|%s|%s\n' "$detected" "$id"
-}
-
-# Status: LIVE  OPEN  dead  FAIL — purely from the probe, no guessing
-
+# ── launch ─────────────────────────────────────────────────────────────────────
 launch() {
     local dev="$1" baud="$2"
-
-    # ── Check if serial-agent is running this device via ser2net TCP ──────────
-    # If so, route tio through TCP instead of opening the device directly.
-    # Both tio and the daemon get the full byte stream via ser2net — no byte-splitting.
     local agent_tcp=""
     local agent_status="${HOME}/var/serial-agent/$(basename "$dev")/status.json"
     if [[ -f "$agent_status" ]]; then
         local via; via=$(python3 -c "import json,sys; print(json.load(open('$agent_status')).get('via',''))" 2>/dev/null)
-        if [[ "$via" == tcp:* ]]; then
-            agent_tcp="${via#tcp:}"   # e.g. "localhost:3001"
-        fi
+        [[ "$via" == tcp:* ]] && agent_tcp="${via#tcp:}"
     fi
-
     if [[ -n "$agent_tcp" ]]; then
-        echo -e "  ${DIM}serial-agent running via ser2net tcp:${agent_tcp} — connecting tio there${NC}"
+        echo -e "  ${DIM}serial-agent via ser2net tcp:${agent_tcp} — connecting tio there${NC}"
         echo -e "  ${DIM}Both tio and agent receive the full stream independently.${NC}"
     else
-        # Pre-clear HUPCL so DTR is NOT dropped when the terminal process closes the fd.
         stty -F "$dev" -hupcl 2>/dev/null
     fi
-
     case "${SERIAL_TERM}" in
         tio)
             command -v tio &>/dev/null || { echo "tio not found: sudo apt install tio" >&2; exit 1; }
             local sock="/tmp/$(basename "$dev").sock"
-            local tio_target="${agent_tcp:+tcp:$agent_tcp}"  # use TCP if agent is running via ser2net
-            tio_target="${tio_target:-$dev}"                  # otherwise use device directly
+            local tio_target="${agent_tcp:+tcp:$agent_tcp}"; tio_target="${tio_target:-$dev}"
             echo -e "\n${GREEN}→${NC} tio $tio_target @ $(baud_display "$baud")  ${DIM}(Ctrl-T Q to quit)${NC}"
-            echo -e "  ${DIM}Share (2nd terminal):  socat - UNIX-CONNECT:$sock${NC}\n"
+            echo -e "  ${DIM}Share: socat - UNIX-CONNECT:$sock${NC}\n"
             exec tio -b "$baud" -S "unix:$sock" "$tio_target"
             ;;
         screen)
             command -v screen &>/dev/null || { echo "screen not found: sudo apt install screen" >&2; exit 1; }
             local sname; sname="$(basename "$dev")"
             echo -e "\n${GREEN}→${NC} screen $dev @ $(baud_display "$baud")  ${DIM}(Ctrl-A K to kill)${NC}"
-            echo -e "  ${DIM}Share (2nd terminal):  screen -x $sname${NC}\n"
+            echo -e "  ${DIM}Share: screen -x $sname${NC}\n"
             exec screen -S "$sname" "$dev" "$baud"
             ;;
         picocom)
@@ -246,39 +66,15 @@ launch() {
     esac
 }
 
-# ── Probe launcher: parallel with optional cap and dynamic watchdog ────────────
-run_probes() {
-    local -a idxs=("$@")
-    local -a pids=()
-    local active=0 i
-    for i in "${idxs[@]}"; do
-        if (( PROBE_PARALLEL > 0 && active >= PROBE_PARALLEL )); then
-            wait -n 2>/dev/null; (( active-- )) || true
-        fi
-        ( probe_tty "${DEVS[$i]}" "${BAUDS[$i]}" \
-            > "$PROBE_DIR/$(basename "${DEVS[$i]}")" ) &
-        pids+=($!); (( active++ )) || true
-    done
-    local wdog_s=$(( (${#PROBE_BAUDS[@]} * (PROBE_READ_MS + PROBE_DRAIN_MS) + 999) / 1000 + 1 ))
-    ( sleep "$wdog_s"; kill -9 "${pids[@]}" 2>/dev/null ) &
-    local wdog=$!
-    wait "${pids[@]}" 2>/dev/null
-    kill -9 "$wdog" 2>/dev/null; wait "$wdog" 2>/dev/null
-}
-
 # ── Cache helpers ──────────────────────────────────────────────────────────────
-# Cache format: one line per port — "VID:PID:SER:IFN|STATUS|board_id"
 save_cache() {
-    local probe_dir="$1"
-    : > "$CACHE_FILE"
+    local probe_dir="$1"; : > "$CACHE_FILE"
     for i in "${!DEVS[@]}"; do
         local key="${VIDS[$i]}:${PIDS[$i]}:${SERS[$i]}:${IFNS[$i]}"
-        local result; result=$(cat "$probe_dir/$(basename "${DEVS[$i]}")" 2>/dev/null \
-                               || echo "FAIL|")
+        local result; result=$(cat "$probe_dir/$(basename "${DEVS[$i]}")" 2>/dev/null || echo "FAIL|")
         echo "${key}|${result}" >> "$CACHE_FILE"
     done
 }
-
 load_cache() {
     local probe_dir="$1"
     for i in "${!DEVS[@]}"; do
@@ -290,43 +86,14 @@ load_cache() {
 
 # ── Init ───────────────────────────────────────────────────────────────────────
 load_config
-declare -a DEVS VIDS PIDS SERS IFNS IFSTRS CHIPS LABELS BAUDS
-idx=0
-for dev in $(ls /dev/ttyUSB* /dev/ttyACM* 2>/dev/null | sort -V); do
-    [[ -c "$dev" ]] || continue
-    info=$(udevadm info -a "$dev" 2>/dev/null)
-    vid=$(awk   -F'"' '/ATTRS\{idVendor\}/{print $2; exit}'         <<< "$info")
-    pid=$(awk   -F'"' '/ATTRS\{idProduct\}/{print $2; exit}'        <<< "$info")
-    ser=$(awk   -F'"' '/ATTRS\{serial\}/{print $2; exit}'           <<< "$info")
-    ifn=$(awk   -F'"' '/ATTRS\{bInterfaceNumber\}/{print $2; exit}' <<< "$info")
-    ifstr=$(awk -F'"' '/ATTRS\{interface\}/{print $2; exit}'        <<< "$info")
-    vp="${vid}:${pid}"
-    DEVS[$idx]="$dev";  VIDS[$idx]="$vid";  PIDS[$idx]="$pid"
-    SERS[$idx]="$ser";  IFNS[$idx]="$ifn";  IFSTRS[$idx]="$ifstr"
-    CHIPS[$idx]="${CHIP_NAMES[$vp]:-${vp}}"
-    LABELS[$idx]="${CFG_LABEL[$ser]:-}"
-    BAUDS[$idx]=$(get_baud "$vp" "$ser")
-    (( idx++ )) || true
-done
-
-# ── Sequential port index within each physical device ─────────────────────────
-declare -A PORT_IDX _ser_devs
-for i in "${!DEVS[@]}"; do _ser_devs[${SERS[$i]}]+="${IFNS[$i]}:${DEVS[$i]} "; done
-for ser in "${!_ser_devs[@]}"; do
-    idx=0
-    while read -r dev; do
-        PORT_IDX[$dev]=$idx; (( idx++ )) || true
-    done < <(tr ' ' '\n' <<< "${_ser_devs[$ser]}" | grep -v '^$' \
-             | sort -t: -k1 -n | cut -d: -f2-)
-done
+enumerate_devices
+port_indices
 
 # ── Direct-device mode ────────────────────────────────────────────────────────
 if [[ -n "${1:-}" ]]; then
     dev="$1"; [[ ! -c "$dev" ]] && { echo "Not a device: $dev" >&2; exit 1; }
     baud="115200"
-    for i in "${!DEVS[@]}"; do
-        [[ "${DEVS[$i]}" == "$dev" ]] && baud="${BAUDS[$i]}" && break
-    done
+    for i in "${!DEVS[@]}"; do [[ "${DEVS[$i]}" == "$dev" ]] && baud="${BAUDS[$i]}" && break; done
     trap 'printf "\n"; exit 0' INT
     while true; do
         read -rp "$(baud_prompt "$baud"): " b || { printf "\n"; exit 0; }
@@ -336,29 +103,19 @@ if [[ -n "${1:-}" ]]; then
     launch "$dev" "$baud"
 fi
 
-# ── Signature check ────────────────────────────────────────────────────────────
-cur_sig=$(for i in "${!DEVS[@]}"; do
-    echo "${VIDS[$i]}:${PIDS[$i]}:${SERS[$i]}"
-done | sort -u)
+# ── Signature check and selective probing ─────────────────────────────────────
+cur_sig=$(for i in "${!DEVS[@]}"; do echo "${VIDS[$i]}:${PIDS[$i]}:${SERS[$i]}"; done | sort -u)
 prev_sig=""; [[ -f "$SIG_FILE" ]] && prev_sig=$(< "$SIG_FILE")
 
 PROBE_DIR=$(mktemp -d /tmp/serial-probe.XXXXXX)
 trap 'rm -rf "$PROBE_DIR"' EXIT
 
 if [[ "$cur_sig" != "$prev_sig" ]]; then
-    # Device set changed: probe fresh, update cache
     echo "$cur_sig" > "$SIG_FILE"
-    [[ -n "$prev_sig" ]] && \
-        echo -e "\n${YELLOW}⚠  Device configuration changed — re-probing${NC}\n"
-    run_probes "${!DEVS[@]}"
-    save_cache "$PROBE_DIR"
+    [[ -n "$prev_sig" ]] && echo -e "\n${YELLOW}⚠  Device configuration changed — re-probing${NC}\n"
+    run_probes "${!DEVS[@]}"; save_cache "$PROBE_DIR"
 elif [[ -f "$CACHE_FILE" ]]; then
-    # Same topology: load cache, then selectively re-probe unrecognized boards.
-    # Boards already identified (LIVE in cache or in config label) are skipped.
-    # Only ports whose entire physical device (serial) has no name are re-probed.
     load_cache "$PROBE_DIR"
-
-    # Which serials are already recognized? (config label OR any port LIVE/OPEN in cache)
     declare -A _recog
     for i in "${!DEVS[@]}"; do
         ser="${SERS[$i]}"
@@ -366,28 +123,23 @@ elif [[ -f "$CACHE_FILE" ]]; then
         result=$(cat "$PROBE_DIR/$(basename "${DEVS[$i]}")" 2>/dev/null || echo "")
         [[ "$result" =~ ^(LIVE|OPEN)\| ]] && _recog[$ser]=1
     done
-
-    # Re-probe only ports of unrecognized serials (skip ttyACM — blocks on USB)
-    local -a _reprobe_idxs=()
+    declare -a _reprobe_idxs=()
     for i in "${!DEVS[@]}"; do
         [[ -n "${_recog[${SERS[$i]}]+x}" ]] && continue
         [[ "${DEVS[$i]}" =~ /dev/ttyACM ]] && continue
         _reprobe_idxs+=("$i")
     done
     if (( ${#_reprobe_idxs[@]} > 0 )); then
-        run_probes "${_reprobe_idxs[@]}"
-        save_cache "$PROBE_DIR"   # persist newly identified boards
+        run_probes "${_reprobe_idxs[@]}"; save_cache "$PROBE_DIR"
     fi
     unset _recog
 else
-    # Same sig but no cache yet: full re-probe and cache
-    run_probes "${!DEVS[@]}"
-    save_cache "$PROBE_DIR"
+    run_probes "${!DEVS[@]}"; save_cache "$PROBE_DIR"
 fi
 
 (( ${#DEVS[@]} == 0 )) && { echo -e "${RED}No serial ports found.${NC}" >&2; exit 1; }
 
-# ── Build BOARD_ID map: best known name per USB serial number ──────────────────
+# ── BOARD_ID map ───────────────────────────────────────────────────────────────
 declare -A BOARD_ID
 for i in "${!DEVS[@]}"; do
     ser="${SERS[$i]}"
@@ -409,69 +161,42 @@ for i in "${!DEVS[@]}"; do
 done
 (( dev_w++ )); (( chip_w++ ))
 board_w=6
-for ser in "${!BOARD_ID[@]}"; do
-    (( ${#BOARD_ID[$ser]} > board_w )) && board_w=${#BOARD_ID[$ser]}
-done
+for ser in "${!BOARD_ID[@]}"; do (( ${#BOARD_ID[$ser]} > board_w )) && board_w=${#BOARD_ID[$ser]}; done
 for i in "${!DEVS[@]}"; do
     [[ -n "${BOARD_ID[${SERS[$i]}]+x}" ]] && continue
-    ser="${SERS[$i]}"
-    ser_disp="${ser}"; (( ${#ser} > 12 )) && ser_disp="${ser:0:10}"
+    ser="${SERS[$i]}"; ser_disp="${ser}"; (( ${#ser} > 12 )) && ser_disp="${ser:0:10}"
     fb=$(( ${#CHIPS[$i]} + 1 + ${#ser_disp} ))
     (( fb > board_w )) && board_w=$fb
 done
 (( board_w++ ))
 rule_w=$(( 2 + 1 + 5 + dev_w + 2 + 6 + 4 + board_w + 2 + chip_w + 2 + 4 + 7 ))
 
-# ── Build and display menu ─────────────────────────────────────────────────────
+# ── Menu ───────────────────────────────────────────────────────────────────────
 echo -e "${BOLD}Select serial port:${NC}\n"
 printf "  ${BOLD}%-1s  %4s  %-${dev_w}s  %-6s    %-${board_w}s  %-${chip_w}s  %-3s  %s${NC}\n" \
     "·" "#" "Device" "Status" "Board" "Chip" "P#" "Baud"
 printf '─%.0s' $(seq 1 "$rule_w"); echo
 
-# ── Re-order display: group by serial (first-occurrence order), then interface ──
-# Prevents a device with a different serial (e.g. CP210x grabbing ttyUSB2) from
-# visually splitting a multi-port adapter's group (e.g. FT4232H ttyUSB0/1/3/4).
-declare -A _fpos   # serial → index of first occurrence in DEVS
-for i in "${!DEVS[@]}"; do
-    [[ -z "${_fpos[${SERS[$i]}]+x}" ]] && _fpos[${SERS[$i]}]=$i
-done
-declare -a _disp_order
-while IFS=: read -r _ _ i; do _disp_order+=("$i"); done < <(
-    for i in "${!DEVS[@]}"; do
-        printf "%05d:%04d:%d\n" \
-            "${_fpos[${SERS[$i]}]}" \
-            "$(( 10#${IFNS[$i]:-0} ))" \
-            "$i"
-    done | sort)
-unset _fpos
-
+display_order
 row=1; prev_ser="__unset__"
 declare -a ROW_DEV ROW_BAUD ROW_STATE
 
 for i in "${_disp_order[@]}"; do
     dev="${DEVS[$i]}"; devname=$(basename "$dev")
-    vp="${VIDS[$i]}:${PIDS[$i]}"
-    ser="${SERS[$i]}"; ifn="${IFNS[$i]}"; ifstr="${IFSTRS[$i]}"
-    chip="${CHIPS[$i]}"; baud="${BAUDS[$i]}"
-
+    ser="${SERS[$i]}"; chip="${CHIPS[$i]}"; baud="${BAUDS[$i]}"
     [[ "$ser" != "$prev_ser" && "$prev_ser" != "__unset__" ]] && echo ""
     prev_ser="$ser"
-
     IFS='|' read -r raw probe_baud _ \
         <<< "$(cat "$PROBE_DIR/$devname" 2>/dev/null || echo 'FAIL||')"
     [[ "$raw" == "DEAD" ]] && state="dead" || state="$raw"
-    # Only use detected baud if it's a valid number (guards against stale cache format)
     [[ "$state" == "LIVE" && "$probe_baud" =~ ^[0-9]+$ ]] && baud="$probe_baud"
-
     ROW_DEV[$row]="$dev"; ROW_BAUD[$row]="$baud"; ROW_STATE[$row]="$state"
-
     case "$state" in
-        LIVE) sym="${GREEN}★${NC}"; dc="$NC";   sc="${GREEN}" ;;
-        OPEN) sym="${CYAN}⊙${NC}";  dc="$CYAN"; sc="${CYAN}"  ;;
-        dead) sym=" ";              dc="$DIM";  sc="$DIM"    ;;
-        FAIL) sym="${RED}✗${NC}";   dc="$RED";  sc="${RED}"   ;;
+        LIVE) sym="${GREEN}★${NC}"; dc="$NC";  sc="${GREEN}" ;;
+        OPEN) sym="${CYAN}⊙${NC}";  dc="$CYAN"; sc="${CYAN}" ;;
+        dead) sym=" ";             dc="$DIM";  sc="$DIM"    ;;
+        FAIL) sym="${RED}✗${NC}";  dc="$RED";  sc="${RED}"   ;;
     esac
-
     board_name="${BOARD_ID[$ser]:-}"
     if [[ -n "$board_name" ]]; then
         board_col=$(printf "%-${board_w}s" "$board_name")
@@ -479,9 +204,7 @@ for i in "${_disp_order[@]}"; do
         ser_disp="${ser}"; (( ${#ser} > 12 )) && ser_disp="${ser:0:10}"
         board_col="${DIM}$(printf "%-${board_w}s" "${chip}-${ser_disp}")${NC}"
     fi
-
     baud_col=""; [[ "$state" == "LIVE" || "$state" == "OPEN" ]] && baud_col=$(baud_display "$baud")
-
     printf "  %b  %b%3d)${NC}  %b%-${dev_w}s${NC}  %b%-6s${NC}    %s  %-${chip_w}s  p%-2s  %s\n" \
         "$sym" "$BOLD" "$row" "$dc" "$devname" "$sc" "$state" \
         "$board_col" "$chip" "${PORT_IDX[$dev]:-0}" "$baud_col"
@@ -491,8 +214,7 @@ done
 total=$(( row - 1 ))
 echo ""
 printf "  ${GREEN}★ LIVE${NC}    ${CYAN}⊙ OPEN${NC}    ${RED}✗ FAIL${NC}    ${DIM}  dead${NC}\n"
-echo -e "  ${DIM}Run serial-discover to force a fresh probe${NC}"
-echo -e "  ${DIM}Run serial-discover --gen-udev to fix port numbering across reboots${NC}"
+echo -e "  ${DIM}serial-discover — fresh probe   serial-discover --gen-udev — fix port numbering${NC}"
 echo ""
 
 trap 'printf "\n"; exit 0' INT
@@ -502,20 +224,15 @@ while true; do
     [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= total )) || {
         echo "  Enter a number between 1 and ${total}." >&2; continue
     }
-
-    # If OPEN, show holder and offer force-close
     if [[ "${ROW_STATE[$choice]}" == "OPEN" ]]; then
         echo ""
         echo -e "  ${CYAN}⊙${NC} ${ROW_DEV[$choice]} is currently held by:"
         fuser -v "${ROW_DEV[$choice]}" 2>&1 | grep -v '^\s*$' | sed 's/^/    /'
         echo ""
         read -rp "  Force close and connect? [y/N]: " confirm || { printf "\n"; exit 0; }
-        if [[ "${confirm,,}" != "y" ]]; then
-            echo ""; continue
-        fi
+        if [[ "${confirm,,}" != "y" ]]; then echo ""; continue; fi
         fuser -k "${ROW_DEV[$choice]}" 2>/dev/null
         sleep 0.3
-        # Invalidate cache — port is no longer OPEN, next run re-probes it fresh
         rm -f "$CACHE_FILE" "$SIG_FILE"
         echo -e "  ${GREEN}Session closed.${NC}\n"
     fi
@@ -523,7 +240,6 @@ while true; do
 done
 
 sel_dev="${ROW_DEV[$choice]}"; sel_baud="${ROW_BAUD[$choice]}"
-
 while true; do
     read -rp "$(baud_prompt "$sel_baud"): " b || { printf "\n"; exit 0; }
     baud_valid "$b" && { [[ -n "$b" ]] && sel_baud=$(parse_baud "$b"); break; }

@@ -180,6 +180,7 @@ from pathlib import Path
 from threading import Thread, Event
 
 # ── Storage ────────────────────────────────────────────────────────────────────
+_SCRIPT_DIR = Path(__file__).resolve().parent
 _REAL_BASE = Path.home() / 'var' / 'serial-agent'
 _TMP_LINK  = Path('/tmp/serial-agent')
 AGENT_BASE = Path(os.environ.get('SERIAL_AGENT_DIR', str(_REAL_BASE)))
@@ -1071,7 +1072,7 @@ def cmd_auto_label(args):
     except Exception as e:
         print(f'serial-discover failed: {e}', file=sys.stderr); sys.exit(1)
 
-    cfg = Path.home() / '.config' / 'serial-boards.conf'
+    cfg = Path(os.environ.get('BOARD_CFG', str(_SCRIPT_DIR / 'serial-boards.conf')))
     existing_text = cfg.read_text() if cfg.exists() else ''
 
     seen, to_label = set(), {}
