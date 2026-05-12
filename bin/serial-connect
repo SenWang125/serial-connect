@@ -99,10 +99,10 @@ elif [[ -f "$CACHE_FILE" ]]; then
     load_cache "$PROBE_DIR"
     # Promote LIVE→OPEN for ports now held by another process (fuser only, no probe)
     for i in "${!DEVS[@]}"; do
-        local _pf="$PROBE_DIR/$(basename "${DEVS[$i]}")"
-        local _r; _r=$(cut -d'|' -f1 "$_pf" 2>/dev/null)
+        _pf="$PROBE_DIR/$(basename "${DEVS[$i]}")"
+        _r=$(cut -d'|' -f1 "$_pf" 2>/dev/null)
         if [[ "$_r" == "LIVE" ]]; then
-            local _baud; _baud=$(cut -d'|' -f2 "$_pf" 2>/dev/null)
+            _baud=$(cut -d'|' -f2 "$_pf" 2>/dev/null)
             { fuser "${DEVS[$i]}" &>/dev/null 2>&1 || sudo -n fuser "${DEVS[$i]}" &>/dev/null 2>&1; } \
                 && printf 'OPEN|%s|\n' "$_baud" > "$_pf"
         fi
