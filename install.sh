@@ -240,7 +240,7 @@ fi
 # ── Config file ────────────────────────────────────────────────────────────────
 mkdir -p "$CONF_DIR"
 if [[ ! -f "$CONF_FILE" ]]; then
-    cp "$SCRIPT_DIR/examples/serial-boards.conf.example" "$CONF_FILE"
+    cp "$SCRIPT_DIR/serial-boards.conf" "$CONF_FILE"
     green "  ✓ ~/.config/serial-boards.conf  (created from example)"
 else
     dim   "  · ~/.config/serial-boards.conf  (exists — not modified)"

@@ -102,16 +102,30 @@ serial-connect                                         # human session via TCP
 
 ## Configuration
 
-`~/.config/serial-boards.conf` maps USB adapter serial numbers to board labels:
+`~/.config/serial-boards.conf` is installed automatically. Edit it to label your boards and tune discovery. The file is self-documented — every option has a comment explaining it.
 
+**Label a board** (USB serial number is the stable key across reboots):
 ```
-# SERIAL=LABEL  or  SERIAL=LABEL:BAUD
 46241800161=MY-AM62-BOARD
-0001=OrangePi5Plus:1500000
+45241640028=AM62P-EVM:115200
+```
+Find serial numbers with `serial-discover` (Board column of unlabelled ports), or generate labels automatically:
+```bash
+serial-agent auto-label -y
 ```
 
-The USB serial number is the key — it follows the hardware across reboots.
-Find serial numbers with: `serial-discover` (shown in the Board column for unknown boards).
+**Tune discovery speed** (uncomment and adjust as needed):
+```
+PROBE_READ_MS=50        # halve response wait → halve worst-case probe time
+PROBE_PARALLEL=8        # cap simultaneous probes if USB bus gets congested
+PROBE_BAUDS=115.2K,9600,19200,38400,57600,230.4K,460.8K,921.6K,1.5M
+```
+
+**Add an unlisted chip**:
+```
+0403:6011=FT4232H:115200
+abcd:1234=MyCustomChip
+```
 
 ---
 
