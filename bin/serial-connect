@@ -154,12 +154,13 @@ rule_w=$(( 2 + 1 + 5 + dev_w + 2 + 6 + 4 + board_w + 2 + chip_w + 2 + 5 + 8 ))
 # ── Menu ───────────────────────────────────────────────────────────────────────
 echo -e "${BOLD}Select serial port:${NC}\n"
 printf "  ${BOLD}%-1s  %4s  %-${dev_w}s  %-6s    %-${board_w}s  %-${chip_w}s  %-3s  %s${NC}\n" \
-    "·" "#" "Port" "Status" "Board" "Chip" "Chip-P" "Baud"
+    "·" "#" "Port" "Status" "Board" "Chip" "P#" "Baud"
 printf '─%.0s' $(seq 1 "$rule_w"); echo
 
 display_order
 row=1; prev_ser="__unset__"
 declare -a ROW_DEV ROW_BAUD ROW_STATE
+declare -A ROW_BY_CHIPPORT   # "N-pM" → row number
 
 for i in "${_disp_order[@]}"; do
     dev="${DEVS[$i]}"; devname=$(basename "$dev")
@@ -171,6 +172,7 @@ for i in "${_disp_order[@]}"; do
     [[ -z "$raw" || "$raw" == "DEAD" ]] && state="dead" || state="$raw"
     [[ "$state" == "LIVE" && "$probe_baud" =~ ^[0-9]+$ ]] && baud="$probe_baud"
     ROW_DEV[$row]="$dev"; ROW_BAUD[$row]="$baud"; ROW_STATE[$row]="$state"
+    ROW_BY_CHIPPORT["${DEVICE_IDX[$ser]:-0}-p${PORT_IDX[$dev]:-0}"]=$row
     case "$state" in
         LIVE) sym="${GREEN}★${NC}"; dc="$NC";  sc="${GREEN}" ;;
         OPEN) sym="${CYAN}⊙${NC}";  dc="$CYAN"; sc="${CYAN}" ;;
@@ -201,9 +203,14 @@ echo ""
 trap 'printf "\n"; exit 0' INT
 
 while true; do
-    read -rp "Port [1-${total}]: " choice || { printf "\n"; exit 0; }
+    read -rp "Port [1-${total} or N-pM]: " choice || { printf "\n"; exit 0; }
+    # Accept N-pM (e.g. 2-p1) as shorthand for the Chip-P column value
+    if [[ "$choice" =~ ^[0-9]+-p[0-9]+$ ]]; then
+        choice="${ROW_BY_CHIPPORT[$choice]:-}"
+        [[ -z "$choice" ]] && { echo "  No port with that Chip-P." >&2; continue; }
+    fi
     [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= total )) || {
-        echo "  Enter a number between 1 and ${total}." >&2; continue
+        echo "  Enter a row number or Chip-P (e.g. 2-p1)." >&2; continue
     }
     if [[ "${ROW_STATE[$choice]}" == "OPEN" ]]; then
         echo ""
