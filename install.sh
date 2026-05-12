@@ -221,7 +221,7 @@ mkdir -p "$INSTALL_DIR"
 
 TOOLS=(serial-common.sh serial-discover serial-connect serial-agent)
 for tool in "${TOOLS[@]}"; do
-    src="$SCRIPT_DIR/bin/$tool"
+    src="$SCRIPT_DIR/$tool"
     [[ ! -f "$src" ]] && { red "  Missing source: $src"; exit 1; }
     cp "$src" "$INSTALL_DIR/$tool"
     chmod +x "$INSTALL_DIR/$tool"
