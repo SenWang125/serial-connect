@@ -170,7 +170,11 @@ for i in "${_disp_order[@]}"; do
     IFS='|' read -r raw probe_baud _ \
         <<< "$(cat "$PROBE_DIR/$devname" 2>/dev/null || echo 'FAIL||')"
     [[ -z "$raw" || "$raw" == "DEAD" ]] && state="dead" || state="$raw"
-    [[ "$state" == "LIVE" && "$probe_baud" =~ ^[0-9]+$ ]] && baud="$probe_baud"
+    if [[ "$state" == "LIVE" && "$probe_baud" =~ ^[0-9]+$ ]]; then
+        baud="$probe_baud"
+    elif [[ "$state" != "OPEN" ]]; then
+        baud="${PROBE_BAUDS[0]:-115200}"
+    fi
     ROW_DEV[$row]="$dev"; ROW_BAUD[$row]="$baud"; ROW_STATE[$row]="$state"
     ROW_BY_CHIPPORT["${DEVICE_IDX[$ser]:-0}-p${PORT_IDX[$dev]:-0}"]=$row
     case "$state" in
