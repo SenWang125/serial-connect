@@ -130,7 +130,7 @@ fi
 # ── Human display ───────────────────────────────────────────────────────────────
 echo -e "${BOLD}USB Serial Port Discovery${NC}  $(date '+%Y-%m-%d %H:%M:%S')\n"
 printf "  ${BOLD}%-1s  %-${dev_w}s  %-6s    %-${board_w}s  %-${chip_w}s  %-3s  %s${NC}\n" \
-    "·" "Device" "Status" "Board" "Chip" "Dev-P" "Baud"
+    "·" "Port" "Status" "Board" "Chip" "Chip-P" "Baud"
 printf '─%.0s' $(seq 1 "$rule_w"); echo
 
 display_order
