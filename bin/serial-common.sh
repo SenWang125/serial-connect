@@ -12,31 +12,10 @@ DIM=$'\033[2m'; RED=$'\033[31m'; NC=$'\033[0m'
 _COMMON_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BOARD_CFG="${BOARD_CFG:-$_COMMON_DIR/serial-boards.conf}"
 
-# ── Built-in chip table ────────────────────────────────────────────────────────
-# Extend or override entries via VID:PID=NAME[:BAUD] in serial-boards.conf.
-declare -A CHIP_NAMES=(
-  ["0403:6001"]="FT232RL"    ["0403:6010"]="FT2232H"
-  ["0403:6011"]="FT4232H"    ["0403:6014"]="FT232H"
-  ["0403:6015"]="FT231X"     ["0451:bef3"]="XDS110"
-  ["0451:bef4"]="XDS110"     ["2e8a:000c"]="RPiProbe"
-  ["10c4:ea60"]="CP210x"     ["10c4:ea70"]="CP2105"
-  ["10c4:ea71"]="CP2108"     ["067b:2303"]="PL2303"
-  ["1a86:7523"]="CH340"      ["1a86:55d4"]="CH343P"
-)
-declare -A CHIP_BAUD=(
-  ["0451:bef3"]="115200"  ["0451:bef4"]="115200"  ["2e8a:000c"]="115200"
-  ["0403:6011"]="115200"  ["0403:6010"]="115200"  ["0403:6001"]="115200"
-  ["0403:6015"]="115200"  ["0403:6014"]="115200"  ["10c4:ea60"]="115200"
-  ["067b:2303"]="115200"  ["1a86:7523"]="115200"  ["1a86:55d4"]="115200"
-)
-declare -A CFG_LABEL CFG_BAUD
-
-# ── Probe defaults ─────────────────────────────────────────────────────────────
-# All overridable via serial-boards.conf.
-PROBE_BAUDS=(115200 9600 19200 38400 57600 230400 460800 921600 1500000)
-PROBE_PARALLEL=0    # max simultaneous port probes (0 = unlimited)
-PROBE_READ_MS=100   # ms to wait for board response per baud attempt
-PROBE_DRAIN_MS=10   # ms to drain stale tty bytes after each baud switch
+# Chip tables and probe defaults are defined in serial-boards.conf.
+declare -A CHIP_NAMES=() CHIP_BAUD=() CFG_LABEL CFG_BAUD
+declare -a PROBE_BAUDS=()
+PROBE_PARALLEL=0 PROBE_READ_MS=100 PROBE_DRAIN_MS=10
 
 # ── parse_baud ─────────────────────────────────────────────────────────────────
 # Convert human-readable baud string to integer: 1.5M→1500000, 115.2K→115200
