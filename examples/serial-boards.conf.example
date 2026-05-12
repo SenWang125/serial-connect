@@ -8,6 +8,31 @@
 # Labels here are purely for display — add one only after you've confirmed
 # which physical board a serial number belongs to.
 #
+# ── Global settings ────────────────────────────────────────────────────────────
+#
+# PROBE_BAUDS — ordered baud rates to try during discovery (comma-separated).
+# Per-board baud overrides are always elevated to position 0 automatically.
+# M and K suffixes are supported (1.5M, 115.2K, etc.).
+# Default if not set:  115.2K,9600,19200,38400,57600,230.4K,460.8K,921.6K,1.5M
+#
+# Override example — only common embedded rates, 1.5M at end for Rockchip boards:
+#PROBE_BAUDS=115.2K,9600,19200,38400,57600,230.4K,460.8K,921.6K,1.5M
+#
+# ── Hardware chip descriptors ──────────────────────────────────────────────────
+#
+# Add or override chip names and default baud rates by USB VID:PID.
+# Format:  VID:PID=CHIP_NAME             (name only, keep built-in baud)
+#          VID:PID=CHIP_NAME:BAUD        (name + default baud for this chip)
+#
+# The built-in table covers common chips (FTDI, XDS110, CP210x, CH340, PL2303).
+# Add entries here for custom or unlisted chips, or to override defaults.
+#
+#0403:6011=FT4232H:115200
+#10c4:ea60=CP210x:115200
+#1a86:7523=CH340:115200
+#
+# ── Board labels ───────────────────────────────────────────────────────────────
+#
 # To identify a new FTDI board:
 #   1. Power the board on
 #   2. Run: serial-discover        (★ shows which port responded)
@@ -16,7 +41,7 @@
 #
 # Default bauds by chip:
 #   FTDI, XDS110, RPi Debug Probe  → 115200
-#   CP210x                         → 1500000
+#   CP210x                         → 115200  (override per-board if needed)
 #
 # ─────────────────────────────────────────────────────────────────
 

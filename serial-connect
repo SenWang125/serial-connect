@@ -23,12 +23,15 @@ DIM=$'\033[2m'; RED=$'\033[31m'; NC=$'\033[0m'
 BOARD_CFG="${HOME}/.config/serial-boards.conf"
 
 declare -A CHIP_NAMES=(
-  ["0403:6001"]="FT232RL"   ["0403:6010"]="FT2232H"   ["0403:6011"]="FT4232H"
-  ["0403:6014"]="FT232H"    ["0403:6015"]="FT231X"    ["0451:bef3"]="XDS110"
-  ["0451:bef4"]="XDS110"    ["2e8a:000c"]="RPiProbe"  ["10c4:ea60"]="CP210x"
-  ["10c4:ea70"]="CP2105"    ["067b:2303"]="PL2303"    ["1a86:7523"]="CH340"
-  ["1a86:55d4"]="CH343P"
+  ["0403:6001"]="FT232RL"    ["0403:6010"]="FT2232H"
+  ["0403:6011"]="FT4232H"    ["0403:6014"]="FT232H"
+  ["0403:6015"]="FT231X"     ["0451:bef3"]="XDS110"
+  ["0451:bef4"]="XDS110"     ["2e8a:000c"]="RPiProbe"
+  ["10c4:ea60"]="CP210x"     ["10c4:ea70"]="CP2105"
+  ["10c4:ea71"]="CP2108"     ["067b:2303"]="PL2303"
+  ["1a86:7523"]="CH340"      ["1a86:55d4"]="CH343P"
 )
+# Default baud for all chips is 115200 — override per-chip or per-board in serial-boards.conf
 declare -A CHIP_BAUD=(
   ["0451:bef3"]="115200"  ["0451:bef4"]="115200"  ["2e8a:000c"]="115200"
   ["0403:6011"]="115200"  ["0403:6010"]="115200"  ["0403:6001"]="115200"
@@ -36,6 +39,8 @@ declare -A CHIP_BAUD=(
   ["067b:2303"]="115200"  ["1a86:7523"]="115200"  ["1a86:55d4"]="115200"
 )
 declare -A CFG_LABEL CFG_BAUD
+# Default probe baud scan list. Override in serial-boards.conf: PROBE_BAUDS=115.2K,9600,...,1.5M
+PROBE_BAUDS=(115200 9600 19200 38400 57600 230400 460800 921600 1500000)
 
 parse_baud() {
     local s="${1^^}"; s="${s//[[:space:]]/}"
@@ -73,6 +78,29 @@ load_config() {
     while IFS='=' read -r key val; do
         [[ "$key" =~ ^[[:space:]]*# || -z "${key// /}" ]] && continue
         key="${key// /}"; val="${val%%#*}"; val="${val// /}"
+        # Global settings
+        if [[ "$key" == "PROBE_BAUDS" ]]; then
+            PROBE_BAUDS=()
+            local _b _braw
+            IFS=',' read -ra _blist <<< "$val"
+            for _b in "${_blist[@]}"; do
+                _b="${_b// /}"
+                _braw=$(parse_baud "$_b")
+                (( _braw > 0 )) && PROBE_BAUDS+=("$_braw")
+            done
+            continue
+        fi
+        # Hardware chip descriptors: VID:PID=NAME or VID:PID=NAME:BAUD
+        if [[ "$key" =~ ^[0-9a-fA-F]{4}:[0-9a-fA-F]{4}$ ]]; then
+            local chip_name="${val%%:*}"
+            [[ -n "$chip_name" ]] && CHIP_NAMES["$key"]="$chip_name"
+            if [[ "$val" == *:* ]]; then
+                local cb; cb=$(parse_baud "${val##*:}")
+                (( cb > 0 )) && CHIP_BAUD["$key"]="$cb"
+            fi
+            continue
+        fi
+        # Board serial→label mappings
         local label="${val%%:*}" extra="${val##*:}"
         CFG_LABEL["$key"]="$label"
         if [[ "$val" == *:* && -n "$extra" ]]; then
@@ -108,10 +136,12 @@ probe_tty() {
     exec {fd}<>"$dev" 2>/dev/null || { printf 'FAIL|%s|\n' "$cfg_baud"; return; }
     local saved; saved=$(stty -F "$dev" -g 2>/dev/null)
 
-    # 115200 first (most common), then cfg_baud if different, then the rest
-    local -a try_bauds=(115200)
-    [[ "$cfg_baud" != "115200" ]] && try_bauds+=("$cfg_baud")
-    for b in 1500000 921600 460800 230400 57600 38400 19200 9600; do
+    # Order driven entirely by PROBE_BAUDS (configurable in serial-boards.conf).
+    # Per-board cfg_baud is elevated to position 0 if not already first.
+    local -a try_bauds=()
+    [[ "$cfg_baud" != "${PROBE_BAUDS[0]}" ]] && try_bauds+=("$cfg_baud")
+    local b
+    for b in "${PROBE_BAUDS[@]}"; do
         local dup=0
         for already in "${try_bauds[@]}"; do [[ "$b" == "$already" ]] && dup=1 && break; done
         (( dup )) || try_bauds+=("$b")
@@ -120,6 +150,8 @@ probe_tty() {
     local detected="" captured=""
     for baud in "${try_bauds[@]}"; do
         stty -F "$dev" "$baud" raw -echo min 0 time 1 2>/dev/null
+        # Drain bytes buffered at the previous baud rate before reading fresh response.
+        IFS= read -t 0.01 -r -d '' -n 1024 -u $fd _drain 2>/dev/null || true
         printf '\r' >&$fd
         local raw=""
         IFS= read -t 0.1 -r -d '' -n 200 -u $fd raw 2>/dev/null
