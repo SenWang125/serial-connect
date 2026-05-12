@@ -90,7 +90,8 @@ Probes all `/dev/ttyUSB*` and `/dev/ttyACM*` ports fresh every run. Sends a carr
 ```bash
 serial-discover              # human display with baud, chip, board name
 serial-discover --json       # JSON output for scripts and agents
-serial-discover --gen-udev   # generate udev rules for stable port names across reboots
+serial-discover --gen-udev    # stable port names across reboots (writes /tmp/99-serial-aliases.rules)
+serial-discover --rm-udev     # remove installed udev rules
 ```
 
 ---
