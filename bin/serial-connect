@@ -195,7 +195,7 @@ total=$(( row - 1 ))
 echo ""
 printf "  ${GREEN}★ LIVE${NC}    ${CYAN}⊙ OPEN${NC}    ${RED}✗ FAIL${NC}    ${DIM}  dead${NC}\n"
 echo -e "  ${DIM}Run serial-discover to force a fresh probe${NC}"
-echo -e "  ${DIM}Run serial-discover --gen-udev   (permanent) or --temp-udev   (this session)${NC}"
+echo -e "  ${DIM}Run serial-discover --gen-udev   (permanent) or --tmp-udev   (this session)${NC}"
 echo ""
 
 trap 'printf "\n"; exit 0' INT

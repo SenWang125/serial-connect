@@ -1,12 +1,12 @@
 #!/bin/bash
 # serial-discover — Probe all USB serial ports, display status and board names.
-# Usage: serial-discover [--json | --gen-udev | --temp-udev | --rm-udev]
+# Usage: serial-discover [--json | --gen-udev | --tmp-udev | --rm-udev]
 #
 # --json       Machine-readable output for agents and scripts.
 # --gen-udev   Write /tmp/99-serial-aliases.rules for permanent stable port names.
 #              Install: sudo cp /tmp/99-serial-aliases.rules /etc/udev/rules.d/
 #                       sudo udevadm control --reload-rules && sudo udevadm trigger
-# --temp-udev  Create /dev/tty<LABEL> symlinks for this session only (no system changes).
+# --tmp-udev  Create /dev/tty<LABEL> symlinks for this session only (no system changes).
 # --rm-udev    Remove installed rules from /etc/udev/rules.d/ and reload udev.
 
 source "$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)/serial-common.sh"
@@ -100,7 +100,7 @@ if [[ "${1:-}" == "--rm-udev" ]]; then
     exit 0
 fi
 
-if [[ "${1:-}" == "--temp-udev" ]]; then
+if [[ "${1:-}" == "--tmp-udev" ]]; then
     declare -A _tseen
     for i in "${!DEVS[@]}"; do
         raw=$(cut -d'|' -f1 "$PROBE_DIR/$(basename "${DEVS[$i]}")" 2>/dev/null)
