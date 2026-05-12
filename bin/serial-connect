@@ -1,6 +1,6 @@
 #!/bin/bash
 # serial-connect — Interactive serial terminal with live TTY probing and cache.
-# Usage: serial-connect [/dev/ttyXXX]
+# Usage: serial-connect [/dev/ttyXXX | --board <pattern>]
 #
 # Probe results are cached per device topology. Re-probes only when the device
 # set changes or new unrecognized boards appear.
@@ -70,9 +70,26 @@ load_config
 enumerate_devices
 port_indices
 
-# ── Direct-device mode ────────────────────────────────────────────────────────
+# ── Direct connect: by device path or --board <pattern> ──────────────────────
+# --board matches label (serial-boards.conf) or probed hostname, case-insensitive
+# regex. Non-unique: if multiple boards match, the first LIVE port wins.
+# Use --serial <USB_serial> in serial-agent for a guaranteed unique match.
 if [[ -n "${1:-}" ]]; then
-    dev="$1"; [[ ! -c "$dev" ]] && { echo "Not a device: $dev" >&2; exit 1; }
+    dev=""
+    if [[ "$1" == "--board" && -n "${2:-}" ]]; then
+        pat="${2,,}"
+        for i in "${!DEVS[@]}"; do
+            label="${LABELS[$i],,}"; board="${BOARD_ID[${SERS[$i]}]:-}"; board="${board,,}"
+            if [[ "$label" =~ $pat || "$board" =~ $pat ]]; then
+                result=$(cat "$PROBE_DIR/$(basename "${DEVS[$i]}")" 2>/dev/null || echo "DEAD||")
+                state=$(cut -d'|' -f1 <<< "$result")
+                [[ "$state" == "LIVE" || "$state" == "OPEN" ]] && dev="${DEVS[$i]}" && break
+            fi
+        done
+        [[ -z "$dev" ]] && { echo "No LIVE match for board: ${2}" >&2; exit 1; }
+    else
+        dev="$1"; [[ ! -c "$dev" ]] && { echo "Not a device: $dev" >&2; exit 1; }
+    fi
     baud="115200"
     for i in "${!DEVS[@]}"; do [[ "${DEVS[$i]}" == "$dev" ]] && baud="${BAUDS[$i]}" && break; done
     trap 'printf "\n"; exit 0' INT

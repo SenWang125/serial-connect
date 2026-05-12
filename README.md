@@ -80,6 +80,7 @@ Port [1-19]:
 
 Override terminal: `SERIAL_TERM=screen serial-connect`
 Direct connect (skip menu): `serial-connect /dev/ttyUSB1`
+`--board` skips the menu by label: `serial-connect --board AM62D2-EVM`. Matches label or hostname (case-insensitive regex), picks the first LIVE port. Non-unique — if two boards share a label, use distinct labels in `serial-boards.conf` or use `serial-agent --serial` for a guaranteed unique match.
 
 ---
 
