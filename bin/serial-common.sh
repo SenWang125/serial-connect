@@ -37,7 +37,7 @@ parse_baud() {
         (( flen > 0 )) && fi=$(( frac * 1000 / (10 ** flen) ))
         echo $(( int * 1000 + fi ))
     elif [[ "$s" =~ ^[0-9]+$ ]]; then echo "$s"
-    else echo "115200"
+    else echo "${PROBE_BAUDS[0]}"
     fi
 }
 
@@ -117,13 +117,13 @@ load_config() {
 
 # ── get_baud ───────────────────────────────────────────────────────────────────
 # Resolve baud for a device: per-board override > chip default > 115200
-get_baud() { local vid="${1%%:*}"; echo "${CFG_BAUD[$2]:-${CHIP_BAUD[$1]:-${CHIP_BAUD_WILDCARD[$vid]:-115200}}}"; }
+get_baud() { local vid="${1%%:*}"; echo "${CFG_BAUD[$2]:-${CHIP_BAUD[$1]:-${CHIP_BAUD_WILDCARD[$vid]:-${PROBE_BAUDS[0]}}}}"; }
 
 # ── probe_tty ──────────────────────────────────────────────────────────────────
 # Probe a single tty: send CR, try each baud in PROBE_BAUDS order, detect live.
 # Output: STATUS|BAUD|board_id  (STATUS: LIVE OPEN DEAD FAIL)
 probe_tty() {
-    local dev="$1" cfg_baud="${2:-115200}"
+    local dev="$1" cfg_baud="${2:-${PROBE_BAUDS[0]}}"
 
     { fuser "$dev" &>/dev/null 2>&1 || sudo -n fuser "$dev" &>/dev/null 2>&1; } \
         && { printf 'OPEN|%s|\n' "$cfg_baud"; return; }

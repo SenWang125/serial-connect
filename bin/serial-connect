@@ -73,7 +73,7 @@ port_indices
 # ── Direct-device mode ────────────────────────────────────────────────────────
 if [[ -n "${1:-}" ]]; then
     dev="$1"; [[ ! -c "$dev" ]] && { echo "Not a device: $dev" >&2; exit 1; }
-    baud="115200"
+    baud="${PROBE_BAUDS[0]}"
     for i in "${!DEVS[@]}"; do [[ "${DEVS[$i]}" == "$dev" ]] && baud="${BAUDS[$i]}" && break; done
     trap 'printf "\n"; exit 0' INT
     while true; do
@@ -173,7 +173,7 @@ for i in "${_disp_order[@]}"; do
     if [[ "$state" == "LIVE" && "$probe_baud" =~ ^[0-9]+$ ]]; then
         baud="$probe_baud"
     elif [[ "$state" != "OPEN" ]]; then
-        baud="${PROBE_BAUDS[0]:-115200}"
+        baud="${PROBE_BAUDS[0]}"
     fi
     ROW_DEV[$row]="$dev"; ROW_BAUD[$row]="$baud"; ROW_STATE[$row]="$state"
     ROW_BY_CHIPPORT["${DEVICE_IDX[$ser]:-0}-p${PORT_IDX[$dev]:-0}"]=$row
