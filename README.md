@@ -27,23 +27,18 @@ cd serial-connect
 ./install.sh
 ```
 
-Everything in `bin/` is deployed to `~/.serial-connect/` — a self-contained named folder that does not mix with other tools on your system.
-
-Add it to PATH once:
-```bash
-echo 'export PATH="$HOME/.serial-connect:$PATH"' >> ~/.bashrc && source ~/.bashrc
-```
+All files deploy to `~/.serial-connect/` (isolated, named folder). The three CLI tools are symlinked into `~/.local/bin/` which is already in PATH on modern Linux — no PATH changes needed.
 
 Non-interactive install:
 ```bash
 ./install.sh --term tio              # recommended
 ./install.sh --term tio,screen       # install multiple terminals
-./install.sh /usr/local/bin --term tio   # system-wide
+sudo ./install.sh /usr/local/bin --term tio   # system-wide
 ```
 
 Uninstall:
 ```bash
-./uninstall.sh          # removes ~/.serial-connect/ entirely
+./uninstall.sh    # removes ~/.serial-connect/ and symlinks in ~/.local/bin/
 ```
 
 **Requirements:** bash ≥ 5.1, python3, user in `dialout` group

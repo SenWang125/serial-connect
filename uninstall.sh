@@ -16,21 +16,20 @@ echo "=========================="
 echo ""
 
 if [[ "$INSTALL_DIR" == "$HOME/.serial-connect" && -d "$INSTALL_DIR" ]]; then
-    # Default install: remove the whole directory (scripts + conf in one place)
     rm -rf "$INSTALL_DIR"
     printf "  ${GREEN}✓${NC} removed %s\n" "$INSTALL_DIR"
 else
-    # Custom install dir: remove known files individually
     for f in serial-common.sh serial-discover serial-connect serial-agent serial-boards.conf; do
         fp="$INSTALL_DIR/$f"
-        if [[ -f "$fp" ]]; then
-            rm -f "$fp"
-            printf "  ${GREEN}✓${NC} removed %s\n" "$fp"
-        else
-            printf "  ${YELLOW}·${NC} not found: %s\n" "$fp"
-        fi
+        [[ -f "$fp" ]] && rm -f "$fp" && printf "  ${GREEN}✓${NC} removed %s\n" "$fp"
     done
 fi
+
+# Remove symlinks from ~/.local/bin
+for tool in serial-discover serial-connect serial-agent; do
+    link="$HOME/.local/bin/$tool"
+    [[ -L "$link" ]] && rm -f "$link" && printf "  ${GREEN}✓${NC} removed symlink %s\n" "$link"
+done
 
 echo ""
 printf "${BOLD}Done.${NC}\n"

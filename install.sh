@@ -1,9 +1,8 @@
 #!/usr/bin/env bash
 # install.sh — Install serial-connect tools
 #
-# By default installs into ~/.serial-connect/ — a private, named directory
-# that does not pollute shared bin paths.  Add it to PATH once:
-#   export PATH="$HOME/.serial-connect:$PATH"   # add to ~/.bashrc
+# Installs all files into ~/.serial-connect/ and symlinks the three CLI tools
+# into ~/.local/bin/ (already in PATH on modern Linux — no PATH changes needed).
 #
 # Usage:
 #   ./install.sh                    # interactive (asks terminal preference)
@@ -11,8 +10,7 @@
 #   ./install.sh --term screen      # non-interactive: screen
 #   ./install.sh --term minicom     # non-interactive: minicom
 #   ./install.sh --term picocom     # non-interactive: picocom
-#   ./install.sh /usr/local/bin     # install to a shared bin directory
-#   sudo ./install.sh /usr/local/bin --term tio
+#   sudo ./install.sh /usr/local/bin --term tio   # system-wide
 
 set -euo pipefail
 
@@ -244,12 +242,20 @@ else
     dim   "  · serial-boards.conf  (exists — not modified)"
 fi
 
-# ── PATH check ─────────────────────────────────────────────────────────────────
+# ── Symlink CLI tools into ~/.local/bin (already in PATH on modern Linux) ──────
+LINK_DIR="$HOME/.local/bin"
+mkdir -p "$LINK_DIR"
 echo ""
-if [[ ":$PATH:" != *":$INSTALL_DIR:"* ]]; then
-    yellow "Note: $INSTALL_DIR is not in \$PATH."
-    yellow "      Add to ~/.bashrc:  export PATH=\"${INSTALL_DIR}:\$PATH\""
+bold "Linking into: $LINK_DIR"
+echo ""
+for tool in serial-discover serial-connect serial-agent; do
+    ln -sf "$INSTALL_DIR/$tool" "$LINK_DIR/$tool"
+    green "  ✓ $tool → $LINK_DIR/$tool"
+done
+if [[ ":$PATH:" != *":$LINK_DIR:"* ]]; then
     echo ""
+    yellow "Note: $LINK_DIR is not yet in \$PATH."
+    yellow "      Add to ~/.bashrc:  export PATH=\"\$HOME/.local/bin:\$PATH\""
 fi
 
 # ── Done ───────────────────────────────────────────────────────────────────────
