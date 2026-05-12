@@ -32,10 +32,12 @@ declare -A CHIP_BAUD=(
   ["067b:2303"]="115200"  ["1a86:7523"]="115200"  ["1a86:55d4"]="115200"
 )
 declare -A CFG_LABEL CFG_BAUD
-# Default probe baud scan list (after 115200 and the per-board cfg_baud which are always first).
-# Override in serial-boards.conf with a PROBE_BAUDS= line (comma-separated, M/K suffixes OK):
+# Default probe baud scan list — override in serial-boards.conf (comma-separated, M/K OK):
 #   PROBE_BAUDS=115.2K,9600,19200,38400,57600,230.4K,460.8K,921.6K,1.5M
 PROBE_BAUDS=(115200 9600 19200 38400 57600 230400 460800 921600 1500000)
+PROBE_PARALLEL=0    # max simultaneous port probes (0 = unlimited)
+PROBE_READ_MS=100   # ms to wait for board response per baud attempt
+PROBE_DRAIN_MS=10   # ms to drain stale tty bytes after each baud switch
 
 # Parse human-readable baud rate — supports M and K suffixes (case-insensitive):
 #   1.5M → 1500000,  1M → 1000000,  115.2K → 115200,  921.6K → 921600,  115200 → 115200
@@ -80,6 +82,10 @@ load_config() {
         [[ "$key" =~ ^[[:space:]]*# || -z "${key// /}" ]] && continue
         key="${key// /}"; val="${val%%#*}"; val="${val// /}"
         # Global settings
+        if [[ "$key" =~ ^PROBE_(PARALLEL|READ_MS|DRAIN_MS)$ ]]; then
+            [[ "$val" =~ ^[0-9]+$ ]] && printf -v "$key" '%s' "$val"
+            continue
+        fi
         if [[ "$key" == "PROBE_BAUDS" ]]; then
             PROBE_BAUDS=()
             local _b _braw
@@ -153,16 +159,21 @@ probe_tty() {
         (( dup )) || try_bauds+=("$b")
     done
 
+    # Precompute float-second strings from integer millisecond globals
+    local read_t drain_t
+    read_t="$(( PROBE_READ_MS  / 1000 )).$(printf '%03d' $(( PROBE_READ_MS  % 1000 )))"
+    drain_t="$(( PROBE_DRAIN_MS / 1000 )).$(printf '%03d' $(( PROBE_DRAIN_MS % 1000 )))"
+
     local detected="" captured=""
     for baud in "${try_bauds[@]}"; do
         stty -F "$dev" "$baud" raw -echo min 0 time 1 2>/dev/null
         # Drain bytes buffered at the previous baud rate before reading fresh response.
         # Without this, a board's 115200 response sitting in the kernel tty buffer would
         # be read at 1500000 and appear valid — a false positive baud detection.
-        IFS= read -t 0.01 -r -d '' -n 1024 -u $fd _drain 2>/dev/null || true
+        IFS= read -t "$drain_t" -r -d '' -n 1024 -u $fd _drain 2>/dev/null || true
         printf '\r' >&$fd
         local raw=""
-        IFS= read -t 0.1 -r -d '' -n 200 -u $fd raw 2>/dev/null
+        IFS= read -t "$read_t" -r -d '' -n 200 -u $fd raw 2>/dev/null
         local clean; clean=$(printf '%s' "$raw" \
             | tr -dc '[:print:][:space:]' | tr -s '[:space:]' ' ' \
             | sed 's/^ //; s/ $//')
@@ -242,27 +253,34 @@ for ser in "${!_ser_devs[@]}"; do
              | cut -d: -f2-)
 done
 
-# ── Parallel probe (always fresh in serial-discover) ──────────────────────────
-# Simple forks — no bash startup overhead. wait -t 2 kills any probe that
-# blocks on open (e.g. ttyACM with no carrier signal).
+# ── Probe launcher: parallel with optional cap and dynamic watchdog ────────────
+# PROBE_PARALLEL=0  → all ports at once (default)
+# PROBE_PARALLEL=N  → at most N simultaneous probes (rolling window via wait -n)
+# Watchdog timeout scales with PROBE_READ_MS and PROBE_DRAIN_MS so it's always
+# just long enough — no stale kills, no unnecessary waiting.
+run_probes() {
+    local -a idxs=("$@")
+    local -a pids=()
+    local active=0
+    local i
+    for i in "${idxs[@]}"; do
+        if (( PROBE_PARALLEL > 0 && active >= PROBE_PARALLEL )); then
+            wait -n 2>/dev/null; (( active-- )) || true
+        fi
+        ( probe_tty "${DEVS[$i]}" "${BAUDS[$i]}" \
+            > "$PROBE_DIR/$(basename "${DEVS[$i]}")" ) &
+        pids+=($!); (( active++ )) || true
+    done
+    local wdog_s=$(( (${#PROBE_BAUDS[@]} * (PROBE_READ_MS + PROBE_DRAIN_MS) + 999) / 1000 + 1 ))
+    ( sleep "$wdog_s"; kill -9 "${pids[@]}" 2>/dev/null ) &
+    local wdog=$!
+    wait "${pids[@]}" 2>/dev/null
+    kill -9 "$wdog" 2>/dev/null; wait "$wdog" 2>/dev/null
+}
+
 PROBE_DIR=$(mktemp -d /tmp/serial-probe.XXXXXX)
 trap 'rm -rf "$PROBE_DIR"' EXIT
-_probe_pids=()
-for i in "${!DEVS[@]}"; do
-    ( probe_tty "${DEVS[$i]}" "${BAUDS[$i]}" \
-        > "$PROBE_DIR/$(basename "${DEVS[$i]}")" ) &
-    _probe_pids+=($!)
-done
-# Watchdog: kill any probe still blocking after 2s (e.g. ttyACM with no carrier).
-# Normal probes finish in ~1s (9 bauds × 0.1s); 2s is a safe margin.
-( sleep 2; kill -9 "${_probe_pids[@]}" 2>/dev/null ) &
-_watchdog=$!
-wait "${_probe_pids[@]}" 2>/dev/null
-# SIGKILL the watchdog so its "kill -9 ${_probe_pids}" never runs.
-# SIGTERM is ignored by bash while it waits for "sleep 2", causing a 2s stall
-# and the kill-9 firing on stale PIDs that may have been recycled.
-kill -9 "$_watchdog" 2>/dev/null; wait "$_watchdog" 2>/dev/null
-unset _probe_pids _watchdog
+run_probes "${!DEVS[@]}"
 
 # ── Build BOARD_ID map: best known name per USB serial number ──────────────────
 # Priority: config label > captured hostname from any LIVE port of that serial.

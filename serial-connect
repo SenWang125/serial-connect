@@ -41,6 +41,9 @@ declare -A CHIP_BAUD=(
 declare -A CFG_LABEL CFG_BAUD
 # Default probe baud scan list. Override in serial-boards.conf: PROBE_BAUDS=115.2K,9600,...,1.5M
 PROBE_BAUDS=(115200 9600 19200 38400 57600 230400 460800 921600 1500000)
+PROBE_PARALLEL=0    # max simultaneous port probes (0 = unlimited)
+PROBE_READ_MS=100   # ms to wait for board response per baud attempt
+PROBE_DRAIN_MS=10   # ms to drain stale tty bytes after each baud switch
 
 parse_baud() {
     local s="${1^^}"; s="${s//[[:space:]]/}"
@@ -79,6 +82,10 @@ load_config() {
         [[ "$key" =~ ^[[:space:]]*# || -z "${key// /}" ]] && continue
         key="${key// /}"; val="${val%%#*}"; val="${val// /}"
         # Global settings
+        if [[ "$key" =~ ^PROBE_(PARALLEL|READ_MS|DRAIN_MS)$ ]]; then
+            [[ "$val" =~ ^[0-9]+$ ]] && printf -v "$key" '%s' "$val"
+            continue
+        fi
         if [[ "$key" == "PROBE_BAUDS" ]]; then
             PROBE_BAUDS=()
             local _b _braw
@@ -147,14 +154,18 @@ probe_tty() {
         (( dup )) || try_bauds+=("$b")
     done
 
+    local read_t drain_t
+    read_t="$(( PROBE_READ_MS  / 1000 )).$(printf '%03d' $(( PROBE_READ_MS  % 1000 )))"
+    drain_t="$(( PROBE_DRAIN_MS / 1000 )).$(printf '%03d' $(( PROBE_DRAIN_MS % 1000 )))"
+
     local detected="" captured=""
     for baud in "${try_bauds[@]}"; do
         stty -F "$dev" "$baud" raw -echo min 0 time 1 2>/dev/null
         # Drain bytes buffered at the previous baud rate before reading fresh response.
-        IFS= read -t 0.01 -r -d '' -n 1024 -u $fd _drain 2>/dev/null || true
+        IFS= read -t "$drain_t" -r -d '' -n 1024 -u $fd _drain 2>/dev/null || true
         printf '\r' >&$fd
         local raw=""
-        IFS= read -t 0.1 -r -d '' -n 200 -u $fd raw 2>/dev/null
+        IFS= read -t "$read_t" -r -d '' -n 200 -u $fd raw 2>/dev/null
         local clean; clean=$(printf '%s' "$raw" \
             | tr -dc '[:print:][:space:]' | tr -s '[:space:]' ' ' \
             | sed 's/^ //; s/ $//')
@@ -233,6 +244,26 @@ launch() {
             exec minicom -D "$dev" -b "$baud" -w -c on
             ;;
     esac
+}
+
+# ── Probe launcher: parallel with optional cap and dynamic watchdog ────────────
+run_probes() {
+    local -a idxs=("$@")
+    local -a pids=()
+    local active=0 i
+    for i in "${idxs[@]}"; do
+        if (( PROBE_PARALLEL > 0 && active >= PROBE_PARALLEL )); then
+            wait -n 2>/dev/null; (( active-- )) || true
+        fi
+        ( probe_tty "${DEVS[$i]}" "${BAUDS[$i]}" \
+            > "$PROBE_DIR/$(basename "${DEVS[$i]}")" ) &
+        pids+=($!); (( active++ )) || true
+    done
+    local wdog_s=$(( (${#PROBE_BAUDS[@]} * (PROBE_READ_MS + PROBE_DRAIN_MS) + 999) / 1000 + 1 ))
+    ( sleep "$wdog_s"; kill -9 "${pids[@]}" 2>/dev/null ) &
+    local wdog=$!
+    wait "${pids[@]}" 2>/dev/null
+    kill -9 "$wdog" 2>/dev/null; wait "$wdog" 2>/dev/null
 }
 
 # ── Cache helpers ──────────────────────────────────────────────────────────────
@@ -319,17 +350,7 @@ if [[ "$cur_sig" != "$prev_sig" ]]; then
     echo "$cur_sig" > "$SIG_FILE"
     [[ -n "$prev_sig" ]] && \
         echo -e "\n${YELLOW}⚠  Device configuration changed — re-probing${NC}\n"
-    _probe_pids=()
-    for i in "${!DEVS[@]}"; do
-        ( probe_tty "${DEVS[$i]}" "${BAUDS[$i]}" \
-            > "$PROBE_DIR/$(basename "${DEVS[$i]}")" ) &
-        _probe_pids+=($!)
-    done
-    ( sleep 2; kill -9 "${_probe_pids[@]}" 2>/dev/null ) &
-    _watchdog=$!
-    wait "${_probe_pids[@]}" 2>/dev/null
-    kill -9 "$_watchdog" 2>/dev/null; wait "$_watchdog" 2>/dev/null
-    unset _probe_pids _watchdog
+    run_probes "${!DEVS[@]}"
     save_cache "$PROBE_DIR"
 elif [[ -f "$CACHE_FILE" ]]; then
     # Same topology: load cache, then selectively re-probe unrecognized boards.
@@ -347,37 +368,20 @@ elif [[ -f "$CACHE_FILE" ]]; then
     done
 
     # Re-probe only ports of unrecognized serials (skip ttyACM — blocks on USB)
-    _reprobe_pids=()
+    local -a _reprobe_idxs=()
     for i in "${!DEVS[@]}"; do
         [[ -n "${_recog[${SERS[$i]}]+x}" ]] && continue
         [[ "${DEVS[$i]}" =~ /dev/ttyACM ]] && continue
-        ( probe_tty "${DEVS[$i]}" "${BAUDS[$i]}" \
-            > "$PROBE_DIR/$(basename "${DEVS[$i]}")" ) &
-        _reprobe_pids+=($!)
+        _reprobe_idxs+=("$i")
     done
-
-    if (( ${#_reprobe_pids[@]} > 0 )); then
-        ( sleep 2; kill -9 "${_reprobe_pids[@]}" 2>/dev/null ) &
-        _rwdog=$!
-        wait "${_reprobe_pids[@]}" 2>/dev/null
-        kill -9 "$_rwdog" 2>/dev/null; wait "$_rwdog" 2>/dev/null
-        unset _reprobe_pids _rwdog
+    if (( ${#_reprobe_idxs[@]} > 0 )); then
+        run_probes "${_reprobe_idxs[@]}"
         save_cache "$PROBE_DIR"   # persist newly identified boards
     fi
     unset _recog
 else
     # Same sig but no cache yet: full re-probe and cache
-    _probe_pids=()
-    for i in "${!DEVS[@]}"; do
-        ( probe_tty "${DEVS[$i]}" "${BAUDS[$i]}" \
-            > "$PROBE_DIR/$(basename "${DEVS[$i]}")" ) &
-        _probe_pids+=($!)
-    done
-    ( sleep 2; kill -9 "${_probe_pids[@]}" 2>/dev/null ) &
-    _watchdog=$!
-    wait "${_probe_pids[@]}" 2>/dev/null
-    kill -9 "$_watchdog" 2>/dev/null; wait "$_watchdog" 2>/dev/null
-    unset _probe_pids _watchdog
+    run_probes "${!DEVS[@]}"
     save_cache "$PROBE_DIR"
 fi
 

@@ -13,10 +13,28 @@
 # PROBE_BAUDS — ordered baud rates to try during discovery (comma-separated).
 # Per-board baud overrides are always elevated to position 0 automatically.
 # M and K suffixes are supported (1.5M, 115.2K, etc.).
-# Default if not set:  115.2K,9600,19200,38400,57600,230.4K,460.8K,921.6K,1.5M
+# Default:  115.2K,9600,19200,38400,57600,230.4K,460.8K,921.6K,1.5M
 #
-# Override example — only common embedded rates, 1.5M at end for Rockchip boards:
 #PROBE_BAUDS=115.2K,9600,19200,38400,57600,230.4K,460.8K,921.6K,1.5M
+#
+# PROBE_PARALLEL — max simultaneous port probes (0 = unlimited, probe all at once).
+# Cap this if you have many ports and see USB bus contention or host CPU spikes.
+# Default: 0 (all ports probed in parallel)
+#
+#PROBE_PARALLEL=8
+#
+# PROBE_READ_MS — milliseconds to wait for a board response per baud attempt.
+# The main speed knob: halving this halves worst-case discovery time.
+# Lower values may miss slow-responding boards (default 100ms covers most cases).
+# Default: 100
+#
+#PROBE_READ_MS=50
+#
+# PROBE_DRAIN_MS — milliseconds to drain stale tty bytes after each baud switch.
+# Prevents false-positive baud detection from buffered residue at prior baud.
+# Default: 10
+#
+#PROBE_DRAIN_MS=10
 #
 # ── Hardware chip descriptors ──────────────────────────────────────────────────
 #
