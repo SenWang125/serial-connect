@@ -107,7 +107,6 @@ elif [[ -f "$CACHE_FILE" ]]; then
     declare -a _reprobe_idxs=()
     for i in "${!DEVS[@]}"; do
         [[ -n "${_recog[${SERS[$i]}]+x}" ]] && continue
-        [[ "${DEVS[$i]}" =~ /dev/ttyACM ]] && continue
         _reprobe_idxs+=("$i")
     done
     if (( ${#_reprobe_idxs[@]} > 0 )); then

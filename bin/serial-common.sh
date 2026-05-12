@@ -128,34 +128,38 @@ probe_tty() {
     { fuser "$dev" &>/dev/null 2>&1 || sudo -n fuser "$dev" &>/dev/null 2>&1; } \
         && { printf 'OPEN|%s|\n' "$cfg_baud"; return; }
 
-    # ttyACM: baud switch triggers USB CDC_SET_LINE_CODING, blocks ~12s — skip
-    [[ "$dev" =~ /dev/ttyACM ]] && { printf 'DEAD|%s|\n' "$cfg_baud"; return; }
-
     local fd
     exec {fd}<>"$dev" 2>/dev/null || { printf 'FAIL|%s|\n' "$cfg_baud"; return; }
     local saved; saved=$(stty -F "$dev" -g 2>/dev/null)
 
-    # Build ordered baud list: per-board cfg_baud first (if not already first),
-    # then PROBE_BAUDS in order (deduped).
+    # ttyACM: each baud switch sends CDC_SET_LINE_CODING — some devices block ~12s per attempt.
+    # Probe at cfg_baud only; watchdog kills it if it blocks.
     local -a try_bauds=()
-    [[ "$cfg_baud" != "${PROBE_BAUDS[0]}" ]] && try_bauds+=("$cfg_baud")
-    local b
-    for b in "${PROBE_BAUDS[@]}"; do
-        local dup=0
-        for already in "${try_bauds[@]}"; do [[ "$b" == "$already" ]] && dup=1 && break; done
-        (( dup )) || try_bauds+=("$b")
-    done
+    if [[ "$dev" =~ /dev/ttyACM ]]; then
+        try_bauds=("$cfg_baud")
+    else
+        [[ "$cfg_baud" != "${PROBE_BAUDS[0]}" ]] && try_bauds+=("$cfg_baud")
+        local b
+        for b in "${PROBE_BAUDS[@]}"; do
+            local dup=0
+            for already in "${try_bauds[@]}"; do [[ "$b" == "$already" ]] && dup=1 && break; done
+            (( dup )) || try_bauds+=("$b")
+        done
+    fi
 
     local read_t drain_t
     read_t="$(( PROBE_READ_MS  / 1000 )).$(printf '%03d' $(( PROBE_READ_MS  % 1000 )))"
     drain_t="$(( PROBE_DRAIN_MS / 1000 )).$(printf '%03d' $(( PROBE_DRAIN_MS % 1000 )))"
 
+    local skip_stty=0
+    [[ "$dev" =~ /dev/ttyACM ]] && skip_stty=1
+
     local detected="" captured=""
     for baud in "${try_bauds[@]}"; do
-        stty -F "$dev" "$baud" raw -echo min 0 time 1 2>/dev/null
-        # Drain bytes buffered at prior baud before reading — prevents false positives
-        # where a 115200 response sitting in the tty buffer appears valid at 1500000.
-        IFS= read -t "$drain_t" -r -d '' -n 1024 -u $fd _drain 2>/dev/null || true
+        if (( !skip_stty )); then
+            stty -F "$dev" "$baud" raw -echo min 0 time 1 2>/dev/null
+            IFS= read -t "$drain_t" -r -d '' -n 1024 -u $fd _drain 2>/dev/null || true
+        fi
         printf '\r' >&$fd
         local raw=""
         IFS= read -t "$read_t" -r -d '' -n 200 -u $fd raw 2>/dev/null
@@ -163,8 +167,10 @@ probe_tty() {
             | tr -dc '[:print:][:space:]' | tr -s '[:space:]' ' ' \
             | sed 's/^ //; s/ $//')
         local raw_len="${#raw}" clean_len="${#clean}"
-        # Correct baud → ≥95% printable; wrong baud → ~30% by chance. Require ≥80%.
-        if (( clean_len >= 4 && raw_len > 0 && clean_len * 100 >= raw_len * 80 )); then
+        # ttyUSB: wrong baud → ~30% printable by chance; require ≥80% to reject false positives.
+        # ttyACM: single baud only, no false-positive risk; require ≥40%.
+        local threshold=80; (( skip_stty )) && threshold=40
+        if (( clean_len >= 4 && raw_len > 0 && clean_len * 100 >= raw_len * threshold )); then
             detected="$baud"; captured="$clean"; break
         fi
     done
@@ -179,8 +185,8 @@ probe_tty() {
     if   [[ "$captured" =~ @([A-Za-z0-9._-]+)[[:space:]]*: ]];       then id="${BASH_REMATCH[1]}"
     elif [[ "$captured" =~ ([A-Za-z0-9._-]+)[[:space:]]+login: ]];    then id="${BASH_REMATCH[1]}"
     elif [[ "$captured" =~ [Bb]oard:[[:space:]]*([A-Za-z0-9._-]+) ]]; then id="${BASH_REMATCH[1]}"
-    else id="${captured:0:30}"
     fi
+    # No fallback to raw captured text — garbage output leaves the board unlabelled.
     printf 'LIVE|%s|%s\n' "$detected" "$id"
 }
 
