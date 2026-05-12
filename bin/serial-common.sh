@@ -19,7 +19,7 @@ CACHE_FILE="/tmp/serial-connect.cache"
 # All defaults live in serial-boards.conf. Structures initialised empty here.
 declare -A CHIP_NAMES=() CHIP_BAUD=() CHIP_WILDCARD=() CHIP_BAUD_WILDCARD=() CFG_LABEL CFG_BAUD
 declare -a PROBE_BAUDS=()
-PROBE_PARALLEL=0 PROBE_READ_MS=100 PROBE_DRAIN_MS=10
+PROBE_PARALLEL=0 PROBE_READ_MS=100 PROBE_DRAIN_MS=10 REPROBE_DEAD=1
 
 # ── parse_baud ─────────────────────────────────────────────────────────────────
 # Convert human-readable baud string to integer: 1.5M→1500000, 115.2K→115200
@@ -69,7 +69,7 @@ load_config() {
         [[ "$key" =~ ^[[:space:]]*# || -z "${key// /}" ]] && continue
         key="${key// /}"; val="${val%%#*}"; val="${val// /}"
         # Probe tuning scalars
-        if [[ "$key" =~ ^PROBE_(PARALLEL|READ_MS|DRAIN_MS)$ ]]; then
+        if [[ "$key" =~ ^(PROBE_(PARALLEL|READ_MS|DRAIN_MS)|REPROBE_DEAD)$ ]]; then
             [[ "$val" =~ ^[0-9]+$ ]] && printf -v "$key" '%s' "$val"
             continue
         fi
@@ -222,8 +222,9 @@ run_probes() {
     local -a idxs=("$@")
     local -a pids=()
     local active=0 i
+    local _par=$(( PROBE_PARALLEL == 0 ? $(nproc 2>/dev/null || echo 4) : PROBE_PARALLEL ))
     for i in "${idxs[@]}"; do
-        if (( PROBE_PARALLEL > 0 && active >= PROBE_PARALLEL )); then
+        if (( active >= _par )); then
             wait -n 2>/dev/null; (( active-- )) || true
         fi
         ( probe_tty "${DEVS[$i]}" "${BAUDS[$i]}" \

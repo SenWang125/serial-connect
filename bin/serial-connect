@@ -103,8 +103,8 @@ elif [[ -f "$CACHE_FILE" ]]; then
         [[ -n "${CFG_LABEL[$ser]+x}" ]] && { _recog[$ser]=1; continue; }
         result=$(cat "$PROBE_DIR/$(basename "${DEVS[$i]}")" 2>/dev/null || echo "")
         [[ "$result" =~ ^(LIVE|OPEN)\| ]] && _recog[$ser]=1
-        # Already probed and all ports dead — skip re-probe; run serial-discover to refresh
-        [[ "$result" =~ ^(DEAD|FAIL)\| ]] && _recog[$ser]=1
+        # If REPROBE_DEAD=0, skip re-probing serials with all-dead cache entries
+        (( !REPROBE_DEAD )) && [[ "$result" =~ ^(DEAD|FAIL)\| ]] && _recog[$ser]=1
     done
     declare -a _reprobe_idxs=()
     for i in "${!DEVS[@]}"; do
