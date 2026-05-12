@@ -104,45 +104,78 @@ if [[ $ABORT -ne 0 ]]; then
 fi
 
 # ── Terminal emulator selection ────────────────────────────────────────────────
+# Supports --term as comma-separated list: --term tio,screen
+# tio is the default terminal for serial-connect; others are also installed.
+
 echo ""
-bold "Terminal emulator"
+bold "Terminal emulators"
 echo ""
-echo "  serial-connect launches a terminal to connect to a board."
-echo "  Which terminal would you like to use as the default?"
+echo "  Select which terminals to install (comma-separated, e.g. 1,2)."
+echo "  The first choice becomes the default for serial-connect."
+echo "  tio + screen is recommended: tio for daily use, screen for sharing."
 echo ""
-echo "    1) tio      Modern, auto-reconnects on reset, session sharing (recommended)"
-echo "    2) screen   Shareable sessions: screen -x ttyUSBx"
+echo "    1) tio      Modern, auto-reconnects on reset              (recommended)"
+echo "    2) screen   Shareable sessions: screen -x ttyUSBx          (recommended)"
 echo "    3) minicom  Classic serial terminal"
 echo "    4) picocom  Minimal, lightweight"
 echo ""
 
 declare -A TERM_PKGS=([tio]=tio [screen]=screen [minicom]=minicom [picocom]=picocom)
+TERM_ORDER=(tio screen minicom picocom)
+declare -a TERMS_TO_INSTALL=()
 
-if [[ -z "$TERM_CHOICE" ]]; then
-    while true; do
-        read -rp "  Choice [1-4, default=1]: " n
-        n="${n:-1}"
-        case "$n" in
-            1) TERM_CHOICE=tio;     break ;;
-            2) TERM_CHOICE=screen;  break ;;
-            3) TERM_CHOICE=minicom; break ;;
-            4) TERM_CHOICE=picocom; break ;;
-            *) echo "  Please enter 1, 2, 3, or 4" ;;
-        esac
+if [[ -n "$TERM_CHOICE" ]]; then
+    # Non-interactive: parse comma-separated --term list
+    IFS=',' read -ra _choices <<< "$TERM_CHOICE"
+    for c in "${_choices[@]}"; do
+        c="${c// /}"
+        [[ -z "${TERM_PKGS[$c]+x}" ]] && { red "Unknown terminal: $c. Valid: tio screen minicom picocom"; exit 1; }
+        TERMS_TO_INSTALL+=("$c")
     done
+elif [[ -t 0 ]]; then
+    # Interactive: multi-select
+    while true; do
+        read -rp "  Choice [1-4, comma-separated, default=1,2]: " input
+        input="${input:-1,2}"
+        TERMS_TO_INSTALL=()
+        valid=1
+        IFS=',' read -ra nums <<< "$input"
+        for n in "${nums[@]}"; do
+            n="${n// /}"
+            case "$n" in
+                1) TERMS_TO_INSTALL+=(tio) ;;
+                2) TERMS_TO_INSTALL+=(screen) ;;
+                3) TERMS_TO_INSTALL+=(minicom) ;;
+                4) TERMS_TO_INSTALL+=(picocom) ;;
+                *) echo "  Invalid choice: $n — enter numbers 1-4 separated by commas"; valid=0; break ;;
+            esac
+        done
+        [[ $valid -eq 1 && ${#TERMS_TO_INSTALL[@]} -gt 0 ]] && break
+    done
+    # Deduplicate
+    declare -a _dedup=()
+    declare -A _seen=()
+    for t in "${TERMS_TO_INSTALL[@]}"; do
+        [[ -z "${_seen[$t]+x}" ]] && _dedup+=("$t") && _seen[$t]=1
+    done
+    TERMS_TO_INSTALL=("${_dedup[@]}")
+else
+    # Non-interactive with no --term: default to tio
+    TERMS_TO_INSTALL=(tio)
 fi
 
-if [[ -z "${TERM_PKGS[$TERM_CHOICE]+x}" ]]; then
-    red "Unknown terminal: $TERM_CHOICE. Valid: tio screen minicom picocom"; exit 1
-fi
+# The first entry is the default for serial-connect
+TERM_CHOICE="${TERMS_TO_INSTALL[0]}"
 
 echo ""
-if command -v "$TERM_CHOICE" &>/dev/null; then
-    green "  ✓ $TERM_CHOICE is already installed"
-else
-    yellow "  $TERM_CHOICE is not installed — installing..."
-    try_install "${TERM_PKGS[$TERM_CHOICE]}" || true
-fi
+for t in "${TERMS_TO_INSTALL[@]}"; do
+    if command -v "$t" &>/dev/null; then
+        green "  ✓ $t already installed"
+    else
+        yellow "  $t not installed — installing..."
+        try_install "${TERM_PKGS[$t]}" || true
+    fi
+done
 
 # ── Optional dependencies ──────────────────────────────────────────────────────
 echo ""
