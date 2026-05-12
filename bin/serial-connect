@@ -18,7 +18,7 @@ baud_valid() {
 }
 baud_prompt() {
     local b="$1" d; d=$(baud_display "$b")
-    [[ "$d" != "$b" ]] && echo "Baud [$d or $b]" || echo "Baud [$b]"
+    [[ "$d" != "$b" ]] && echo "Baud [$b or $d]" || echo "Baud [$b]"
 }
 
 # ── launch ─────────────────────────────────────────────────────────────────────
