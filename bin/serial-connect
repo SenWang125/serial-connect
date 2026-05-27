@@ -97,16 +97,24 @@ if [[ "$cur_sig" != "$prev_sig" ]]; then
     run_probes "${!DEVS[@]}"; save_cache "$PROBE_DIR"
 elif [[ -f "$CACHE_FILE" ]]; then
     load_cache "$PROBE_DIR"
-    # Promote LIVE→OPEN for ports now held by another process (fuser only, no probe)
+    # Reconcile cached state with current fuser status for all ports.
+    # Any state + fuser held  → OPEN (catches stale DEAD/FAIL/LIVE entries).
+    # Cached OPEN + not held  → re-probe; session ended, actual state is unknown.
+    declare -a _stale_open_idxs=()
     for i in "${!DEVS[@]}"; do
         _pf="$PROBE_DIR/$(basename "${DEVS[$i]}")"
         _r=$(cut -d'|' -f1 "$_pf" 2>/dev/null)
-        if [[ "$_r" == "LIVE" ]]; then
-            _baud=$(cut -d'|' -f2 "$_pf" 2>/dev/null)
-            { fuser "${DEVS[$i]}" &>/dev/null 2>&1 || sudo -n fuser "${DEVS[$i]}" &>/dev/null 2>&1; } \
-                && printf 'OPEN|%s|\n' "$_baud" > "$_pf"
+        _baud=$(cut -d'|' -f2 "$_pf" 2>/dev/null)
+        _bid=$(cut -d'|' -f3 "$_pf" 2>/dev/null)
+        if { fuser "${DEVS[$i]}" &>/dev/null 2>&1 || sudo -n fuser "${DEVS[$i]}" &>/dev/null 2>&1; }; then
+            printf 'OPEN|%s|%s\n' "${_baud:-${BAUDS[$i]}}" "$_bid" > "$_pf"
+        elif [[ "$_r" == "OPEN" ]]; then
+            _stale_open_idxs+=("$i")
         fi
     done
+    if (( ${#_stale_open_idxs[@]} > 0 )); then
+        run_probes "${_stale_open_idxs[@]}"; save_cache "$PROBE_DIR"
+    fi
     declare -A _recog
     for i in "${!DEVS[@]}"; do
         ser="${SERS[$i]}"
@@ -140,7 +148,7 @@ for i in "${!DEVS[@]}"; do
     elif [[ -z "${BOARD_ID[$ser]+x}" ]]; then
         IFS='|' read -r _r _b cap \
             <<< "$(cat "$PROBE_DIR/$(basename "${DEVS[$i]}")" 2>/dev/null || echo 'FAIL||')"
-        [[ "$_r" == "LIVE" && -n "$cap" ]] && BOARD_ID[$ser]="$cap"
+        [[ ( "$_r" == "LIVE" || "$_r" == "OPEN" ) && -n "$cap" ]] && BOARD_ID[$ser]="$cap"
     fi
 done
 
