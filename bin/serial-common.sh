@@ -154,6 +154,18 @@ probe_tty() {
     local skip_stty=0
     [[ "$dev" =~ /dev/ttyACM ]] && skip_stty=1
 
+    # ttyACM: switching baud triggers CDC_SET_LINE_CODING which stalls ~12s per
+    # attempt, so baud changes are skipped entirely.  But raw mode must still be
+    # set: without it the kernel TTY line discipline buffers incoming bytes until
+    # a newline arrives (canonical mode), so a login prompt ending in \r without
+    # \n is never delivered to read() and the probe returns DEAD even when the
+    # board is alive.  Setting raw + drain here, once, is safe — no baud change,
+    # no CDC overhead.
+    if (( skip_stty )); then
+        stty -F "$dev" raw -echo min 0 time 0 2>/dev/null
+        IFS= read -t "$drain_t" -r -d '' -n 1024 -u $fd _drain 2>/dev/null || true
+    fi
+
     local detected="" captured=""
     for baud in "${try_bauds[@]}"; do
         if (( !skip_stty )); then
