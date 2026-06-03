@@ -118,10 +118,13 @@ elif [[ -f "$CACHE_FILE" ]]; then
     declare -A _recog
     for i in "${!DEVS[@]}"; do
         ser="${SERS[$i]}"
-        [[ -n "${CFG_LABEL[$ser]+x}" ]] && { _recog[$ser]=1; continue; }
         result=$(cat "$PROBE_DIR/$(basename "${DEVS[$i]}")" 2>/dev/null || echo "")
         [[ "$result" =~ ^(LIVE|OPEN)\| ]] && _recog[$ser]=1
-        # If REPROBE_DEAD=0, skip re-probing serials with all-dead cache entries
+        # If REPROBE_DEAD=0, skip re-probing serials with all-dead cache entries.
+        # Labeled boards are NOT exempted here: FT4232H and similar chips power up
+        # from USB host regardless of target board state, so the device signature
+        # never changes between board power-off and power-on — without this, a
+        # labeled board cached as dead would never be re-probed.
         (( !REPROBE_DEAD )) && [[ "$result" =~ ^(DEAD|FAIL)\| ]] && _recog[$ser]=1
     done
     declare -a _reprobe_idxs=()
@@ -192,8 +195,6 @@ for i in "${_disp_order[@]}"; do
     [[ -z "$raw" || "$raw" == "DEAD" ]] && state="dead" || state="$raw"
     if [[ "$state" == "LIVE" && "$probe_baud" =~ ^[0-9]+$ ]]; then
         baud="$probe_baud"
-    elif [[ "$state" != "OPEN" ]]; then
-        baud="${PROBE_BAUDS[0]}"
     fi
     ROW_DEV[$row]="$dev"; ROW_BAUD[$row]="$baud"; ROW_STATE[$row]="$state"
     ROW_BY_CHIPPORT["${DEVICE_IDX[$ser]:-0}-p${PORT_IDX[$dev]:-0}"]=$row
