@@ -73,8 +73,6 @@ Select serial port:
 Port [1-15 or P#]:
 ```
 
-**Color scheme:** the symbol carries the color — `★` green for LIVE, `⊙` cyan for OPEN, `✗` red for FAIL. Port, board, and chip columns are normal weight when any port on that device is active, and dimmed when all ports are dead.
-
 `★ LIVE` — active console detected. `⊙ OPEN` — port held by another process (will offer to force-close). Dead ports are still selectable.
 
 ```bash
