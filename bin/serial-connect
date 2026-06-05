@@ -219,9 +219,12 @@ if [[ "${1:-}" == "--label" ]]; then
         echo ""
     done
     if [[ ${#_lbl_updates[@]} -gt 0 ]]; then
-        rewrite_labels _lbl_updates
-        echo -e "  ${GREEN}✓${NC} Saved ${#_lbl_updates[@]} change(s)"
-        echo -e "  Exported to config: ${BOARD_CFG}"
+        if rewrite_labels _lbl_updates; then
+            echo -e "  ${GREEN}✓${NC} Saved ${#_lbl_updates[@]} change(s)"
+            echo -e "  Exported to config: ${BOARD_CFG}"
+        else
+            echo -e "  ${RED}✗${NC} Failed to write config: ${BOARD_CFG}" >&2
+        fi
     else
         echo -e "  ${DIM}No changes.${NC}"
         echo -e "  Config: ${BOARD_CFG}"
@@ -255,6 +258,13 @@ printf "  ${BOLD}%-1s  %-4s  %-${dev_w}s  %-6s    %-${board_w}s  %-${chip_w}s  %
 printf '─%.0s' $(seq 1 "$rule_w"); echo
 
 display_order
+declare -A _active_ser
+for i in "${_disp_order[@]}"; do
+    IFS='|' read -r _rs _ _ \
+        <<< "$(cat "$PROBE_DIR/$(basename "${DEVS[$i]}")" 2>/dev/null || echo 'FAIL||')"
+    [[ "$_rs" == "LIVE" || "$_rs" == "OPEN" ]] && _active_ser[${SERS[$i]}]=1
+done
+
 row=1; prev_ser="__unset__"
 declare -a ROW_DEV ROW_BAUD ROW_STATE
 declare -A ROW_BY_CHIPPORT   # "N-pM" → row number
@@ -280,7 +290,11 @@ for i in "${_disp_order[@]}"; do
     esac
     board_name="${BOARD_ID[$ser]:-}"
     if [[ -n "$board_name" ]]; then
-        board_col=$(printf "%-${board_w}s" "$board_name")
+        if [[ -n "${_active_ser[$ser]+x}" ]]; then
+            board_col=$(printf "%-${board_w}s" "$board_name")
+        else
+            board_col="${DIM}$(printf "%-${board_w}s" "$board_name")${NC}"
+        fi
     else
         ser_disp="${ser}"; (( ${#ser} > 12 )) && ser_disp="${ser:0:10}"
         board_col="${DIM}$(printf "%-${board_w}s" "${chip}-${ser_disp}")${NC}"

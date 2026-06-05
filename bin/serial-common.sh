@@ -363,7 +363,7 @@ port_indices() {
 # Populate _disp_order array: indices sorted by (first-occurrence serial, interface).
 # Keeps multi-port adapters grouped even when another device grabs a ttyUSBN in between.
 display_order() {
-    declare -gA _fpos
+    declare -gA _fpos=()
     local i
     for i in "${!DEVS[@]}"; do
         [[ -z "${_fpos[${SERS[$i]}]+x}" ]] && _fpos[${SERS[$i]}]=$i

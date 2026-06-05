@@ -134,6 +134,13 @@ printf "  ${BOLD}%-1s  %-${dev_w}s  %-6s    %-${board_w}s  %-${chip_w}s  %-5s  %
 printf '─%.0s' $(seq 1 "$rule_w"); echo
 
 display_order
+declare -A _active_ser
+for i in "${_disp_order[@]}"; do
+    IFS='|' read -r _rs _ _ \
+        <<< "$(cat "$PROBE_DIR/$(basename "${DEVS[$i]}")" 2>/dev/null || echo 'FAIL||')"
+    [[ "$_rs" == "LIVE" || "$_rs" == "OPEN" ]] && _active_ser[${SERS[$i]}]=1
+done
+
 prev_ser="__unset__"
 for i in "${_disp_order[@]}"; do
     dev="${DEVS[$i]}"; devname=$(basename "$dev")
@@ -157,7 +164,11 @@ for i in "${_disp_order[@]}"; do
 
     board_name="${BOARD_ID[$ser]:-}"
     if [[ -n "$board_name" ]]; then
-        board_col=$(printf "%-${board_w}s" "$board_name")
+        if [[ -n "${_active_ser[$ser]+x}" ]]; then
+            board_col=$(printf "%-${board_w}s" "$board_name")
+        else
+            board_col="${DIM}$(printf "%-${board_w}s" "$board_name")${NC}"
+        fi
     else
         ser_disp="${ser}"; (( ${#ser} > 12 )) && ser_disp="${ser:0:10}"
         board_col="${DIM}$(printf "%-${board_w}s" "${chip}-${ser_disp}")${NC}"
