@@ -712,14 +712,20 @@ def cmd_alive(args):
         print(f'ALIVE  state=UBOOT'); sys.exit(0)
 
     # Slow path: probe with CR
-    fifo = devdir(args.device) / 'input.fifo'
-    bf   = devdir(args.device) / 'buf.log'
-    if fifo.exists():
-        with open(fifo, 'wb') as f:
-            f.write(b'\r')
+    bf = devdir(args.device) / 'buf.log'
+    if _daemon_running(args.device):
+        fifo = devdir(args.device) / 'input.fifo'
+        try:
+            fd = os.open(str(fifo), os.O_WRONLY | os.O_NONBLOCK)
+            try: os.write(fd, b'\r')
+            finally: os.close(fd)
+        except OSError:
+            pass
         deadline = time.time() + args.timeout
         prev = bf.stat().st_size if bf.exists() else 0
         while time.time() < deadline:
+            if not _daemon_running(args.device):
+                break
             time.sleep(0.15)
             if bf.exists() and bf.stat().st_size > prev:
                 s2 = json.loads(sf.read_text())
@@ -892,6 +898,9 @@ def cmd_expect(args):
     baseline = baseline_offset
 
     while time.time() < deadline:
+        if not _daemon_running(args.device):
+            break
+
         if use_inotify:
             remaining = max(0.1, deadline - time.time())
             try:
@@ -1082,8 +1091,14 @@ def cmd_connect(args):
         tcp = find_ser2net_port(device)
         cmd = [sys.argv[0], 'start', device, '--baud', str(d['baud'])]
         if tcp: cmd += ['--tcp', tcp]
-        subprocess.run(cmd, check=True)
-        time.sleep(0.4)
+        try:
+            subprocess.run(cmd, check=True)
+        except subprocess.CalledProcessError:
+            print(f'Failed to start daemon for {device}', file=sys.stderr); sys.exit(1)
+        for _ in range(20):   # poll up to 2s instead of fixed sleep
+            if _daemon_running(device):
+                break
+            time.sleep(0.1)
     else:
         # Daemon already running — probe if board is idle/DEAD (no output for 30s).
         # Directly write CR to fifo so wait_state below sees the prompt transition.
@@ -1102,7 +1117,7 @@ def cmd_connect(args):
     if args.wait_shell:
         if not _wait_state(device, 'SHELL,LOGIN,PASSWORD', args.timeout,
                            print_output=not args.json):
-            print(f'Timeout waiting for shell on {device}', file=sys.stderr); sys.exit(1)
+            sys.exit(1)  # _wait_state already printed DAEMON_DIED or TIMEOUT
         sf = devdir(device) / 'status.json'
         cur = json.loads(sf.read_text()).get('state', '') if sf.exists() else ''
         # Auto-login if board landed at LOGIN (consistent with reboot behaviour)
@@ -1282,7 +1297,7 @@ def cmd_reboot(args):
     # Wait for board to come back
     target = 'SHELL,LOGIN,UBOOT' if not args.no_login else 'SHELL,UBOOT'
     if not _wait_state(device, target, args.timeout):
-        print(f'Timeout waiting for board to come back', file=sys.stderr); sys.exit(1)
+        sys.exit(1)  # _wait_state already printed DAEMON_DIED or TIMEOUT
 
     # Auto-login if board is at LOGIN prompt
     sf = devdir(device) / 'status.json'
@@ -1583,7 +1598,13 @@ def cmd_health(args):
               'last_output_ago': s.get('last_output_ago'),
               'prompt': s.get('prompt_text')}
 
-    if state in ('SHELL', 'RUNNING'):
+    if state == 'RUNNING':
+        _wait_state(device, 'SHELL', 10, print_output=False)
+        s = json.loads(sf.read_text())
+        state = s.get('state', 'UNKNOWN')
+        health['state'] = state
+
+    if state == 'SHELL':
         # Gather vitals with a single compound command
         vitals_cmd = (
             'printf "UNAME:%s\\n" "$(uname -r)"; '
