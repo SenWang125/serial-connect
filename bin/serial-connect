@@ -273,7 +273,7 @@ for i in "${_disp_order[@]}"; do
     ROW_DEV[$row]="$dev"; ROW_BAUD[$row]="$baud"; ROW_STATE[$row]="$state"
     ROW_BY_CHIPPORT["${DEVICE_IDX[$ser]:-0}-p${PORT_IDX[$dev]:-0}"]=$row
     case "$state" in
-        LIVE) sym="${GREEN}★${NC}"; dc="$NC";  sc="${GREEN}" ;;
+        LIVE) sym="${GREEN}★${NC}"; dc="${GREEN}"; sc="${GREEN}" ;;
         OPEN) sym="${CYAN}⊙${NC}";  dc="$CYAN"; sc="${CYAN}" ;;
         dead) sym=" ";             dc="$DIM";  sc="$DIM"    ;;
         FAIL) sym="${RED}✗${NC}";  dc="$RED";  sc="${RED}"   ;;
