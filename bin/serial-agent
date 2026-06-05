@@ -174,7 +174,7 @@ EMBEDDED MPU DEVELOPMENT PATTERNS (TI AM62x, AM62D2, etc.)
   EOF
 """
 
-import argparse, json, os, re, select, signal, socket, sys, termios, time
+import argparse, errno, json, os, re, select, signal, socket, sys, termios, time
 from datetime import datetime
 from pathlib import Path
 from threading import Thread, Event
@@ -488,7 +488,12 @@ class Daemon:
                 while not self._stop.is_set():
                     r, _, _ = select.select([rfd], [], [], 0.5)
                     if r:
-                        data = os.read(rfd, 4096)
+                        try:
+                            data = os.read(rfd, 4096)
+                        except OSError as _e:
+                            if _e.errno == errno.EAGAIN:
+                                continue   # spurious select wakeup — no data yet
+                            raise
                         if not data:
                             break
                         self._append(data)
