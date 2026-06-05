@@ -172,6 +172,81 @@ EMBEDDED MPU DEVELOPMENT PATTERNS (TI AM62x, AM62D2, etc.)
   arecord -l
   amixer scontents | head -20
   EOF
+
+══════════════════════════════════════════════════════════════════════════════
+FILE LAYOUT  ~/var/serial-agent/<devname>/
+══════════════════════════════════════════════════════════════════════════════
+
+  daemon.pid   — PID of the running daemon process. Removed on clean exit.
+                 Use _daemon_running(device) to check: reads PID and sends
+                 kill(pid, 0) — returns False if file missing or PID dead.
+
+  status.json  — Written after every state change and every received byte.
+                 Fields: state, last_output_ago, last_prompt_ago,
+                 prompt_text, pid, device, baud, via, buf_file, buf_lines.
+                 Consumers should read this; never poll buf.log directly.
+
+  buf.log      — Ring buffer of the last N lines (default 500) from the
+                 board. Each line is prepended with a [HH:MM:SS.mmm]
+                 timestamp. Partial lines are buffered across os.read()
+                 calls so split bytes never produce corrupt entries.
+
+  events.log   — State-transition log, max MAX_EVENTS (200) lines.
+                 Format: [HH:MM:SS.mmm] PREV → NEW  <prompt_text>
+                 Used by _wait_state() via inotifywait for zero-latency
+                 wakeup when a target state is reached.
+
+  input.fifo   — Named FIFO for sending commands to the daemon. The daemon's
+                 _writer thread holds it open for reading; senders open it
+                 O_WRONLY|O_NONBLOCK (fails with ENXIO if no reader yet).
+                 Each write is a complete shell command + newline (\n).
+                 The FIFO is created once at daemon start and persists until
+                 the next start (cleared by cmd_start to prevent stale data).
+
+  daemon.log   — stdout/stderr of the daemon process (append mode).
+                 Contains connect/disconnect events and error messages.
+
+══════════════════════════════════════════════════════════════════════════════
+DESIGN NOTES
+══════════════════════════════════════════════════════════════════════════════
+
+  Serial device flags (O_RDWR | O_NOCTTY | O_NONBLOCK):
+    O_NOCTTY   — prevent the device becoming the controlling terminal.
+    O_NONBLOCK — open returns immediately even if DCD is not asserted;
+                 os.read() raises EAGAIN (errno 11) instead of blocking
+                 when no data is available. The daemon's select() loop
+                 handles EAGAIN as a spurious wakeup and continues.
+
+  FIFO protocol:
+    The _writer thread opens input.fifo with blocking O_RDONLY, which
+    blocks until a sender opens the write end. Senders use O_NONBLOCK so
+    they never block waiting for the daemon — they fail fast (ENXIO) if
+    the daemon isn't ready yet and retry up to 20×100ms before giving up.
+
+  Output capture baseline:
+    _send_impl() snaps buf.log's byte offset to the last newline BEFORE
+    writing to the FIFO. After the command completes, only bytes after that
+    offset are read back — this prevents pre-command output from polluting
+    the captured result, even if the board was still printing when the
+    command was sent.
+
+  State machine priority:
+    _update_state() checks in this order: PANIC > UBOOT > LOGIN >
+    PASSWORD > SHELL > BOOTING > DEAD > RUNNING. Earlier states are
+    authoritative — a kernel panic in the last 500 chars always wins,
+    even if there's also a shell prompt on another line.
+
+  wait-state inotifywait path:
+    If inotifywait is installed, _wait_state() watches events.log for
+    new writes rather than polling on a timer. This gives sub-millisecond
+    wakeup latency when a state transition happens, vs the 50-200ms
+    polling interval. The daemon check (_daemon_running) runs once per
+    inotify cycle (≤10s wake interval) to detect daemon death early.
+
+  EXIT CODES used by CLI commands:
+    0  — success (state reached, command completed, board alive)
+    1  — failure (timeout, daemon died, board unreachable, command failed)
+    2  — usage error (bad arguments, missing device)
 """
 
 import argparse, errno, json, os, re, select, signal, socket, sys, termios, time
@@ -186,11 +261,11 @@ _TMP_LINK  = Path('/tmp/serial-agent')
 AGENT_BASE = Path(os.environ.get('SERIAL_AGENT_DIR', str(_REAL_BASE)))
 
 # ── Tunables ───────────────────────────────────────────────────────────────────
-DEFAULT_LINES = 500
+DEFAULT_LINES = 500      # buf.log ring buffer depth (lines)
 MAX_EVENTS    = 200      # events.log rotation threshold
-DEAD_AFTER    = 30.0
-RUNNING_AFTER = 3.0
-EXITCODE_TAG  = 'SERIAL_EXITCODE'
+DEAD_AFTER    = 30.0     # seconds of silence before state → DEAD
+RUNNING_AFTER = 3.0      # seconds of output without a prompt → state = RUNNING
+EXITCODE_TAG  = 'SERIAL_EXITCODE'  # sentinel prefix injected by --exit-code
 
 # ── Patterns ───────────────────────────────────────────────────────────────────
 RE_SHELL    = re.compile(r'[\$#>]\s*$')
@@ -212,8 +287,30 @@ def _strip_timestamps(lines: list) -> list:
     return [RE_TIMESTAMP.sub('', l) for l in lines]
 
 def _clean_output(raw_lines: list, sent_cmd: str = '') -> tuple:
-    """Strip timestamps+ANSI, remove command echo, remove trailing prompt.
-    Returns (clean_text, exit_code_or_None)."""
+    """Strip noise from captured board output and extract the exit code.
+
+    Processing steps (in order):
+      1. Strip [HH:MM:SS.mmm] timestamp prefix from each line.
+      2. Strip ANSI escape codes (colour, cursor movement, etc.).
+      3. Strip bare CR characters (terminal line wrapping artefacts).
+      4. Remove command echo. Two forms handled:
+           Form 1 — board echoes 'prompt + command' on one line:
+             e.g. 'root@board:~# uname -r' → first line removed.
+           Form 2 — board echoes the bare command, possibly wrapped:
+             e.g. 'uname', '-r' across two lines → those lines consumed.
+      5. Strip lines matching SERIAL_EXITCODE:<N> and record the value.
+      6. Remove trailing shell prompt line(s).
+      7. Remove trailing blank lines.
+
+    Args:
+        raw_lines:  Lines from buf.log (with timestamps), as a list.
+        sent_cmd:   The exact command that was sent (used for echo removal).
+                    Pass '' to skip echo removal.
+
+    Returns:
+        (clean_text: str, exit_code: int | None)
+        clean_text is newline-joined; exit_code is None if not found.
+    """
     lines = _strip_timestamps(raw_lines)
     lines = [_strip_ansi(l) for l in lines]
     lines = [l.replace('\r', '') for l in lines]   # remove all CRs (mid-line wrapping)
@@ -296,6 +393,20 @@ def ts() -> str:
 # Daemon
 # ══════════════════════════════════════════════════════════════════════════════
 class Daemon:
+    """Serial console daemon.
+
+    Runs as a double-forked background process (see cmd_start). Maintains a
+    persistent connection to a serial device (or ser2net TCP relay), writes
+    timestamped output to buf.log, tracks the board state machine, and
+    accepts commands via a named FIFO (input.fifo).
+
+    Consumers interact through the filesystem:
+      - Read status.json for current state and timestamps.
+      - Read buf.log for recent board output.
+      - Write to input.fifo (via CLI 'send') to send commands to the board.
+      - Watch events.log for state transitions (via CLI 'wait-state').
+    """
+
     def __init__(self, device, tcp, baud, lines):
         self.device   = device
         self.tcp      = tcp
@@ -320,6 +431,22 @@ class Daemon:
         self._fd          = None
 
     def _connect(self):
+        """Open the serial device or TCP connection and configure terminal settings.
+
+        Direct serial path:
+          - O_RDWR|O_NOCTTY|O_NONBLOCK: open without blocking on DCD, without
+            becoming the controlling terminal.
+          - Raw mode (no ICANON, no ECHO): bytes pass through unprocessed.
+          - ICRNL disabled: CR is not translated to NL, preserving raw framing.
+          - VMIN=0, VTIME=1: non-blocking read with 100ms kernel timeout.
+          - TIOCSWINSZ cols=220: tells the board's terminal driver the window is
+            wide so commands and output don't wrap mid-line in the buffer.
+          - ~HUPCL: prevents DTR from dropping when the fd is closed, which
+            would reset the board.
+
+        Returns the file descriptor (int) of the opened connection.
+        Raises OSError on failure (caught by run()'s reconnect loop).
+        """
         if self.tcp:
             host, port = self.tcp
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -365,6 +492,22 @@ class Daemon:
             os.write(self._fd, data)
 
     def _update_state(self, text: str):
+        """Update the board state machine from a chunk of received text.
+
+        Checks are ordered by priority — earlier matches win:
+          PANIC > UBOOT > LOGIN > PASSWORD > SHELL > BOOTING > DEAD > RUNNING
+
+        PANIC always wins because a kernel oops in a flood of output should
+        not be obscured by a shell prompt on another line.
+
+        BOOTING is checked on the tail of the text (last 300 chars) to handle
+        boards that print a shell prompt at the login screen while the kernel
+        log is still flowing — LOGIN and SHELL checks see the last line, while
+        BOOTING looks at the recent tail.
+
+        State changes are written to events.log and status.json. Events are
+        read by _wait_state() via inotifywait.
+        """
         t = now()
         # Strip ANSI codes before pattern matching (handles colored prompts)
         clean = _strip_ansi(text)
@@ -411,6 +554,17 @@ class Daemon:
             self._prev_state = self.state
 
     def _append(self, data: bytes):
+        """Process a raw bytes chunk from the serial device.
+
+        Decodes UTF-8 (replacing bad bytes), updates t_output and state,
+        then assembles complete lines. Partial lines are held in self._partial
+        and prepended to the next read — this prevents os.read() boundary
+        splits (e.g. "6.18.13" + "-dirty\\n") from creating two log entries.
+
+        Lines are timestamped and appended to buf_lines (ring buffer capped at
+        self.maxlines). The full ring is rewritten to buf.log on every call so
+        readers always see a consistent snapshot.
+        """
         text = data.decode('utf-8', errors='replace')
         self.t_output = now()
         self._update_state(text)
@@ -456,6 +610,20 @@ class Daemon:
             pass
 
     def _writer(self):
+        """Daemon thread: relay commands from input.fifo to the serial device.
+
+        Opens the FIFO for reading in blocking mode — this blocks until a
+        sender opens the write end (i.e. until 'serial-agent send' runs).
+        Once open, reads 256-byte chunks and writes them to the serial device.
+        When the writer closes its end, f.read() returns b'' (EOF) and the
+        loop restarts, blocking again for the next sender.
+
+        Senders use O_WRONLY|O_NONBLOCK so they never block — they only
+        succeed if this thread already has the FIFO open for reading.
+
+        This is a daemon thread (daemon=True) so it is automatically killed
+        when the main process exits — no explicit shutdown coordination needed.
+        """
         while not self._stop.is_set():
             try:
                 with open(self.fifo_file, 'rb') as f:
@@ -468,6 +636,30 @@ class Daemon:
                 time.sleep(0.1)
 
     def run(self):
+        """Main daemon loop. Runs after double-fork in cmd_start.
+
+        Lifecycle:
+          1. Write PID file and initial status.json (UNKNOWN state).
+          2. Create input.fifo (if missing).
+          3. Install SIGTERM/SIGINT handlers that set self._stop.
+          4. Start _writer thread (daemon=True).
+          5. Outer loop: call _connect(), run inner select loop, reconnect on error.
+
+        Reconnect backoff starts at 1s, doubles on each failure up to 30s.
+        Backoff resets to 1s on each successful connection.
+
+        Startup probe: if the board sends nothing within 0.5s of connect,
+        the daemon sends a bare CR (\r). This wakes an idle board at a shell
+        prompt so the state transitions from UNKNOWN to SHELL immediately,
+        without requiring the user to send a command first. The probe is
+        skipped if the board is already talking (t_output is set) to avoid
+        interrupting U-Boot autoboot.
+
+        EAGAIN handling: os.read() on an O_NONBLOCK fd can raise EAGAIN even
+        after select() reports the fd readable (spurious wakeup from a modem
+        control line change). This is caught and treated as 'no data yet' —
+        the select loop continues rather than treating it as a disconnect.
+        """
         self.pid_file.write_text(str(os.getpid()))
         self._write_status()
         if not self.fifo_file.exists():
@@ -551,9 +743,27 @@ def find_ser2net_port(device: str):
 
 
 def _wait_pattern(device, pattern, timeout, show=False, baseline_offset=None):
-    """Poll buf.log for `pattern`. Adaptive: 50ms for first second, 200ms after.
-    baseline_offset: byte offset in buf.log to start reading from — set this
-    to the file size BEFORE sending so only post-send output is captured."""
+    """Poll buf.log until `pattern` appears or timeout expires.
+
+    Args:
+        device:          /dev/ttyUSBx path.
+        pattern:         Regex string. Matched against ANSI-stripped new content.
+        timeout:         Seconds to wait before returning False.
+        show:            If True, print new lines to stdout as they arrive
+                         (used by 'send' without --json/--capture).
+        baseline_offset: Byte offset in buf.log to start reading from. Set
+                         this to the file size snapped BEFORE the command was
+                         written to the FIFO so pre-command output is excluded.
+                         None = snap to current end at call time.
+
+    Returns True if pattern matched, False on timeout or daemon death.
+
+    Adaptive polling: 50ms for the first second (fast response for quick
+    commands), then 200ms (reduces CPU for long-running commands).
+
+    Daemon liveness is checked at the top of each iteration. If the daemon
+    dies mid-wait, returns False immediately rather than burning the timeout.
+    """
     bf = devdir(device) / 'buf.log'
     pat = re.compile(pattern)
     deadline = time.time() + timeout
@@ -594,6 +804,15 @@ def _wait_pattern(device, pattern, timeout, show=False, baseline_offset=None):
 
 
 def _daemon_running(device: str) -> bool:
+    """Return True if a daemon process for this device is alive.
+
+    Reads daemon.pid and sends kill(pid, 0) — a zero-signal that checks
+    process existence without delivering anything. Returns False if the
+    PID file is missing, unreadable, or the process no longer exists.
+
+    Called frequently (per poll iteration in wait loops) so must be fast.
+    The kill(0) syscall is O(1) and does not block.
+    """
     pf = devdir(device) / 'daemon.pid'
     if not pf.exists():
         return False
@@ -608,6 +827,16 @@ def _daemon_running(device: str) -> bool:
 # CLI commands
 # ══════════════════════════════════════════════════════════════════════════════
 def cmd_start(args):
+    """Start a daemon for a serial device.
+
+    Double-forks to detach from the terminal (setsid + second fork). The
+    parent waits 0.6s then prints the PID and buf.log path from status.json.
+    On start, ALL previous state files for this device are removed so stale
+    data from a prior session cannot corrupt the new one.
+
+    Exits silently if status.json does not appear within 0.6s (daemon failed
+    to start — check daemon.log for the reason).
+    """
     tcp = None
     if args.tcp:
         host, port = args.tcp.rsplit(':', 1)
@@ -643,6 +872,17 @@ def cmd_start(args):
 
 
 def cmd_stop(args):
+    """Send SIGTERM to the daemon and wait up to 3s for it to exit.
+
+    Waits for the process to actually exit before returning so that an
+    immediate 'serial-agent start' after 'stop' does not race against the
+    dying daemon on the serial device. The daemon's run() loop removes
+    daemon.pid on clean exit; cmd_stop also removes it as a fallback for
+    crash/SIGKILL cases.
+
+    Also SIGTERMs any other processes still holding the device (stale
+    restarts or orphaned sessions caught by fuser).
+    """
     pf = devdir(args.device) / 'daemon.pid'
     killed = []
     if pf.exists():
@@ -685,6 +925,22 @@ def cmd_status(args):
 
 
 def cmd_alive(args):
+    """Check whether the board is alive. Exits 0 if alive, 1 if not.
+
+    Fast paths (no serial traffic):
+      SHELL + recent prompt   → ALIVE immediately
+      RUNNING + recent output → ALIVE (board is busy, don't interrupt)
+      Any state + output <2s  → ALIVE (something is printing)
+      UBOOT                   → ALIVE
+
+    Slow path (only if fast paths all miss):
+      Sends a bare CR to the FIFO with O_NONBLOCK. If the board responds
+      (buf.log grows and state becomes SHELL/RUNNING/LOGIN/PASSWORD), reports
+      ALIVE. Probe timeout is controlled by --timeout (default 5s).
+
+    The slow-path FIFO write uses O_NONBLOCK so it never hangs if the daemon
+    just died. A _daemon_running() guard prevents probing a dead daemon.
+    """
     sf = devdir(args.device) / 'status.json'
     if not sf.exists():
         print('NO_DAEMON'); sys.exit(1)
@@ -749,6 +1005,25 @@ def cmd_read(args):
 
 
 def cmd_send(args):
+    """Send a command to the board and optionally capture structured output.
+
+    Typical usage:
+      --json     Structured output: {output, state, elapsed_ms, exit_code,
+                 timed_out}. Zero-parsing for agents — just read the JSON.
+      --capture  Clean stdout only (no timestamps, prompt, or echo).
+                 Exit code = command exit code if --exit-code was also used.
+      --exit-code Appends '; echo SERIAL_EXITCODE:$?' to the command and
+                  parses the exit code. NOTE: avoid 'exit' in commands with
+                  this flag — the shell exits before the echo can run; use
+                  'run' instead for multi-step scripts.
+      --no-wait  Fire and forget — write to FIFO and return immediately.
+      --no-wrap  Prepend COLUMNS=32767 to prevent board terminal from
+                 wrapping long output lines (important for grep, find, etc.).
+      --all      Fan-out: send to every device with a running daemon in
+                 parallel; results keyed by device path in the JSON output.
+
+    Exit code: 0 = completed (pattern matched), 1 = timed out or failed.
+    """
     # ── Fan-out: send to ALL running daemons ──────────────────────────────────
     if args.all:
         targets = []
@@ -799,7 +1074,30 @@ def cmd_send(args):
 
 
 def _send_impl(args):
-    """Core send implementation. Returns dict (for --json/--capture) or None."""
+    """Core send implementation. Shared by cmd_send, _do_send, and cmd_connect.
+
+    Flow:
+      1. Verify daemon is running (exits with error if not).
+      2. Snap buf.log byte offset (baseline) to the last complete newline so
+         post-command output capture starts cleanly.
+      3. Wrap the command with COLUMNS= prefix (--no-wrap) or EXITCODE echo
+         (--exit-code) if requested.
+      4. Write command+newline to input.fifo using O_NONBLOCK. Retries up to
+         up to 20 attempts x 100ms, checking daemon liveness on each. Fails fast
+         with 'no daemon' if daemon dies during retry.
+      5. If --no-wait: return None immediately (fire and forget).
+      6. Otherwise: call _wait_pattern() to block until the shell prompt
+         (or custom --wait pattern) appears in buf.log after the baseline.
+      7. Read buf.log from baseline, call _clean_output() to strip timestamps,
+         ANSI codes, command echo, trailing prompt, and extract EXITCODE.
+
+    Returns:
+        dict  with keys: output, state, elapsed_ms, exit_code, timed_out
+              (when --json, --capture, or --exit-code is set)
+        dict  with key: timed_out only (when none of the above)
+        None  when --no-wait
+    Calls sys.exit(1) on daemon errors (does not return).
+    """
     fifo = devdir(args.device) / 'input.fifo'
     if not _daemon_running(args.device):
         print(f'no daemon for {args.device}', file=sys.stderr); sys.exit(1)
@@ -956,12 +1254,45 @@ def cmd_expect(args):
 
 
 def cmd_wait(args):
+    """Block until a regex pattern appears in the board's output buffer.
+
+    Unlike wait-state (which watches the state machine), wait watches the
+    raw buf.log content. Useful for waiting on a specific log message,
+    error string, or application output that doesn't map to a board state.
+
+    Exit 0 on match, 1 on timeout or daemon death.
+    """
     sys.exit(0 if _wait_pattern(args.device, args.pattern, args.timeout) else 1)
 
 
 def _wait_state(device, state_csv, timeout, print_output=True):
-    """Internal: block until board reaches one of the target states.
-    Returns True on success, False on timeout. Does NOT call sys.exit."""
+    """Block until the board reaches one of the target states.
+
+    Args:
+        device:       /dev/ttyUSBx path.
+        state_csv:    Comma-separated target states, e.g. 'SHELL,LOGIN'.
+        timeout:      Seconds before giving up.
+        print_output: If True, print ALREADY/REACHED/TIMEOUT/DAEMON_DIED
+                      to stdout for the user to see.
+
+    Returns True if a target state was reached, False on failure.
+    Does NOT call sys.exit — callers decide what to do on False.
+
+    Fast path: if the current state in status.json is already in targets,
+    returns True immediately (prints ALREADY).
+
+    Event-driven path (inotifywait available): watches events.log for new
+    writes, wakes instantly on state change, checks daemon liveness once per
+    inotify cycle (up to 10s). Much lower CPU than polling.
+
+    Polling fallback: 50ms for first 2s, then 200ms. Used when inotifywait
+    is not installed.
+
+    On daemon death: prints DAEMON_DIED and returns False immediately,
+    regardless of remaining timeout.
+
+    On timeout: prints TIMEOUT with the last known state and returns False.
+    """
     import shutil
     ef = devdir(device) / 'events.log'
     sf = devdir(device) / 'status.json'
@@ -1015,7 +1346,19 @@ def _wait_state(device, state_csv, timeout, print_output=True):
 
 
 def cmd_wait_state(args):
-    """CLI wrapper: block until board reaches target state."""
+    """Block until the board reaches one of the target states, then exit 0.
+
+    Uses inotifywait (if installed) for event-driven wakeup with sub-ms
+    latency, falling back to 50-200ms polling. Prints one of:
+      ALREADY  state=X    — already in target state when called
+      REACHED  [timestamp] PREV → NEW  prompt   — transition observed
+      TIMEOUT  state=X  waited=N  target=Y       — timed out
+      DAEMON_DIED  state=DEAD                    — daemon process died
+
+    Exit 0 = target reached. Exit 1 = timeout or daemon death.
+
+    See also: wait-alive (shorthand for SHELL,LOGIN,PASSWORD).
+    """
     ok = _wait_state(args.device, args.state, args.timeout)
     sys.exit(0 if ok else 1)
 
@@ -1258,7 +1601,13 @@ def cmd_discover(args):
 
 
 def _do_send(device, command, wait=r'[\$#>]\s*$', timeout=10, no_wrap=False):
-    """Helper: fire a send and return the result dict."""
+    """Internal helper: send a command and return the result dict (always JSON mode).
+
+    Calls sys.exit(1) if the daemon is not running — callers that need to
+    handle daemon death gracefully should check _daemon_running() first.
+    Returns None only if the daemon check passes but the send is no-wait
+    (which never happens here since wait is always set).
+    """
     return _send_impl(argparse.Namespace(
         device=device, command=command, wait=wait, timeout=timeout,
         json=True, capture=False, exit_code=False, all=False, no_wrap=no_wrap))
