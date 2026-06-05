@@ -42,33 +42,27 @@ Pick a port and connect. Ports are grouped by physical device. Probe results are
 $ serial-connect
 Select serial port:
 
-  ·    #  Port       Status    Board                 Chip       P#     Baud
+  ·    #   Port       Status    Board             Chip       P#     Baud
 ────────────────────────────────────────────────────────────────────────────────
-       1)  ttyACM0    dead      RPiProbe-E663B03597   RPiProbe   0-p0
-       2)  ttyACM1    dead      XDS110-S62H0161       XDS110     1-p0
-  ★    3)  ttyACM2    LIVE      XDS110-S62H0161       XDS110     1-p1   115.2K
+  ★    1)  ttyACM0    LIVE      BeagleBone        RPiProbe   0-p0   115.2K
 
-       4)  ttyUSB0    dead      am62dxx-evm           FT4232H    2-p0
-  ★    5)  ttyUSB1    LIVE      am62dxx-evm           FT4232H    2-p1   115.2K
-       6)  ttyUSB3    dead      am62dxx-evm           FT4232H    2-p2
-       7)  ttyUSB4    dead      am62dxx-evm           FT4232H    2-p3
+       2)  ttyACM1    dead      XDS110-S62H0161   XDS110     1-p0
+  ★    3)  ttyACM2    LIVE      XDS110-S62H0161   XDS110     1-p1   115.2K
 
-       8)  ttyUSB2    dead      am62dxx-evm           FT4232H    3-p0
-  ★    9)  ttyUSB9    LIVE      am62dxx-evm           FT4232H    3-p1   115.2K
-      10)  ttyUSB10   dead      am62dxx-evm           FT4232H    3-p2
-      11)  ttyUSB11   dead      am62dxx-evm           FT4232H    3-p3
+  ★    4)  ttyUSB0    LIVE      AM62P5-EVM        FT4232H    2-p0   115.2K
+       5)  ttyUSB1    dead      AM62P5-EVM        FT4232H    2-p1
+       6)  ttyUSB2    dead      AM62P5-EVM        FT4232H    2-p2
+       7)  ttyUSB3    dead      AM62P5-EVM        FT4232H    2-p3
 
-  ★   12)  ttyUSB5    LIVE      am62pxx-evm           FT4232H    4-p0   115.2K
-      13)  ttyUSB6    dead      am62pxx-evm           FT4232H    4-p1
-      14)  ttyUSB7    dead      am62pxx-evm           FT4232H    4-p2
-      15)  ttyUSB8    dead      am62pxx-evm           FT4232H    4-p3
+       8)  ttyUSB4    dead      AM62D-EVM         FT4232H    3-p0
+  ⊙    9)  ttyUSB5    OPEN      AM62D-EVM         FT4232H    3-p1   115.2K
+      10)  ttyUSB6    dead      AM62D-EVM         FT4232H    3-p2
+      11)  ttyUSB7    dead      AM62D-EVM         FT4232H    3-p3
 
-      16)  ttyUSB12   dead      CP2102-0001           CP2102     5-p0
-
-  ★   17)  ttyUSB13   LIVE      am62axx-evm           FT4232H    6-p0   115.2K
-      18)  ttyUSB14   dead      am62axx-evm           FT4232H    6-p1
-      19)  ttyUSB15   dead      am62axx-evm           FT4232H    6-p2
-      20)  ttyUSB16   dead      am62axx-evm           FT4232H    6-p3
+  ★   12)  ttyUSB8    LIVE      AM62A7-EVM        FT4232H    4-p0   115.2K
+      13)  ttyUSB9    dead      AM62A7-EVM        FT4232H    4-p1
+      14)  ttyUSB10   dead      AM62A7-EVM        FT4232H    4-p2
+      15)  ttyUSB11   dead      AM62A7-EVM        FT4232H    4-p3
 
   ★ LIVE    ⊙ OPEN    ✗ FAIL      dead
   use serial-discover             to force a fresh probe
@@ -76,13 +70,21 @@ Select serial port:
   use serial-discover --tmp-udev  for stable port names current session
   use serial-connect --label      to rename boards
 
-Port [1-20 or P#]:
+Port [1-15 or P#]:
 ```
+
+**Color scheme:** the symbol carries the color — `★` green for LIVE, `⊙` cyan for OPEN, `✗` red for FAIL. Port, board, and chip columns are normal weight when any port on that device is active, and dimmed when all ports are dead.
 
 `★ LIVE` — active console detected. `⊙ OPEN` — port held by another process (will offer to force-close). Dead ports are still selectable.
 
+```bash
+serial-connect               # interactive menu
+serial-connect /dev/ttyUSB1  # direct connect, skip menu
+serial-connect --label       # rename boards interactively
+serial-connect --help        # show usage
+```
+
 Override terminal: `SERIAL_TERM=screen serial-connect`
-Direct connect (skip menu): `serial-connect /dev/ttyUSB1`
 
 ### Labelling boards
 
