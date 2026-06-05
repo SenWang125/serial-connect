@@ -74,6 +74,7 @@ Select serial port:
   use serial-discover             to force a fresh probe
   use serial-discover --gen-udev  for stable port names across reboots
   use serial-discover --tmp-udev  for stable port names current session
+  use serial-connect --label      to rename boards
 
 Port [1-20 or P#]:
 ```
@@ -82,6 +83,33 @@ Port [1-20 or P#]:
 
 Override terminal: `SERIAL_TERM=screen serial-connect`
 Direct connect (skip menu): `serial-connect /dev/ttyUSB1`
+
+### Labelling boards
+
+`serial-connect --label` opens an interactive editor to assign human-readable names to connected boards. Labels are saved by USB serial number and persist across reboots and re-enumeration.
+
+```
+$ serial-connect --label
+
+Label editor  —  Enter to keep, type a new name to change, - to remove
+
+  ★  FT4232H - ttyUSB0 ttyUSB1 ttyUSB2 ttyUSB3
+     Serial Number:  46241800161
+     Current Label:  AM62D2-EVM
+     Probed Label:   am62dxx-evm
+     New Label [AM62D2-EVM]:
+
+  ⊙  XDS110 - ttyACM1 ttyACM2
+     Serial Number:  S62H0161
+     New Label:
+
+  ✓ Saved 1 change(s)
+  Exported to config: ~/.serial-connect/serial-boards.conf
+```
+
+- **Current Label** — name already stored in `serial-boards.conf`
+- **Probed Label** — hostname captured live from the board's console prompt
+- Press **Enter** to keep the current/suggested value; type a new name to change it; type **`-`** to remove an existing label
 
 
 ---
@@ -130,6 +158,7 @@ Label boards by USB serial number (stable across reboots and re-enumeration):
 ```
 
 Find serial numbers: `serial-discover`
+Label boards interactively: `serial-connect --label`
 Auto-generate labels from board hostnames: `serial-agent auto-label -y`
 
 ---

@@ -1,6 +1,7 @@
 #!/bin/bash
 # serial-connect — Interactive serial terminal with live TTY probing and cache.
 # Usage: serial-connect [/dev/ttyXXX]
+#        serial-connect --label
 #
 # Probe results are cached per device topology. Re-probes only when the device
 # set changes or new unrecognized boards appear.
@@ -71,7 +72,7 @@ enumerate_devices
 port_indices
 
 # ── Direct-device mode ────────────────────────────────────────────────────────
-if [[ -n "${1:-}" ]]; then
+if [[ -n "${1:-}" && "${1:-}" != "--label" ]]; then
     dev="$1"; [[ ! -c "$dev" ]] && { echo "Not a device: $dev" >&2; exit 1; }
     baud="${PROBE_BAUDS[0]}"
     for i in "${!DEVS[@]}"; do [[ "${DEVS[$i]}" == "$dev" ]] && baud="${BAUDS[$i]}" && break; done
@@ -155,6 +156,60 @@ for i in "${!DEVS[@]}"; do
     fi
 done
 
+# ── Label mode ────────────────────────────────────────────────────────────────
+if [[ "${1:-}" == "--label" ]]; then
+    display_order
+    echo ""
+    echo -e "${BOLD}Label editor${NC}  —  Enter to keep, type a new name to change, ${DIM}-${NC} to remove"
+    echo ""
+    declare -A _lbl_updates _lbl_seen _lbl_ports
+    for j in "${_disp_order[@]}"; do
+        _lbl_ports[${SERS[$j]}]+="${_lbl_ports[${SERS[$j]}]:+ }$(basename "${DEVS[$j]}")"
+    done
+    for i in "${_disp_order[@]}"; do
+        ser="${SERS[$i]}"
+        [[ -n "${_lbl_seen[$ser]+x}" ]] && continue
+        _lbl_seen[$ser]=1
+        _cur="${CFG_LABEL[$ser]:-}"
+        _probed=""
+        IFS='|' read -r _r _b _id \
+            <<< "$(cat "$PROBE_DIR/$(basename "${DEVS[$i]}")" 2>/dev/null || echo 'FAIL||')"
+        [[ -z "$_r" || "$_r" == "DEAD" ]] && _r="dead"
+        [[ ( "$_r" == "LIVE" || "$_r" == "OPEN" ) && -n "$_id" ]] && _probed="$_id"
+        case "$_r" in
+            LIVE) _sym="${GREEN}★${NC}" ;;
+            OPEN) _sym="${CYAN}⊙${NC}"  ;;
+            dead) _sym=" "              ;;
+            *)    _sym="${RED}✗${NC}"   ;;
+        esac
+        _suggested="${_cur:-${_probed}}"
+        printf "  %b  %s - %s\n" "$_sym" "${CHIPS[$i]}" "${_lbl_ports[$ser]}"
+        printf "     Serial Number:  %s\n" "$ser"
+        [[ -n "$_cur"    ]] && printf "     Current Label:  ${GREEN}%s${NC}\n" "$_cur"
+        [[ -n "$_probed" ]] && printf "     Probed Label:   ${DIM}%s${NC}\n"   "$_probed"
+        _prompt="     New Label"
+        [[ -n "$_suggested" ]] && _prompt+=" [${_suggested}]"
+        read -rp "${_prompt}: " _newlabel || { printf "\n"; exit 0; }
+        if [[ "$_newlabel" =~ ^-[[:space:]]*$ ]]; then
+            [[ -n "$_cur" ]] && _lbl_updates[$ser]=""
+        elif [[ -z "$_newlabel" && -n "$_suggested" && "$_suggested" != "$_cur" ]]; then
+            _lbl_updates[$ser]="$_suggested"
+        elif [[ -n "$_newlabel" && "$_newlabel" != "$_cur" ]]; then
+            _lbl_updates[$ser]="$_newlabel"
+        fi
+        echo ""
+    done
+    if [[ ${#_lbl_updates[@]} -gt 0 ]]; then
+        rewrite_labels _lbl_updates
+        echo -e "  ${GREEN}✓${NC} Saved ${#_lbl_updates[@]} change(s)"
+        echo -e "  Exported to config: ${BOARD_CFG}"
+    else
+        echo -e "  ${DIM}No changes.${NC}"
+        echo -e "  Config: ${BOARD_CFG}"
+    fi
+    exit 0
+fi
+
 # ── Dynamic column widths ──────────────────────────────────────────────────────
 dev_w=6; chip_w=6
 for i in "${!DEVS[@]}"; do
@@ -224,6 +279,7 @@ printf "  ${GREEN}★ LIVE${NC}    ${CYAN}⊙ OPEN${NC}    ${RED}✗ FAIL${NC}  
 echo -e "  use ${DIM}serial-discover${NC}             to force a fresh probe"
 echo -e "  use ${DIM}serial-discover --gen-udev${NC}  for stable port names across reboots"
 echo -e "  use ${DIM}serial-discover --tmp-udev${NC}  for stable port names current session"
+echo -e "  use ${DIM}serial-connect --label${NC}      to rename boards"
 echo ""
 
 trap 'printf "\n"; exit 0' INT

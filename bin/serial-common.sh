@@ -227,6 +227,47 @@ load_cache() {
     done
 }
 
+# ── rewrite_labels ────────────────────────────────────────────────────────────
+# Update serial→label entries in BOARD_CFG.
+# Arg: name of an associative array  serial → new_label.
+#   Non-empty value  — add or update the entry, preserving any :BAUD suffix.
+#   Empty string     — comment out the existing line.
+rewrite_labels() {
+    local -n _rl=$1
+    [[ ${#_rl[@]} -eq 0 ]] && return 0
+    [[ ! -f "$BOARD_CFG" ]] && { echo "Config not found: $BOARD_CFG" >&2; return 1; }
+    local tmpfile; tmpfile=$(mktemp "${BOARD_CFG}.XXXXXX") || return 1
+    local -A _done
+    while IFS= read -r line; do
+        if [[ "$line" =~ ^[[:space:]]*# ]] || [[ "$line" != *=* ]]; then
+            printf '%s\n' "$line"; continue
+        fi
+        local key="${line%%=*}"; key="${key// /}"
+        if [[ -n "${_rl[$key]+x}" ]]; then
+            _done[$key]=1
+            if [[ -z "${_rl[$key]}" ]]; then
+                printf '# %s\n' "$line"
+            else
+                local v="${line#*=}"; v="${v%%#*}"; v="${v// /}"
+                local baud=""; [[ "$v" == *:* ]] && baud=":${v##*:}"
+                printf '%s=%s%s\n' "$key" "${_rl[$key]}" "$baud"
+            fi
+        else
+            printf '%s\n' "$line"
+        fi
+    done < "$BOARD_CFG" > "$tmpfile"
+    local first=1 ser
+    for ser in "${!_rl[@]}"; do
+        [[ -n "${_done[$ser]+x}" || -z "${_rl[$ser]}" ]] && continue
+        if (( first )); then
+            printf '\n# Added %s\n' "$(date '+%Y-%m-%d')" >> "$tmpfile"
+            first=0
+        fi
+        printf '%s=%s\n' "$ser" "${_rl[$ser]}" >> "$tmpfile"
+    done
+    mv "$tmpfile" "$BOARD_CFG" || { rm -f "$tmpfile"; return 1; }
+}
+
 # ── run_probes ─────────────────────────────────────────────────────────────────
 # Launch probe_tty for each device index, respecting PROBE_PARALLEL.
 # Results written to $PROBE_DIR/<devname>. Watchdog timeout scales with settings.
