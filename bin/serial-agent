@@ -218,29 +218,34 @@ def _clean_output(raw_lines: list, sent_cmd: str = '') -> tuple:
     lines = [_strip_ansi(l) for l in lines]
     lines = [l.replace('\r', '') for l in lines]   # remove all CRs (mid-line wrapping)
 
-    # Remove command echo. Long commands wrap at terminal width, so the echo
-    # may span multiple lines. We skip leading lines as long as they are a
-    # contiguous prefix of the sent command (case-sensitive, ignoring whitespace).
+    # Remove command echo. Two forms:
+    #   1. "prompt + command" on one line (board echoes with prompt visible)
+    #   2. Bare command lines (may wrap across multiple lines at terminal width)
     cmd_stripped = sent_cmd.strip()
     if cmd_stripped and lines:
-        consumed = ''
-        skip = 0
-        for line in lines:
-            chunk = line.strip()
-            if not chunk:
-                break
-            test = consumed + chunk
-            if cmd_stripped.startswith(test):
-                consumed = test
-                skip += 1
-                if consumed == cmd_stripped:
+        # Form 1: first line is "prompt + command" — ends with the command
+        first = lines[0].strip()
+        if first.endswith(cmd_stripped) and len(first) > len(cmd_stripped):
+            lines = lines[1:]
+        else:
+            # Form 2: bare command, possibly wrapped across lines
+            consumed = ''
+            skip = 0
+            for line in lines:
+                chunk = line.strip()
+                if not chunk:
                     break
-            elif cmd_stripped.startswith(consumed) and len(consumed) < len(cmd_stripped):
-                # Partial match so far but this line doesn't continue it — stop
-                break
-            else:
-                break
-        lines = lines[skip:]
+                test = consumed + chunk
+                if cmd_stripped.startswith(test):
+                    consumed = test
+                    skip += 1
+                    if consumed == cmd_stripped:
+                        break
+                elif cmd_stripped.startswith(consumed) and len(consumed) < len(cmd_stripped):
+                    break
+                else:
+                    break
+            lines = lines[skip:]
 
     # Extract exit code if present
     exit_code = None
@@ -476,6 +481,8 @@ class Daemon:
             try:
                 rfd = self._connect()
                 backoff = 1.0
+                t_connected = now()
+                _probe_sent = False
                 print(f'[serial-agent] {self.device} connected '
                       f'via {"tcp" if self.tcp else "direct"}', flush=True)
                 while not self._stop.is_set():
@@ -486,6 +493,15 @@ class Daemon:
                             break
                         self._append(data)
                     else:
+                        # Startup probe: if board has sent NOTHING after 0.5s, send CR
+                        # so an idle board at shell will echo its prompt → SHELL state.
+                        # Do NOT probe if t_output is set — board is already talking
+                        # (e.g. U-Boot banner); sending CR would interrupt autoboot.
+                        if (not _probe_sent and self.state == 'UNKNOWN'
+                                and not self.t_output
+                                and now() - t_connected > 0.5):
+                            self._send_raw(b'\r')
+                            _probe_sent = True
                         if self.t_output and now() - self.t_output > DEAD_AFTER:
                             if self.state != 'DEAD':
                                 self.state = 'DEAD'
@@ -680,6 +696,10 @@ def cmd_alive(args):
     if ago is not None and ago < 2.0:
         print(f'ALIVE  state={state}  output {ago:.1f}s ago'); sys.exit(0)
 
+    # UBOOT = board is alive at U-Boot prompt
+    if state == 'UBOOT':
+        print(f'ALIVE  state=UBOOT'); sys.exit(0)
+
     # Slow path: probe with CR
     fifo = devdir(args.device) / 'input.fifo'
     bf   = devdir(args.device) / 'buf.log'
@@ -764,12 +784,19 @@ def cmd_send(args):
 def _send_impl(args):
     """Core send implementation. Returns dict (for --json/--capture) or None."""
     fifo = devdir(args.device) / 'input.fifo'
-    if not fifo.exists():
+    if not _daemon_running(args.device):
         print(f'no daemon for {args.device}', file=sys.stderr); sys.exit(1)
 
     bf = devdir(args.device) / 'buf.log'
     t0 = time.time()
-    baseline_offset = bf.stat().st_size if bf.exists() else 0
+    # Snap to last newline so we never read a partial timestamped line
+    if bf.exists():
+        with open(bf, 'rb') as _f:
+            _raw = _f.read()
+        _nl = _raw.rfind(b'\n')
+        baseline_offset = _nl + 1 if _nl >= 0 else len(_raw)
+    else:
+        baseline_offset = 0
 
     cmd = args.command.rstrip('\n')
     if getattr(args, 'no_wrap', False):
@@ -830,7 +857,13 @@ def _send_impl(args):
 def cmd_expect(args):
     """Wait for first of multiple patterns. Returns JSON with matched key and output."""
     bf = devdir(args.device) / 'buf.log'
-    baseline_offset = bf.stat().st_size if bf.exists() else 0
+    if bf.exists():
+        with open(bf, 'rb') as _f:
+            _raw = _f.read()
+        _nl = _raw.rfind(b'\n')
+        baseline_offset = _nl + 1 if _nl >= 0 else len(_raw)
+    else:
+        baseline_offset = 0
     deadline = time.time() + args.timeout
     t0 = time.time()
 
@@ -904,30 +937,35 @@ def cmd_wait(args):
     sys.exit(0 if _wait_pattern(args.device, args.pattern, args.timeout) else 1)
 
 
-def cmd_wait_state(args):
-    """Block until board reaches target state. Uses inotifywait (instant) if available."""
+def _wait_state(device, state_csv, timeout, print_output=True):
+    """Internal: block until board reaches one of the target states.
+    Returns True on success, False on timeout. Does NOT call sys.exit."""
     import shutil
-    ef = devdir(args.device) / 'events.log'
-    sf = devdir(args.device) / 'status.json'
-    targets = {s.strip().upper() for s in args.state.split(',')}
+    ef = devdir(device) / 'events.log'
+    sf = devdir(device) / 'status.json'
+    targets = {s.strip().upper() for s in state_csv.split(',')}
 
     if sf.exists():
         s = json.loads(sf.read_text())
         if s.get('state', '') in targets:
-            print(f'ALREADY  state={s["state"]}'); sys.exit(0)
+            if print_output: print(f'ALREADY  state={s["state"]}')
+            return True
 
-    deadline = time.time() + args.timeout
+    deadline = time.time() + timeout
     t_start = time.time()
     baseline = ef.stat().st_size if ef.exists() else 0
     use_inotify = bool(shutil.which('inotifywait'))
 
     while time.time() < deadline:
+        if not _daemon_running(device):
+            if print_output: print(f'DAEMON_DIED  state=DEAD')
+            return False
+
         if use_inotify:
             remaining = max(0.1, deadline - time.time())
             try:
-                import subprocess
-                # Watch the directory containing events.log
-                subprocess.run(
+                import subprocess as _sp
+                _sp.run(
                     ['inotifywait', '-q', '-e', 'modify,create',
                      '--timeout', str(min(remaining, 10)), str(ef.parent)],
                     capture_output=True, timeout=remaining + 2)
@@ -946,12 +984,18 @@ def cmd_wait_state(args):
             for line in new_lines.splitlines():
                 m = re.search(r'→\s+(\w+)', line)
                 if m and m.group(1) in targets:
-                    print(f'REACHED  {line.strip()}')
-                    sys.exit(0)
+                    if print_output: print(f'REACHED  {line.strip()}')
+                    return True
 
     state = json.loads(sf.read_text()).get('state', '?') if sf.exists() else '?'
-    print(f'TIMEOUT  state={state}  waited={args.timeout}s  target={args.state}')
-    sys.exit(1)
+    if print_output: print(f'TIMEOUT  state={state}  waited={timeout}s  target={state_csv}')
+    return False
+
+
+def cmd_wait_state(args):
+    """CLI wrapper: block until board reaches target state."""
+    ok = _wait_state(args.device, args.state, args.timeout)
+    sys.exit(0 if ok else 1)
 
 
 def cmd_events(args):
@@ -1027,16 +1071,39 @@ def cmd_connect(args):
         if tcp: cmd += ['--tcp', tcp]
         subprocess.run(cmd, check=True)
         time.sleep(0.4)
+    else:
+        # Daemon already running — probe if board is idle/DEAD (no output for 30s).
+        # Directly write CR to fifo so wait_state below sees the prompt transition.
+        sf2 = devdir(device) / 'status.json'
+        cur2 = json.loads(sf2.read_text()).get('state', '') if sf2.exists() else ''
+        if cur2 in ('DEAD', 'UNKNOWN'):
+            fifo2 = devdir(device) / 'input.fifo'
+            if fifo2.exists():
+                try:
+                    fd2 = os.open(str(fifo2), os.O_WRONLY | os.O_NONBLOCK)
+                    try: os.write(fd2, b'\r')
+                    finally: os.close(fd2)
+                except OSError:
+                    pass
 
     if args.wait_shell:
-        ns = argparse.Namespace(device=device, state='SHELL,LOGIN,PASSWORD', timeout=args.timeout)
-        cmd_wait_state(ns)
-        if args.setup_terminal:
-            # Set wide terminal so the board doesn't wrap output lines
+        if not _wait_state(device, 'SHELL,LOGIN,PASSWORD', args.timeout,
+                           print_output=not args.json):
+            print(f'Timeout waiting for shell on {device}', file=sys.stderr); sys.exit(1)
+        sf = devdir(device) / 'status.json'
+        cur = json.loads(sf.read_text()).get('state', '') if sf.exists() else ''
+        # Auto-login if board landed at LOGIN (consistent with reboot behaviour)
+        if cur == 'LOGIN':
+            _do_send(device, getattr(args, 'user', 'root'), wait=r'Password|[\$#>]\s*$', timeout=10)
+            cur = json.loads(sf.read_text()).get('state', '') if sf.exists() else ''
+            if cur == 'PASSWORD':
+                _do_send(device, getattr(args, 'password', None) or '', wait=r'[\$#>]\s*$', timeout=10)
+            cur = json.loads(sf.read_text()).get('state', '') if sf.exists() else ''
+        if args.setup_terminal and cur == 'SHELL':
             _send_impl(argparse.Namespace(
                 device=device, command='stty cols 220 rows 50',
                 wait=r'[\$#>]\s*$', timeout=5,
-                json=False, capture=False, exit_code=False, all=False, no_wrap=False))
+                json=True, capture=False, exit_code=False, all=False, no_wrap=False))
 
     if args.json:
         sf = devdir(device) / 'status.json'
@@ -1197,13 +1264,12 @@ def cmd_reboot(args):
         print(f'Rebooting {device}...')
 
     # Wait for board to go down (DEAD or BOOTING)
-    ns = argparse.Namespace(device=device, state='DEAD,BOOTING', timeout=30)
-    cmd_wait_state(ns)
+    _wait_state(device, 'DEAD,BOOTING', 30)
 
     # Wait for board to come back
     target = 'SHELL,LOGIN,UBOOT' if not args.no_login else 'SHELL,UBOOT'
-    ns = argparse.Namespace(device=device, state=target, timeout=args.timeout)
-    cmd_wait_state(ns)
+    if not _wait_state(device, target, args.timeout):
+        print(f'Timeout waiting for board to come back', file=sys.stderr); sys.exit(1)
 
     # Auto-login if board is at LOGIN prompt
     sf = devdir(device) / 'status.json'
@@ -1214,6 +1280,8 @@ def cmd_reboot(args):
         if state == 'PASSWORD' and args.password is not None:
             _do_send(device, args.password or '', wait=r'[\$#>]\s*$', timeout=10)
 
+    # Re-read state — login sequence may have changed it
+    state = json.loads(sf.read_text()).get('state', '') if sf.exists() else ''
     if args.setup_terminal and state == 'SHELL':
         _do_send(device, 'stty cols 220 rows 50', timeout=5)
 
@@ -1241,11 +1309,15 @@ def cmd_login(args):
     state = json.loads(sf.read_text()).get('state', 'UNKNOWN')
     if state == 'SHELL':
         print('Already at shell'); return
-    if state not in ('LOGIN', 'UNKNOWN'):
-        print(f'Unexpected state: {state} (need LOGIN)', file=sys.stderr); sys.exit(1)
+    if state == 'BOOTING':
+        _wait_state(device, 'LOGIN', 90)
+        state = json.loads(sf.read_text()).get('state', 'UNKNOWN')
+    if state not in ('LOGIN', 'PASSWORD', 'UNKNOWN'):
+        print(f'Unexpected state: {state} (need LOGIN or PASSWORD)', file=sys.stderr); sys.exit(1)
 
-    # Send username
-    _do_send(device, args.user, wait=r'Password|[\$#>]\s*$', timeout=10)
+    # Skip username if already at PASSWORD prompt
+    if state != 'PASSWORD':
+        _do_send(device, args.user, wait=r'Password|[\$#>]\s*$', timeout=10)
 
     # Check if password was requested
     state = json.loads(sf.read_text()).get('state', '') if sf.exists() else ''
@@ -1253,8 +1325,7 @@ def cmd_login(args):
         _do_send(device, args.password or '', wait=r'[\$#>]\s*$', timeout=10)
 
     # Verify shell
-    ns = argparse.Namespace(device=device, state='SHELL', timeout=5)
-    cmd_wait_state(ns)
+    _wait_state(device, 'SHELL', 15)
     state = json.loads(sf.read_text()).get('state', '?') if sf.exists() else '?'
     print(f'Logged in: state={state}')
     sys.exit(0 if state == 'SHELL' else 1)
@@ -1442,8 +1513,7 @@ def cmd_run(args):
         print(f'Board not at shell (state={state}). Run: serial-agent login {device}',
               file=sys.stderr); sys.exit(1)
     if state == 'RUNNING':
-        ns = argparse.Namespace(device=device, state='SHELL', timeout=30)
-        cmd_wait_state(ns)
+        _wait_state(device, 'SHELL', 30)
     # DEAD is ok if board had a shell prompt before (just quiet) — let the timeout decide
 
     # Encode and transfer script
@@ -1774,7 +1844,9 @@ def main():
                     help='Block until SHELL/LOGIN/PASSWORD reached')
     sp.add_argument('--setup-terminal', action='store_true',
                     help='After --wait-shell, run stty cols 220 rows 50 to prevent wrapping')
-    sp.add_argument('--timeout',    type=float, default=60.0)
+    sp.add_argument('--timeout',    type=float, default=90.0)
+    sp.add_argument('--user',       default='root', help='Login username (default: root)')
+    sp.add_argument('--password',   default=None,   help='Login password (None=skip if not prompted)')
     sp.add_argument('--json',       action='store_true')
 
     sp = sub.add_parser('auto-label',
@@ -1847,8 +1919,11 @@ def main():
     sp.add_argument('device', nargs='?', default=None)
 
     args = p.parse_args()
-    if hasattr(args, 'device') and args.device and re.match(r'^\d+$', args.device):
-        args.device = f'/dev/ttyUSB{args.device}'
+    if hasattr(args, 'device') and args.device:
+        if re.match(r'^\d+$', args.device):
+            args.device = f'/dev/ttyUSB{args.device}'
+        elif re.match(r'^tty\w+$', args.device):
+            args.device = f'/dev/{args.device}'
     args.func(args)
 
 
