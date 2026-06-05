@@ -286,9 +286,9 @@ for i in "${_disp_order[@]}"; do
         board_col="${DIM}$(printf "%-${board_w}s" "${chip}-${ser_disp}")${NC}"
     fi
     baud_col=""; [[ "$state" == "LIVE" || "$state" == "OPEN" ]] && baud_col=$(baud_display "$baud")
-    printf "  %b  %b%3d)${NC}  %b%-${dev_w}s${NC}  %b%-6s${NC}    %s  %-${chip_w}s  %-5s  %s\n" \
+    printf "  %b  %b%3d)${NC}  %b%-${dev_w}s${NC}  %b%-6s${NC}    %s  %-${chip_w}s  %b%-5s${NC}  %s\n" \
         "$sym" "$BOLD" "$row" "$dc" "$devname" "$sc" "$state" \
-        "$board_col" "$chip" "${DEVICE_IDX[$ser]:-0}-p${PORT_IDX[$dev]:-0}" "$baud_col"
+        "$board_col" "$chip" "$dc" "${DEVICE_IDX[$ser]:-0}-p${PORT_IDX[$dev]:-0}" "$baud_col"
     (( row++ ))
 done
 
