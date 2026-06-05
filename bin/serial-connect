@@ -9,6 +9,25 @@
 
 source "$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)/serial-common.sh"
 
+case "${1:-}" in
+    -h|--help)
+        cat <<EOF
+Usage: serial-connect [OPTION | /dev/ttyXXX]
+
+  (no args)        interactive port picker with live probe
+  /dev/ttyXXX      connect directly to a specific port
+  --label          interactively assign labels to connected boards
+  -h, --help       show this help
+
+Environment:
+  SERIAL_TERM      terminal to use: tio (default), screen, picocom, minicom
+  BOARD_CFG        path to serial-boards.conf (default: same dir as this script)
+
+Config: ${BOARD_CFG}
+EOF
+        exit 0 ;;
+esac
+
 SERIAL_TERM="${SERIAL_TERM:-tio}"
 
 # ── baud_valid / baud_prompt ───────────────────────────────────────────────────
