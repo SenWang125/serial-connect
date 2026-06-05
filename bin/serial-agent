@@ -557,6 +557,9 @@ def _wait_pattern(device, pattern, timeout, show=False, baseline_offset=None):
         bf.stat().st_size if bf.exists() else 0)
 
     while time.time() < deadline:
+        if not _daemon_running(device):
+            return False
+
         interval = 0.05 if (time.time() - t_start) < 1.0 else 0.2
         time.sleep(interval)
 
