@@ -273,10 +273,10 @@ for i in "${_disp_order[@]}"; do
     ROW_DEV[$row]="$dev"; ROW_BAUD[$row]="$baud"; ROW_STATE[$row]="$state"
     ROW_BY_CHIPPORT["${DEVICE_IDX[$ser]:-0}-p${PORT_IDX[$dev]:-0}"]=$row
     case "$state" in
-        LIVE) sym="${GREEN}★${NC}"; dc="$NC";  sc="${GREEN}" ;;
-        OPEN) sym="${CYAN}⊙${NC}";  dc="$CYAN"; sc="${CYAN}" ;;
-        dead) sym=" ";             dc="$DIM";  sc="$DIM"    ;;
-        FAIL) sym="${RED}✗${NC}";  dc="$RED";  sc="${RED}"   ;;
+        LIVE) sym="${GREEN}★${NC}"; dc="$NC";   sc="${GREEN}"; pc="$NC"  ;;
+        OPEN) sym="${CYAN}⊙${NC}";  dc="$CYAN"; sc="${CYAN}";  pc="$NC"  ;;
+        dead) sym=" ";             dc="$DIM";  sc="$DIM";    pc="$DIM" ;;
+        FAIL) sym="${RED}✗${NC}";  dc="$RED";  sc="${RED}";   pc="$NC"  ;;
     esac
     board_name="${BOARD_ID[$ser]:-}"
     if [[ -n "$board_name" ]]; then
@@ -288,7 +288,7 @@ for i in "${_disp_order[@]}"; do
     baud_col=""; [[ "$state" == "LIVE" || "$state" == "OPEN" ]] && baud_col=$(baud_display "$baud")
     printf "  %b  %b%3d)${NC}  %b%-${dev_w}s${NC}  %b%-6s${NC}    %s  %-${chip_w}s  %b%-5s${NC}  %s\n" \
         "$sym" "$BOLD" "$row" "$dc" "$devname" "$sc" "$state" \
-        "$board_col" "$chip" "$dc" "${DEVICE_IDX[$ser]:-0}-p${PORT_IDX[$dev]:-0}" "$baud_col"
+        "$board_col" "$chip" "$pc" "${DEVICE_IDX[$ser]:-0}-p${PORT_IDX[$dev]:-0}" "$baud_col"
     (( row++ ))
 done
 
