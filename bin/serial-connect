@@ -162,18 +162,8 @@ fi
 
 (( ${#DEVS[@]} == 0 )) && { echo -e "${RED}No serial ports found.${NC}" >&2; exit 1; }
 
-# ── BOARD_ID map ───────────────────────────────────────────────────────────────
-declare -A BOARD_ID
-for i in "${!DEVS[@]}"; do
-    ser="${SERS[$i]}"
-    if [[ -n "${CFG_LABEL[$ser]:-}" ]]; then
-        BOARD_ID[$ser]="${CFG_LABEL[$ser]}"
-    elif [[ -z "${BOARD_ID[$ser]+x}" ]]; then
-        IFS='|' read -r _r _b cap \
-            <<< "$(cat "$PROBE_DIR/$(basename "${DEVS[$i]}")" 2>/dev/null || echo 'FAIL||')"
-        [[ ( "$_r" == "LIVE" || "$_r" == "OPEN" ) && -n "$cap" ]] && BOARD_ID[$ser]="$cap"
-    fi
-done
+build_board_ids
+build_active_ser
 
 # ── Label mode ────────────────────────────────────────────────────────────────
 if [[ "${1:-}" == "--label" ]]; then
@@ -258,13 +248,6 @@ printf "  ${BOLD}%-1s  %-4s  %-${dev_w}s  %-6s    %-${board_w}s  %-${chip_w}s  %
 printf '─%.0s' $(seq 1 "$rule_w"); echo
 
 display_order
-declare -A _active_ser
-for i in "${_disp_order[@]}"; do
-    IFS='|' read -r _rs _ _ \
-        <<< "$(cat "$PROBE_DIR/$(basename "${DEVS[$i]}")" 2>/dev/null || echo 'FAIL||')"
-    [[ "$_rs" == "LIVE" || "$_rs" == "OPEN" ]] && _active_ser[${SERS[$i]}]=1
-done
-
 row=1; prev_ser="__unset__"
 declare -a ROW_DEV ROW_BAUD ROW_STATE
 declare -A ROW_BY_CHIPPORT   # "N-pM" → row number
@@ -289,20 +272,18 @@ for i in "${_disp_order[@]}"; do
         FAIL) sym="${RED}✗${NC}";  dc="$RED";  sc="${RED}";   pc="$NC"  ;;
     esac
     board_name="${BOARD_ID[$ser]:-}"
-    if [[ -n "$board_name" ]]; then
-        if [[ -n "${_active_ser[$ser]+x}" ]]; then
-            board_col=$(printf "%-${board_w}s" "$board_name")
-        else
-            board_col="${DIM}$(printf "%-${board_w}s" "$board_name")${NC}"
-        fi
+    [[ -z "$board_name" ]] && { ser_disp="${ser}"; (( ${#ser} > 12 )) && ser_disp="${ser:0:10}"; board_name="${chip}-${ser_disp}"; }
+    if [[ -n "${_active_ser[$ser]+x}" ]]; then
+        board_col=$(printf "%-${board_w}s" "$board_name")
+        chip_col="$chip"
     else
-        ser_disp="${ser}"; (( ${#ser} > 12 )) && ser_disp="${ser:0:10}"
-        board_col="${DIM}$(printf "%-${board_w}s" "${chip}-${ser_disp}")${NC}"
+        board_col="${DIM}$(printf "%-${board_w}s" "$board_name")${NC}"
+        chip_col="${DIM}${chip}${NC}"
     fi
     baud_col=""; [[ "$state" == "LIVE" || "$state" == "OPEN" ]] && baud_col=$(baud_display "$baud")
     printf "  %b  %b%3d)${NC}  %b%-${dev_w}s${NC}  %b%-6s${NC}    %s  %-${chip_w}s  %b%-5s${NC}  %s\n" \
         "$sym" "$BOLD" "$row" "$dc" "$devname" "$sc" "$state" \
-        "$board_col" "$chip" "$pc" "${DEVICE_IDX[$ser]:-0}-p${PORT_IDX[$dev]:-0}" "$baud_col"
+        "$board_col" "$chip_col" "$pc" "${DEVICE_IDX[$ser]:-0}-p${PORT_IDX[$dev]:-0}" "$baud_col"
     (( row++ ))
 done
 

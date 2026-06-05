@@ -22,18 +22,8 @@ trap 'rm -rf "$PROBE_DIR"' EXIT
 run_probes "${!DEVS[@]}"
 save_cache "$PROBE_DIR"
 
-# ── BOARD_ID: best known name per USB serial (label > probed hostname) ─────────
-declare -A BOARD_ID
-for i in "${!DEVS[@]}"; do
-    ser="${SERS[$i]}"
-    if [[ -n "${CFG_LABEL[$ser]:-}" ]]; then
-        BOARD_ID[$ser]="${CFG_LABEL[$ser]}"
-    elif [[ -z "${BOARD_ID[$ser]+x}" ]]; then
-        IFS='|' read -r _r _b cap \
-            <<< "$(cat "$PROBE_DIR/$(basename "${DEVS[$i]}")" 2>/dev/null || echo 'FAIL||')"
-        [[ "$_r" == "LIVE" && -n "$cap" ]] && BOARD_ID[$ser]="$cap"
-    fi
-done
+build_board_ids
+build_active_ser
 
 # ── Dynamic column widths ───────────────────────────────────────────────────────
 dev_w=6; chip_w=6
@@ -134,13 +124,6 @@ printf "  ${BOLD}%-1s  %-${dev_w}s  %-6s    %-${board_w}s  %-${chip_w}s  %-5s  %
 printf '─%.0s' $(seq 1 "$rule_w"); echo
 
 display_order
-declare -A _active_ser
-for i in "${_disp_order[@]}"; do
-    IFS='|' read -r _rs _ _ \
-        <<< "$(cat "$PROBE_DIR/$(basename "${DEVS[$i]}")" 2>/dev/null || echo 'FAIL||')"
-    [[ "$_rs" == "LIVE" || "$_rs" == "OPEN" ]] && _active_ser[${SERS[$i]}]=1
-done
-
 prev_ser="__unset__"
 for i in "${_disp_order[@]}"; do
     dev="${DEVS[$i]}"; devname=$(basename "$dev")
@@ -163,15 +146,13 @@ for i in "${_disp_order[@]}"; do
     esac
 
     board_name="${BOARD_ID[$ser]:-}"
-    if [[ -n "$board_name" ]]; then
-        if [[ -n "${_active_ser[$ser]+x}" ]]; then
-            board_col=$(printf "%-${board_w}s" "$board_name")
-        else
-            board_col="${DIM}$(printf "%-${board_w}s" "$board_name")${NC}"
-        fi
+    [[ -z "$board_name" ]] && { ser_disp="${ser}"; (( ${#ser} > 12 )) && ser_disp="${ser:0:10}"; board_name="${chip}-${ser_disp}"; }
+    if [[ -n "${_active_ser[$ser]+x}" ]]; then
+        board_col=$(printf "%-${board_w}s" "$board_name")
+        chip_col="$chip"
     else
-        ser_disp="${ser}"; (( ${#ser} > 12 )) && ser_disp="${ser:0:10}"
-        board_col="${DIM}$(printf "%-${board_w}s" "${chip}-${ser_disp}")${NC}"
+        board_col="${DIM}$(printf "%-${board_w}s" "$board_name")${NC}"
+        chip_col="${DIM}${chip}${NC}"
     fi
 
     baud_col=""
@@ -180,7 +161,7 @@ for i in "${_disp_order[@]}"; do
 
     printf "  %b  %b%-${dev_w}s${NC}  %b%-6s${NC}    %s  %-${chip_w}s  %-5s  %b\n" \
         "$sym" "$dc" "$devname" "$sc" "$state" \
-        "$board_col" "$chip" "${DEVICE_IDX[$ser]:-0}-p${PORT_IDX[$dev]:-0}" "$baud_col"
+        "$board_col" "$chip_col" "${DEVICE_IDX[$ser]:-0}-p${PORT_IDX[$dev]:-0}" "$baud_col"
 done
 
 (( ${#DEVS[@]} == 0 )) && echo -e "${RED}No serial devices found.${NC}"

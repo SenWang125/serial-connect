@@ -359,6 +359,37 @@ port_indices() {
     done
 }
 
+# ── build_board_ids ───────────────────────────────────────────────────────────
+# Populate BOARD_ID[serial]: config label > probed hostname (LIVE or OPEN).
+# Requires PROBE_DIR, DEVS, SERS, CFG_LABEL.
+build_board_ids() {
+    declare -gA BOARD_ID=()
+    local i ser _r _b cap
+    for i in "${!DEVS[@]}"; do
+        ser="${SERS[$i]}"
+        if [[ -n "${CFG_LABEL[$ser]:-}" ]]; then
+            BOARD_ID[$ser]="${CFG_LABEL[$ser]}"
+        elif [[ -z "${BOARD_ID[$ser]+x}" ]]; then
+            IFS='|' read -r _r _b cap \
+                <<< "$(cat "$PROBE_DIR/$(basename "${DEVS[$i]}")" 2>/dev/null || echo 'FAIL||')"
+            [[ ( "$_r" == "LIVE" || "$_r" == "OPEN" ) && -n "$cap" ]] && BOARD_ID[$ser]="$cap"
+        fi
+    done
+}
+
+# ── build_active_ser ──────────────────────────────────────────────────────────
+# Populate _active_ser[serial]=1 for any serial with at least one LIVE/OPEN port.
+# Requires PROBE_DIR, DEVS, SERS.
+build_active_ser() {
+    declare -gA _active_ser=()
+    local i rs
+    for i in "${!DEVS[@]}"; do
+        IFS='|' read -r rs _ _ \
+            <<< "$(cat "$PROBE_DIR/$(basename "${DEVS[$i]}")" 2>/dev/null || echo 'FAIL||')"
+        [[ "$rs" == "LIVE" || "$rs" == "OPEN" ]] && _active_ser[${SERS[$i]}]=1
+    done
+}
+
 # ── display_order ─────────────────────────────────────────────────────────────
 # Populate _disp_order array: indices sorted by (first-occurrence serial, interface).
 # Keeps multi-port adapters grouped even when another device grabs a ttyUSBN in between.
