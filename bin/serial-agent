@@ -645,6 +645,9 @@ def cmd_stop(args):
             pid = int(pf.read_text().strip())
             os.kill(pid, signal.SIGTERM)
             killed.append(pid)
+            for _ in range(30):   # wait up to 3s for clean exit
+                try: os.kill(pid, 0); time.sleep(0.1)
+                except OSError: break
         except (OSError, ValueError):
             pass
         pf.unlink(missing_ok=True)
@@ -813,6 +816,8 @@ def _send_impl(args):
     # Retry briefly if the daemon's _writer thread isn't ready yet.
     sent = False
     for attempt in range(20):   # up to 2s (20 × 0.1s)
+        if not _daemon_running(args.device):
+            print(f'no daemon for {args.device}', file=sys.stderr); sys.exit(1)
         try:
             fd = os.open(str(fifo), os.O_WRONLY | os.O_NONBLOCK)
             try:
@@ -1251,8 +1256,8 @@ def cmd_reboot(args):
     device = args.device
 
     # Send the reboot command — don't wait for prompt (shell dies immediately)
-    fifo = devdir(device) / 'input.fifo'
-    if fifo.exists():
+    if _daemon_running(device):
+        fifo = devdir(device) / 'input.fifo'
         cmd_bytes = (args.cmd + '\n').encode()
         for _ in range(20):
             try:
@@ -1516,7 +1521,8 @@ def cmd_run(args):
         print(f'Board not at shell (state={state}). Run: serial-agent login {device}',
               file=sys.stderr); sys.exit(1)
     if state == 'RUNNING':
-        _wait_state(device, 'SHELL', 30)
+        if not _wait_state(device, 'SHELL', 30, print_output=False):
+            print(f'Board stuck in RUNNING state on {device}', file=sys.stderr); sys.exit(1)
     # DEAD is ok if board had a shell prompt before (just quiet) — let the timeout decide
 
     # Encode and transfer script
