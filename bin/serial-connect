@@ -60,7 +60,7 @@ launch() {
     case "${SERIAL_TERM}" in
         tio)
             command -v tio &>/dev/null || { echo "tio not found: sudo apt install tio" >&2; exit 1; }
-            local sock="/tmp/$(basename "$dev").sock"
+            local sock="/tmp/$(basename "$dev")-${USER}.sock"
             local tio_target="${agent_tcp:+tcp:$agent_tcp}"; tio_target="${tio_target:-$dev}"
             echo -e "\n${GREEN}→${NC} tio $tio_target @ $(baud_display "$baud")  ${DIM}(Ctrl-T Q to quit)${NC}"
             echo -e "  ${DIM}Share: socat - UNIX-CONNECT:$sock${NC}\n"
