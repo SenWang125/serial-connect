@@ -41,6 +41,22 @@ baud_prompt() {
     [[ "$d" != "$b" ]] && echo "Baud [$b or $d]" || echo "Baud [$b]"
 }
 
+# ── lock helpers ──────────────────────────────────────────────────────────────
+LOCK_DIR="/tmp/serial-connect-locks"
+
+_lock_acquire() {
+    local dev="$1"
+    mkdir -p "$LOCK_DIR" && chmod 1777 "$LOCK_DIR" 2>/dev/null || true
+    printf '%s\n%s\n' "$$" "$USER" > "$LOCK_DIR/$(basename "$dev")"
+}
+
+_lock_release() {
+    local dev="$1"
+    local lockfile="$LOCK_DIR/$(basename "$dev")"
+    local lock_pid; lock_pid=$(awk 'NR==1' "$lockfile" 2>/dev/null)
+    [[ "$lock_pid" == "$$" ]] && rm -f "$lockfile"
+}
+
 # ── launch ─────────────────────────────────────────────────────────────────────
 launch() {
     local dev="$1" baud="$2"
@@ -64,6 +80,8 @@ launch() {
             local tio_target="${agent_tcp:+tcp:$agent_tcp}"; tio_target="${tio_target:-$dev}"
             echo -e "\n${GREEN}→${NC} tio $tio_target @ $(baud_display "$baud")  ${DIM}(Ctrl-T Q to quit)${NC}"
             echo -e "  ${DIM}Share: socat - UNIX-CONNECT:$sock${NC}\n"
+            _lock_acquire "$dev"
+            trap '_lock_release "$dev"' EXIT INT TERM
             tio -b "$baud" -S "unix:$sock" "$tio_target" || {
                 echo -e "\n${YELLOW}⚠${NC}  Port is in use by another user."
                 echo -e "  ${DIM}To force-close: sudo fuser -k $dev${NC}"
@@ -76,16 +94,22 @@ launch() {
             local sname; sname="$(basename "$dev")"
             echo -e "\n${GREEN}→${NC} screen $dev @ $(baud_display "$baud")  ${DIM}(Ctrl-A K to kill)${NC}"
             echo -e "  ${DIM}Share: screen -x $sname${NC}\n"
-            exec screen -S "$sname" "$dev" "$baud"
+            _lock_acquire "$dev"
+            trap '_lock_release "$dev"' EXIT INT TERM
+            screen -S "$sname" "$dev" "$baud"
             ;;
         picocom)
             command -v picocom &>/dev/null || { echo "picocom not found" >&2; exit 1; }
             echo -e "\n${GREEN}→${NC} picocom $dev @ $(baud_display "$baud")  ${DIM}(Ctrl-A Ctrl-X to exit)${NC}\n"
-            exec picocom -b "$baud" --imap lfcrnl "$dev"
+            _lock_acquire "$dev"
+            trap '_lock_release "$dev"' EXIT INT TERM
+            picocom -b "$baud" --imap lfcrnl "$dev"
             ;;
         minicom|*)
             echo -e "\n${GREEN}→${NC} minicom $dev @ $(baud_display "$baud")  ${DIM}(Ctrl-A X to exit)${NC}\n"
-            exec minicom -D "$dev" -b "$baud" -w -c on
+            _lock_acquire "$dev"
+            trap '_lock_release "$dev"' EXIT INT TERM
+            minicom -D "$dev" -b "$baud" -w -c on
             ;;
     esac
 }

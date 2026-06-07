@@ -132,9 +132,16 @@ probe_tty() {
     local dev="$1" cfg_baud="${2:-${PROBE_BAUDS[0]}}"
 
     local _agent_status="/tmp/serial-agent/$(basename "$dev")/status.json"
+    local _lockfile="/tmp/serial-connect-locks/$(basename "$dev")"
+    local _lock_alive=0
+    if [[ -f "$_lockfile" ]]; then
+        local _lock_pid; _lock_pid=$(awk 'NR==1' "$_lockfile" 2>/dev/null)
+        [[ -n "$_lock_pid" ]] && kill -0 "$_lock_pid" 2>/dev/null && _lock_alive=1 || rm -f "$_lockfile"
+    fi
     { fuser "$dev" &>/dev/null 2>&1 \
         || sudo -n fuser "$dev" &>/dev/null 2>&1 \
-        || [[ -f "$_agent_status" ]]; } \
+        || [[ -f "$_agent_status" ]] \
+        || (( _lock_alive )); } \
         && { printf 'OPEN|%s|\n' "$cfg_baud"; return; }
 
     local fd
