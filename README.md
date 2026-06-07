@@ -16,20 +16,37 @@ cd serial-connect
 ./install.sh
 ```
 
-Files go to `~/.serial-connect/`. The three tools are symlinked into `~/.local/bin/` which is in PATH on modern Linux — no extra setup needed.
+The installer asks whether to install for the current user or system-wide:
+
+| Scope | Files | Symlinks | Requires |
+|---|---|---|---|
+| Local (default) | `~/.serial-connect/` | `~/.local/bin/` | nothing |
+| Global | `/usr/local/share/serial-connect/` | `/usr/local/bin/` | sudo |
 
 ```bash
-./install.sh --term tio              # set default terminal (recommended)
-./install.sh --term tio,screen       # install multiple
-sudo ./install.sh /usr/local/bin     # system-wide
+./install.sh --local                 # current user only (default)
+sudo ./install.sh --global           # all users, system-wide
+./install.sh --term tio              # set default terminal non-interactively
+./install.sh --term tio,screen       # install multiple terminals
 ```
 
-Uninstall:
+**Serial port access (udev rules)**
+
+The installer sets up a udev rule that gives all users access to `/dev/ttyUSB*` and `/dev/ttyACM*` without needing the `dialout` group or a re-login. It also prevents ModemManager from locking ports.
+
+If you don't have sudo (e.g. installing as a guest user), the installer will print the command for an admin to run once:
 ```bash
-./uninstall.sh    # removes ~/.serial-connect/ and the symlinks
+sudo cp udev/99-serial-connect.rules /etc/udev/rules.d/
+sudo udevadm control --reload-rules && sudo udevadm trigger
 ```
 
-**Requirements:** bash ≥ 5.1, python3, user in `dialout` group
+**Uninstall:**
+```bash
+./uninstall.sh              # removes local install (~/.serial-connect/)
+sudo ./uninstall.sh --global  # removes global install + udev rules
+```
+
+**Requirements:** bash ≥ 5.1, python3
 **Optional:** `tio`, `screen`, `ser2net`, `inotify-tools`
 
 ---
@@ -149,7 +166,7 @@ Run `serial-agent --help` for the full command list.
 
 ## Configuration
 
-`~/.serial-connect/serial-boards.conf` — open it to see all options with inline docs.
+`~/.serial-connect/serial-boards.conf` (local install) or `/etc/serial-boards.conf` (global install) — open it to see all options with inline docs.
 
 Label boards by USB serial number (stable across reboots and re-enumeration):
 ```
