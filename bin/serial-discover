@@ -149,17 +149,17 @@ for i in "${_disp_order[@]}"; do
     [[ -z "$board_name" ]] && { ser_disp="${ser}"; (( ${#ser} > 12 )) && ser_disp="${ser:0:10}"; board_name="${chip}-${ser_disp}"; }
     if [[ -n "${_active_ser[$ser]+x}" ]]; then
         board_col=$(printf "%-${board_w}s" "$board_name")
-        chip_col="$chip"
+        chip_col=$(printf "%-${chip_w}s" "$chip")
     else
         board_col="${DIM}$(printf "%-${board_w}s" "$board_name")${NC}"
-        chip_col="${DIM}${chip}${NC}"
+        chip_col="${DIM}$(printf "%-${chip_w}s" "$chip")${NC}"
     fi
 
     baud_col=""
     [[ "$state" == "LIVE" || "$state" == "OPEN" ]] && baud_col=$(baud_display "$baud")
     [[ -n "$alias" ]] && baud_col+="${baud_col:+ }${CYAN}→${alias}${NC}"
 
-    printf "  %b  %b%-${dev_w}s${NC}  %b%-6s${NC}    %s  %-${chip_w}s  %-5s  %b\n" \
+    printf "  %b  %b%-${dev_w}s${NC}  %b%-6s${NC}    %s  %s  %-5s  %b\n" \
         "$sym" "$dc" "$devname" "$sc" "$state" \
         "$board_col" "$chip_col" "${DEVICE_IDX[$ser]:-0}-p${PORT_IDX[$dev]:-0}" "$baud_col"
 done
