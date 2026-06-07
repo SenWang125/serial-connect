@@ -330,6 +330,7 @@ while true; do
         local _holder_uid; _holder_uid=$(fuser "${ROW_DEV[$choice]}" 2>/dev/null | tr ' ' '\n' | grep -E '^[0-9]+$' | head -1 | xargs -I{} awk -F: 'NR==1{print $9}' /proc/{}/status 2>/dev/null | head -1)
         if [[ -n "$_holder_uid" && "$_holder_uid" != "$(id -u)" ]] && ! sudo -n true 2>/dev/null; then
             echo -e "  ${YELLOW}⚠${NC}  Port held by another user — cannot force-close."
+            echo -e "  ${DIM}To force-close: sudo fuser -k ${ROW_DEV[$choice]}${NC}"
             echo ""
             continue
         fi
