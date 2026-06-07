@@ -280,7 +280,8 @@ if [[ ":$PATH:" != *":$LINK_DIR:"* ]]; then
     else
         LINE="export PATH=\"\$HOME/.local/bin:\$PATH\""
         grep -qxF "$LINE" "$HOME/.bashrc" 2>/dev/null || echo "$LINE" >> "$HOME/.bashrc"
-        green "  ✓ added $LINK_DIR to ~/.bashrc — open a new terminal to use serial-connect"
+        green "  ✓ added $LINK_DIR to ~/.bashrc"
+        dim   "    Run: source ~/.bashrc  or open a new terminal"
     fi
 fi
 
