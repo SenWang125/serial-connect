@@ -672,6 +672,12 @@ class Daemon:
         """
         self.pid_file.write_text(str(os.getpid()))
         self._write_status()
+        self._lock_file = Path('/tmp/serial-connect-locks') / Path(self.device).name
+        try:
+            self._lock_file.parent.mkdir(mode=0o1777, exist_ok=True)
+            self._lock_file.write_text(f'{os.getpid()}\n{os.environ.get("USER", "")}\n')
+        except OSError:
+            self._lock_file = None
         if not self.fifo_file.exists():
             os.mkfifo(self.fifo_file)
         signal.signal(signal.SIGTERM, lambda *_: self._stop.set())
@@ -730,6 +736,9 @@ class Daemon:
                     self._fd = None
 
         self.pid_file.unlink(missing_ok=True)
+        if getattr(self, '_lock_file', None):
+            try: self._lock_file.unlink(missing_ok=True)
+            except OSError: pass
         print('[serial-agent] stopped', flush=True)
 
 
@@ -2096,10 +2105,17 @@ def cmd_list(args):
         print(json.dumps([{'device': f'/dev/{r[0]}', 'state': r[1], 'via': r[2],
                            'buf_lines': r[3], 'prompt': r[4]} for r in rows], indent=2))
         return
-    print(f"{'Device':<14} {'State':<9} {'Via':<22} {'Buf':>5}  Prompt")
-    print('─' * 70)
+    G='\033[32m'; C='\033[36m'; Y='\033[33m'; D='\033[2m'; R='\033[31m'; B='\033[1m'; N='\033[0m'
+    def _state_fmt(s):
+        if s in ('SHELL', 'RUNNING'):   return f'{G}{s:<9}{N}'
+        if s in ('UBOOT', 'BOOTING'):   return f'{Y}{s:<9}{N}'
+        if s in ('LOGIN', 'PASSWORD'):  return f'{C}{s:<9}{N}'
+        if s == 'DEAD':                 return f'{R}{s:<9}{N}'
+        return f'{D}{s:<9}{N}'
+    print(f'{B}{"Device":<14} {"State":<9} {"Via":<28} {"Buf":>5}  Prompt{N}')
+    print('─' * 74)
     for name, state, via, buf_lines, prompt in rows:
-        print(f'{name:<14} {state:<9} {via:<22} {buf_lines:>5}  {prompt}')
+        print(f'{name:<14} {_state_fmt(state)} {via:<28} {buf_lines:>5}  {D}{prompt}{N}')
 
 
 def cmd_attach(args):
