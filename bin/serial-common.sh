@@ -131,16 +131,21 @@ get_baud() { local vid="${1%%:*}"; echo "${CFG_BAUD[$2]:-${CHIP_BAUD[$1]:-${CHIP
 probe_tty() {
     local dev="$1" cfg_baud="${2:-${PROBE_BAUDS[0]}}"
 
-    local _agent_status="/tmp/serial-agent/$(basename "$dev")/status.json"
-    local _lockfile="/tmp/serial-connect-locks/$(basename "$dev")"
-    local _lock_alive=0
+    local _devname; _devname=$(basename "$dev")
+    local _lockfile="/tmp/serial-connect-locks/$_devname"
+    local _agent_pidfile="/tmp/serial-agent/$_devname/daemon.pid"
+    local _lock_alive=0 _agent_alive=0
     if [[ -f "$_lockfile" ]]; then
         local _lock_pid; _lock_pid=$(awk 'NR==1' "$_lockfile" 2>/dev/null)
         [[ -n "$_lock_pid" ]] && kill -0 "$_lock_pid" 2>/dev/null && _lock_alive=1 || rm -f "$_lockfile"
     fi
+    if [[ -f "$_agent_pidfile" ]]; then
+        local _a_pid; _a_pid=$(cat "$_agent_pidfile" 2>/dev/null)
+        [[ -n "$_a_pid" ]] && kill -0 "$_a_pid" 2>/dev/null && _agent_alive=1
+    fi
     { fuser "$dev" &>/dev/null 2>&1 \
         || sudo -n fuser "$dev" &>/dev/null 2>&1 \
-        || [[ -f "$_agent_status" ]] \
+        || (( _agent_alive )) \
         || (( _lock_alive )); } \
         && { printf 'OPEN|%s|\n' "$cfg_baud"; return; }
 
