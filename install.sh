@@ -1,44 +1,33 @@
 #!/usr/bin/env bash
 # install.sh — Install serial-connect tools
 #
-# Installs all files into ~/.serial-connect/ and symlinks the three CLI tools
-# into ~/.local/bin/ (already in PATH on modern Linux — no PATH changes needed).
-#
 # Usage:
-#   ./install.sh                         # interactive (asks terminal preference)
-#   ./install.sh --term tio              # non-interactive: tio (recommended)
-#   ./install.sh --term screen           # non-interactive: screen
-#   ./install.sh --term minicom          # non-interactive: minicom
-#   ./install.sh --term picocom          # non-interactive: picocom
-#   sudo ./install.sh --global           # system-wide (all users, requires sudo)
+#   ./install.sh                    # interactive
+#   ./install.sh --term tio         # non-interactive, tio as default terminal
+#   ./install.sh --local            # current user only (default)
+#   sudo ./install.sh --global      # all users (/usr/local/bin)
 
 set -euo pipefail
 
 INSTALL_DIR=""
 TERM_CHOICE=""
 GLOBAL=0
+SCOPE_SET=0
 
 # ── Parse args ─────────────────────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --global)  GLOBAL=1; shift ;;
+        --global)  GLOBAL=1; SCOPE_SET=1; shift ;;
+        --local)   GLOBAL=0; SCOPE_SET=1; shift ;;
         --term)    TERM_CHOICE="$2"; shift 2 ;;
         --term=*)  TERM_CHOICE="${1#--term=}"; shift ;;
-        --help|-h) echo "Usage: ./install.sh [--global] [--term tio|screen|minicom|picocom]"; exit 0 ;;
+        --help|-h)
+            echo "Usage: ./install.sh [--local|--global] [--term tio|screen|minicom|picocom]"
+            exit 0 ;;
         *)         INSTALL_DIR="$1"; shift ;;
     esac
 done
 
-if (( GLOBAL )); then
-    (( EUID == 0 )) || { echo "Global install requires sudo."; exit 1; }
-    INSTALL_DIR="${INSTALL_DIR:-/usr/local/share/serial-connect}"
-    LINK_DIR="/usr/local/bin"
-    CONF_FILE="/etc/serial-boards.conf"
-else
-    INSTALL_DIR="${INSTALL_DIR:-$HOME/.serial-connect}"
-    LINK_DIR="$HOME/.local/bin"
-    CONF_FILE="${INSTALL_DIR}/serial-boards.conf"
-fi
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # ── Colour helpers ─────────────────────────────────────────────────────────────
@@ -47,6 +36,38 @@ green()  { printf '\033[32m%s\033[0m\n' "$*"; }
 yellow() { printf '\033[33m%s\033[0m\n' "$*"; }
 red()    { printf '\033[31m%s\033[0m\n' "$*"; }
 dim()    { printf '\033[2m%s\033[0m\n'  "$*"; }
+
+echo ""
+bold "serial-connect installer"
+echo "========================"
+echo ""
+
+# ── Scope prompt ───────────────────────────────────────────────────────────────
+if [[ -t 0 && $SCOPE_SET -eq 0 ]]; then
+    bold "Install scope"
+    echo ""
+    echo "  1) Current user only  (~/.local/bin, no sudo needed)  [default]"
+    echo "  2) All users          (/usr/local/bin, requires sudo)"
+    echo ""
+    read -rp "  Choice [1/2]: " _scope || _scope="1"
+    [[ "${_scope:-1}" == "2" ]] && GLOBAL=1
+fi
+
+if (( GLOBAL )); then
+    (( EUID == 0 )) || { red "Global install requires sudo. Re-run: sudo ./install.sh --global"; exit 1; }
+    INSTALL_DIR="${INSTALL_DIR:-/usr/local/share/serial-connect}"
+    LINK_DIR="/usr/local/bin"
+    CONF_FILE="/etc/serial-boards.conf"
+else
+    INSTALL_DIR="${INSTALL_DIR:-$HOME/.serial-connect}"
+    LINK_DIR="$HOME/.local/bin"
+    CONF_FILE="${INSTALL_DIR}/serial-boards.conf"
+fi
+
+# ── Sudo availability ──────────────────────────────────────────────────────────
+HAS_SUDO=0
+(( EUID == 0 )) && HAS_SUDO=1
+(( HAS_SUDO )) || sudo -n true 2>/dev/null && HAS_SUDO=1 || true
 
 # ── Package manager detection ──────────────────────────────────────────────────
 pkg_install_cmd() {
@@ -62,28 +83,22 @@ pkg_install_cmd() {
 try_install() {
     local pkg="$1"
     local cmd; cmd="$(pkg_install_cmd "$pkg")"
-    echo "  Running: $cmd"
     if eval "$cmd" &>/dev/null; then
         green "  ✓ installed $pkg"; return 0
     else
-        yellow "  Could not auto-install. Run manually: $cmd"; return 1
+        return 1
     fi
 }
 
-# ── Header ─────────────────────────────────────────────────────────────────────
+# ── Required dependencies ──────────────────────────────────────────────────────
 echo ""
-bold "serial-connect installer"
-echo "========================"
-echo ""
-
-# ── Required dependencies ─────────────────────────────────────────────────────
 bold "Checking required dependencies..."
 echo ""
 
 ABORT=0
 
 if (( BASH_VERSINFO[0] < 5 || (BASH_VERSINFO[0] == 5 && BASH_VERSINFO[1] < 1) )); then
-    yellow "  ⚠ bash ${BASH_VERSION} — bash ≥ 5.1 recommended (event-driven wait-state)"
+    yellow "  ⚠ bash ${BASH_VERSION} — bash ≥ 5.1 recommended"
 else
     green  "  ✓ bash ${BASH_VERSION}"
 fi
@@ -100,35 +115,55 @@ if command -v fuser &>/dev/null; then
     green  "  ✓ fuser"
 else
     yellow "  ⚠ fuser not found — install psmisc for port-ownership detection"
-    echo   "    $(pkg_install_cmd psmisc)"
-fi
-
-if id -nG | grep -qw dialout; then
-    green  "  ✓ dialout group"
-else
-    yellow "  ⚠ user '$(id -un)' not in dialout group (needed to access /dev/ttyUSB* without sudo)"
-    if [[ -t 0 ]]; then
-        read -rp "    Add to dialout now? [Y/n]: " yn || yn="y"
-        if [[ "${yn,,}" != "n" ]]; then
-            if sudo usermod -aG dialout "$USER"; then
-                green "  ✓ added to dialout — re-login required for it to take effect"
-            else
-                yellow "    Could not add automatically. Run: sudo usermod -aG dialout \$USER"
-            fi
-        fi
-    else
-        yellow "    Run: sudo usermod -aG dialout \$USER  (then log out/in)"
-    fi
+    dim    "    $(pkg_install_cmd psmisc)"
 fi
 
 if [[ $ABORT -ne 0 ]]; then
     echo ""; red "Required dependencies missing — install them and re-run."; exit 1
 fi
 
-# ── Terminal emulator selection ────────────────────────────────────────────────
-# Supports --term as comma-separated list: --term tio,screen
-# tio is the default terminal for serial-connect; others are also installed.
+# ── Serial port access (udev rules) ───────────────────────────────────────────
+echo ""
+bold "Serial port access"
+echo ""
 
+UDEV_DEST="/etc/udev/rules.d/99-serial-connect.rules"
+UDEV_SRC="$SCRIPT_DIR/udev/99-serial-connect.rules"
+
+if [[ -f "$UDEV_DEST" ]]; then
+    green "  ✓ udev rules already installed"
+elif (( HAS_SUDO )); then
+    if sudo cp "$UDEV_SRC" "$UDEV_DEST" \
+        && sudo udevadm control --reload-rules \
+        && sudo udevadm trigger 2>/dev/null; then
+        green "  ✓ udev rules installed — all users can access serial ports, no re-login needed"
+    else
+        yellow "  ⚠ udev rules install failed"
+        dim    "    Run manually: sudo cp $UDEV_SRC $UDEV_DEST"
+        dim    "                  sudo udevadm control --reload-rules"
+    fi
+elif [[ -t 0 ]]; then
+    echo "  udev rules give all users access to /dev/ttyUSB* without sudo or re-login."
+    read -rp "  Install now? (requires sudo once) [Y/n]: " yn || yn="y"
+    if [[ "${yn,,}" != "n" ]]; then
+        if sudo cp "$UDEV_SRC" "$UDEV_DEST" \
+            && sudo udevadm control --reload-rules \
+            && sudo udevadm trigger 2>/dev/null; then
+            green "  ✓ udev rules installed"
+        else
+            yellow "  ⚠ could not install udev rules"
+            dim    "    Run manually: sudo cp $UDEV_SRC $UDEV_DEST"
+            dim    "                  sudo udevadm control --reload-rules"
+        fi
+    else
+        dim "  Skipped. You may need to run serial-connect with sudo or be in the dialout group."
+    fi
+else
+    yellow "  ⚠ udev rules not installed — serial port access may require sudo"
+    dim    "  Install later: sudo cp $UDEV_SRC $UDEV_DEST && sudo udevadm control --reload-rules"
+fi
+
+# ── Terminal emulator selection ────────────────────────────────────────────────
 echo ""
 bold "Terminal emulators"
 echo ""
@@ -143,11 +178,10 @@ echo "    4) picocom  Minimal, lightweight"
 echo ""
 
 declare -A TERM_PKGS=([tio]=tio [screen]=screen [minicom]=minicom [picocom]=picocom)
-TERM_ORDER=(tio screen minicom picocom)
 declare -a TERMS_TO_INSTALL=()
+declare -a MISSING_PKGS=()
 
 if [[ -n "$TERM_CHOICE" ]]; then
-    # Non-interactive: parse comma-separated --term list
     IFS=',' read -ra _choices <<< "$TERM_CHOICE"
     for c in "${_choices[@]}"; do
         c="${c// /}"
@@ -155,7 +189,6 @@ if [[ -n "$TERM_CHOICE" ]]; then
         TERMS_TO_INSTALL+=("$c")
     done
 elif [[ -t 0 ]]; then
-    # Interactive: multi-select
     while true; do
         read -rp "  Choice [1-4, comma-separated, default=1,2]: " input
         input="${input:-1,2}"
@@ -174,28 +207,30 @@ elif [[ -t 0 ]]; then
         done
         [[ $valid -eq 1 && ${#TERMS_TO_INSTALL[@]} -gt 0 ]] && break
     done
-    # Deduplicate
-    declare -a _dedup=()
-    declare -A _seen=()
+    declare -a _dedup=(); declare -A _seen=()
     for t in "${TERMS_TO_INSTALL[@]}"; do
         [[ -z "${_seen[$t]+x}" ]] && _dedup+=("$t") && _seen[$t]=1
     done
     TERMS_TO_INSTALL=("${_dedup[@]}")
 else
-    # Non-interactive with no --term: default to tio
     TERMS_TO_INSTALL=(tio)
 fi
 
-# The first entry is the default for serial-connect
 TERM_CHOICE="${TERMS_TO_INSTALL[0]}"
 
 echo ""
 for t in "${TERMS_TO_INSTALL[@]}"; do
     if command -v "$t" &>/dev/null; then
         green "  ✓ $t already installed"
-    else
+    elif (( HAS_SUDO )); then
         yellow "  $t not installed — installing..."
-        try_install "${TERM_PKGS[$t]}" || true
+        try_install "${TERM_PKGS[$t]}" || {
+            yellow "  ⚠ could not install $t"
+            MISSING_PKGS+=("${TERM_PKGS[$t]}")
+        }
+    else
+        dim "  $t not installed (no sudo — install later: $(pkg_install_cmd "${TERM_PKGS[$t]}"))"
+        MISSING_PKGS+=("${TERM_PKGS[$t]}")
     fi
 done
 
@@ -204,31 +239,26 @@ echo ""
 bold "Optional dependencies"
 echo ""
 
-install_optional() {
+check_optional() {
     local cmd="$1" pkg="$2" desc="$3"
     if command -v "$cmd" &>/dev/null; then
         green "  ✓ $cmd — $desc"
+    elif (( HAS_SUDO )); then
+        yellow "  $cmd not installed — installing..."
+        try_install "$pkg" || {
+            dim "  Install later: $(pkg_install_cmd "$pkg")"
+            MISSING_PKGS+=("$pkg")
+        }
     else
-        yellow "  ✗ $cmd — $desc"
-        # Only prompt when running interactively
-        if [[ -t 0 ]]; then
-            read -rp "    Install $pkg now? [y/N]: " yn || yn="n"
-            if [[ "${yn,,}" == "y" ]]; then
-                try_install "$pkg" || true
-            else
-                dim "    Skip. Install later: $(pkg_install_cmd "$pkg")"
-            fi
-        else
-            dim "    Install later: $(pkg_install_cmd "$pkg")"
-        fi
+        dim "  $cmd not installed — install later: $(pkg_install_cmd "$pkg")"
+        MISSING_PKGS+=("$pkg")
     fi
-    echo ""
 }
 
-install_optional inotifywait inotify-tools \
+check_optional inotifywait inotify-tools \
     "instant event notifications — faster wait-state in serial-agent"
 
-install_optional ser2net ser2net \
+check_optional ser2net ser2net \
     "serial multiplexer — run human terminal and agent daemon on the same port"
 
 # ── Copy tools ─────────────────────────────────────────────────────────────────
@@ -247,15 +277,12 @@ for tool in "${TOOLS[@]}"; do
     green "  ✓ $tool"
 done
 
-# ── Patch terminal default into installed serial-connect ──────────────────────
 if [[ "$TERM_CHOICE" != "tio" ]]; then
     sed -i "s|SERIAL_TERM=\"\${SERIAL_TERM:-tio}\"|SERIAL_TERM=\"\${SERIAL_TERM:-${TERM_CHOICE}}\"|" \
         "$INSTALL_DIR/serial-connect"
     dim "  · default terminal set to: $TERM_CHOICE"
-    dim "    Override any time: SERIAL_TERM=tio serial-connect"
 fi
 
-# ── Config file (lives alongside the scripts) ──────────────────────────────────
 if [[ ! -f "$CONF_FILE" ]]; then
     cp "$SCRIPT_DIR/bin/serial-boards.conf" "$CONF_FILE"
     green "  ✓ serial-boards.conf  (created)"
@@ -272,6 +299,7 @@ for tool in serial-discover serial-connect serial-agent; do
     ln -sf "$INSTALL_DIR/$tool" "$LINK_DIR/$tool"
     green "  ✓ $tool → $LINK_DIR/$tool"
 done
+
 if [[ ":$PATH:" != *":$LINK_DIR:"* ]]; then
     if (( GLOBAL )); then
         echo ""
@@ -286,11 +314,20 @@ if [[ ":$PATH:" != *":$LINK_DIR:"* ]]; then
 fi
 
 # ── Done ───────────────────────────────────────────────────────────────────────
+echo ""
 bold "Done. Quick start:"
 echo ""
 dim  "  serial-discover                 # probe all connected boards"
 dim  "  serial-connect                  # pick a board and connect"
-dim  "  serial-connect /dev/ttyUSB1     # connect directly (skips menu)"
+dim  "  serial-connect /dev/ttyUSB1     # connect directly"
 dim  "  serial-agent auto-label -y      # name boards by USB serial#"
 dim  "  serial-agent --help             # full automation CLI"
+
+if (( ${#MISSING_PKGS[@]} > 0 )); then
+    echo ""
+    yellow "  Optional packages not installed (no sudo access):"
+    for pkg in "${MISSING_PKGS[@]}"; do
+        dim "    $(pkg_install_cmd "$pkg")"
+    done
+fi
 echo ""

@@ -1,0 +1,7 @@
+# serial-connect udev rules
+# Grants all users read/write access to USB serial adapters without
+# requiring dialout group membership or re-login.
+# Prevents ModemManager from probing and locking serial ports.
+
+SUBSYSTEM=="tty", KERNEL=="ttyUSB[0-9]*", MODE:="0666", ENV{ID_MM_DEVICE_IGNORE}="1", ENV{ID_MM_PORT_IGNORE}="1"
+SUBSYSTEM=="tty", KERNEL=="ttyACM[0-9]*", MODE:="0666", ENV{ID_MM_DEVICE_IGNORE}="1", ENV{ID_MM_PORT_IGNORE}="1"
