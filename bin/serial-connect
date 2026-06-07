@@ -152,6 +152,18 @@ elif [[ -f "$CACHE_FILE" ]]; then
         [[ -n "${_recog[${SERS[$i]}]+x}" ]] && continue
         _reprobe_idxs+=("$i")
     done
+    # Also re-probe LIVE cached ports whose detected baud doesn't match the
+    # configured baud — guards against false-positive baud detections where
+    # the probe happened to get 0 bytes at the correct baud and then caught
+    # stray bytes at a wrong baud that passed the printable threshold.
+    for i in "${!DEVS[@]}"; do
+        [[ -n "${_recog[${SERS[$i]}]+x}" ]] || continue
+        _pf="$PROBE_DIR/$(basename "${DEVS[$i]}")"
+        _cr=$(cat "$_pf" 2>/dev/null || echo "")
+        if [[ "$_cr" =~ ^LIVE\|([0-9]+)\| && "${BASH_REMATCH[1]}" != "${BAUDS[$i]}" ]]; then
+            _reprobe_idxs+=("$i")
+        fi
+    done
     if (( ${#_reprobe_idxs[@]} > 0 )); then
         run_probes "${_reprobe_idxs[@]}"; save_cache "$PROBE_DIR"
     fi
