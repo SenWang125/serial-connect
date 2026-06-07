@@ -142,25 +142,10 @@ elif (( HAS_SUDO )); then
         dim    "    Run manually: sudo cp $UDEV_SRC $UDEV_DEST"
         dim    "                  sudo udevadm control --reload-rules"
     fi
-elif [[ -t 0 ]]; then
-    echo "  udev rules give all users access to /dev/ttyUSB* without sudo or re-login."
-    read -rp "  Install now? (requires sudo once) [Y/n]: " yn || yn="y"
-    if [[ "${yn,,}" != "n" ]]; then
-        if sudo cp "$UDEV_SRC" "$UDEV_DEST" \
-            && sudo udevadm control --reload-rules \
-            && sudo udevadm trigger 2>/dev/null; then
-            green "  ✓ udev rules installed"
-        else
-            yellow "  ⚠ could not install udev rules"
-            dim    "    Run manually: sudo cp $UDEV_SRC $UDEV_DEST"
-            dim    "                  sudo udevadm control --reload-rules"
-        fi
-    else
-        dim "  Skipped. You may need to run serial-connect with sudo or be in the dialout group."
-    fi
 else
-    yellow "  ⚠ udev rules not installed — serial port access may require sudo"
-    dim    "  Install later: sudo cp $UDEV_SRC $UDEV_DEST && sudo udevadm control --reload-rules"
+    yellow "  ⚠ no sudo access — ask an admin to run:"
+    dim    "    sudo cp $UDEV_SRC $UDEV_DEST"
+    dim    "    sudo udevadm control --reload-rules && sudo udevadm trigger"
 fi
 
 # ── Terminal emulator selection ────────────────────────────────────────────────
