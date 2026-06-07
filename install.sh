@@ -106,8 +106,19 @@ fi
 if id -nG | grep -qw dialout; then
     green  "  ✓ dialout group"
 else
-    yellow "  ⚠ user '$(id -un)' not in dialout group"
-    yellow "    Run: sudo usermod -aG dialout \$USER  (then log out/in)"
+    yellow "  ⚠ user '$(id -un)' not in dialout group (needed to access /dev/ttyUSB* without sudo)"
+    if [[ -t 0 ]]; then
+        read -rp "    Add to dialout now? [Y/n]: " yn || yn="y"
+        if [[ "${yn,,}" != "n" ]]; then
+            if sudo usermod -aG dialout "$USER"; then
+                green "  ✓ added to dialout — re-login required for it to take effect"
+            else
+                yellow "    Could not add automatically. Run: sudo usermod -aG dialout \$USER"
+            fi
+        fi
+    else
+        yellow "    Run: sudo usermod -aG dialout \$USER  (then log out/in)"
+    fi
 fi
 
 if [[ $ABORT -ne 0 ]]; then
@@ -262,12 +273,15 @@ for tool in serial-discover serial-connect serial-agent; do
     green "  ✓ $tool → $LINK_DIR/$tool"
 done
 if [[ ":$PATH:" != *":$LINK_DIR:"* ]]; then
-    echo ""
-    yellow "Note: $LINK_DIR is not yet in \$PATH."
     if (( GLOBAL )); then
+        echo ""
+        yellow "Note: $LINK_DIR is not yet in \$PATH for all users."
         yellow "      Add to /etc/environment or /etc/profile.d/serial-connect.sh"
     else
-        yellow "      Add to ~/.bashrc:  export PATH=\"\$HOME/.local/bin:\$PATH\""
+        LINE="export PATH=\"\$HOME/.local/bin:\$PATH\""
+        grep -qxF "$LINE" "$HOME/.bashrc" 2>/dev/null || echo "$LINE" >> "$HOME/.bashrc"
+        green "  ✓ added $LINK_DIR to ~/.bashrc"
+        dim   "    Run: source ~/.bashrc  (or open a new terminal)"
     fi
 fi
 
