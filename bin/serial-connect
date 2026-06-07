@@ -64,7 +64,12 @@ launch() {
             local tio_target="${agent_tcp:+tcp:$agent_tcp}"; tio_target="${tio_target:-$dev}"
             echo -e "\n${GREEN}→${NC} tio $tio_target @ $(baud_display "$baud")  ${DIM}(Ctrl-T Q to quit)${NC}"
             echo -e "  ${DIM}Share: socat - UNIX-CONNECT:$sock${NC}\n"
-            exec tio -b "$baud" -S "unix:$sock" "$tio_target"
+            tio -b "$baud" -S "unix:$sock" "$tio_target" || {
+                echo -e "\n${YELLOW}⚠${NC}  Port is in use by another user."
+                echo -e "  ${DIM}To force-close: sudo fuser -k $dev${NC}"
+                exit 1
+            }
+            exit 0
             ;;
         screen)
             command -v screen &>/dev/null || { echo "screen not found: sudo apt install screen" >&2; exit 1; }

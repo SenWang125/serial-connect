@@ -18,9 +18,9 @@ if [[ -z "${BOARD_CFG:-}" ]]; then
     fi
 fi
 
-# Shared probe cache — both serial-discover and serial-connect read/write these.
-SIG_FILE="/tmp/serial-connect.sig"
-CACHE_FILE="/tmp/serial-connect.cache"
+# Per-user probe cache to avoid cross-user permission conflicts.
+SIG_FILE="/tmp/serial-connect-${USER}.sig"
+CACHE_FILE="/tmp/serial-connect-${USER}.cache"
 
 # All defaults live in serial-boards.conf. Structures initialised empty here.
 declare -A CHIP_NAMES=() CHIP_BAUD=() CHIP_WILDCARD=() CHIP_BAUD_WILDCARD=() CFG_LABEL CFG_BAUD
