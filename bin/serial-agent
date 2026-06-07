@@ -260,6 +260,16 @@ _REAL_BASE = Path.home() / 'var' / 'serial-agent'
 _TMP_LINK  = Path('/tmp/serial-agent')
 AGENT_BASE = Path(os.environ.get('SERIAL_AGENT_DIR', str(_REAL_BASE)))
 
+def _resolve_board_cfg() -> Path:
+    if env := os.environ.get('BOARD_CFG'):
+        return Path(env)
+    for p in [Path.home() / '.config' / 'serial-boards.conf',
+              _SCRIPT_DIR / 'serial-boards.conf',
+              Path('/etc/serial-boards.conf')]:
+        if p.exists():
+            return p
+    return _SCRIPT_DIR / 'serial-boards.conf'
+
 # ── Tunables ───────────────────────────────────────────────────────────────────
 DEFAULT_LINES = 500      # buf.log ring buffer depth (lines)
 MAX_EVENTS    = 200      # events.log rotation threshold
@@ -1510,7 +1520,7 @@ def cmd_auto_label(args):
     except Exception as e:
         print(f'serial-discover failed: {e}', file=sys.stderr); sys.exit(1)
 
-    cfg = Path(os.environ.get('BOARD_CFG', str(_SCRIPT_DIR / 'serial-boards.conf')))
+    cfg = _resolve_board_cfg()
     existing_text = cfg.read_text() if cfg.exists() else ''
 
     seen, to_label = set(), {}

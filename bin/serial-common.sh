@@ -10,7 +10,13 @@ DIM=$'\033[2m'; RED=$'\033[31m'; NC=$'\033[0m'
 # Defaults to serial-boards.conf in the same directory as the sourcing script.
 # Override at runtime: BOARD_CFG=/path/to/serial-boards.conf serial-connect
 _COMMON_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
-BOARD_CFG="${BOARD_CFG:-$_COMMON_DIR/serial-boards.conf}"
+if [[ -z "${BOARD_CFG:-}" ]]; then
+    if   [[ -f "$HOME/.config/serial-boards.conf" ]]; then BOARD_CFG="$HOME/.config/serial-boards.conf"
+    elif [[ -f "$_COMMON_DIR/serial-boards.conf"  ]]; then BOARD_CFG="$_COMMON_DIR/serial-boards.conf"
+    elif [[ -f "/etc/serial-boards.conf"           ]]; then BOARD_CFG="/etc/serial-boards.conf"
+    else                                                     BOARD_CFG="$_COMMON_DIR/serial-boards.conf"
+    fi
+fi
 
 # Shared probe cache — both serial-discover and serial-connect read/write these.
 SIG_FILE="/tmp/serial-connect.sig"

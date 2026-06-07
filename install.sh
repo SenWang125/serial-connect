@@ -5,30 +5,40 @@
 # into ~/.local/bin/ (already in PATH on modern Linux — no PATH changes needed).
 #
 # Usage:
-#   ./install.sh                    # interactive (asks terminal preference)
-#   ./install.sh --term tio         # non-interactive: tio (recommended)
-#   ./install.sh --term screen      # non-interactive: screen
-#   ./install.sh --term minicom     # non-interactive: minicom
-#   ./install.sh --term picocom     # non-interactive: picocom
-#   sudo ./install.sh /usr/local/bin --term tio   # system-wide
+#   ./install.sh                         # interactive (asks terminal preference)
+#   ./install.sh --term tio              # non-interactive: tio (recommended)
+#   ./install.sh --term screen           # non-interactive: screen
+#   ./install.sh --term minicom          # non-interactive: minicom
+#   ./install.sh --term picocom          # non-interactive: picocom
+#   sudo ./install.sh --global           # system-wide (all users, requires sudo)
 
 set -euo pipefail
 
 INSTALL_DIR=""
 TERM_CHOICE=""
+GLOBAL=0
 
 # ── Parse args ─────────────────────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
     case "$1" in
+        --global)  GLOBAL=1; shift ;;
         --term)    TERM_CHOICE="$2"; shift 2 ;;
         --term=*)  TERM_CHOICE="${1#--term=}"; shift ;;
-        --help|-h) echo "Usage: ./install.sh [INSTALL_DIR] [--term tio|screen|minicom|picocom]"; exit 0 ;;
+        --help|-h) echo "Usage: ./install.sh [--global] [--term tio|screen|minicom|picocom]"; exit 0 ;;
         *)         INSTALL_DIR="$1"; shift ;;
     esac
 done
 
-INSTALL_DIR="${INSTALL_DIR:-$HOME/.serial-connect}"
-CONF_FILE="${INSTALL_DIR}/serial-boards.conf"
+if (( GLOBAL )); then
+    (( EUID == 0 )) || { echo "Global install requires sudo."; exit 1; }
+    INSTALL_DIR="${INSTALL_DIR:-/usr/local/share/serial-connect}"
+    LINK_DIR="/usr/local/bin"
+    CONF_FILE="/etc/serial-boards.conf"
+else
+    INSTALL_DIR="${INSTALL_DIR:-$HOME/.serial-connect}"
+    LINK_DIR="$HOME/.local/bin"
+    CONF_FILE="${INSTALL_DIR}/serial-boards.conf"
+fi
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # ── Colour helpers ─────────────────────────────────────────────────────────────
@@ -242,8 +252,7 @@ else
     dim   "  · serial-boards.conf  (exists — not modified)"
 fi
 
-# ── Symlink CLI tools into ~/.local/bin (already in PATH on modern Linux) ──────
-LINK_DIR="$HOME/.local/bin"
+# ── Symlink CLI tools ──────────────────────────────────────────────────────────
 mkdir -p "$LINK_DIR"
 echo ""
 bold "Linking into: $LINK_DIR"
@@ -255,7 +264,11 @@ done
 if [[ ":$PATH:" != *":$LINK_DIR:"* ]]; then
     echo ""
     yellow "Note: $LINK_DIR is not yet in \$PATH."
-    yellow "      Add to ~/.bashrc:  export PATH=\"\$HOME/.local/bin:\$PATH\""
+    if (( GLOBAL )); then
+        yellow "      Add to /etc/environment or /etc/profile.d/serial-connect.sh"
+    else
+        yellow "      Add to ~/.bashrc:  export PATH=\"\$HOME/.local/bin:\$PATH\""
+    fi
 fi
 
 # ── Done ───────────────────────────────────────────────────────────────────────
