@@ -131,10 +131,10 @@ get_baud() { local vid="${1%%:*}"; echo "${CFG_BAUD[$2]:-${CHIP_BAUD[$1]:-${CHIP
 probe_tty() {
     local dev="$1" cfg_baud="${2:-${PROBE_BAUDS[0]}}"
 
-    local _dev_inode; _dev_inode=$(stat -c '%T' "$dev" 2>/dev/null | tr '[:lower:]' '[:upper:]')
+    local _agent_status="/tmp/serial-agent/$(basename "$dev")/status.json"
     { fuser "$dev" &>/dev/null 2>&1 \
         || sudo -n fuser "$dev" &>/dev/null 2>&1 \
-        || { [[ -n "$_dev_inode" ]] && grep -rlq "$_dev_inode" /proc/*/fd 2>/dev/null; }; } \
+        || [[ -f "$_agent_status" ]]; } \
         && { printf 'OPEN|%s|\n' "$cfg_baud"; return; }
 
     local fd
