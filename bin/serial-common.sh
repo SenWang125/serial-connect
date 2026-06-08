@@ -89,6 +89,11 @@ _load_conf_file() {
             [[ "$key" =~ ^[0-9a-fA-F]{4}: ]] && continue  # skip chip table
             [[ "$key" =~ ^(PROBE_|REPROBE_) ]] && continue # skip probe tuning
         fi
+        # Terminal preference
+        if [[ "$key" == "SERIAL_TERM" ]]; then
+            [[ "$val" =~ ^(tio|screen|minicom|picocom)$ ]] && export SERIAL_TERM="$val"
+            continue
+        fi
         # Probe tuning scalars
         if [[ "$key" =~ ^(PROBE_(PARALLEL|READ_MS|DRAIN_MS)|REPROBE_DEAD)$ ]]; then
             [[ "$val" =~ ^[0-9]+$ ]] && printf -v "$key" '%s' "$val"

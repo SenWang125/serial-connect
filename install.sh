@@ -201,11 +201,11 @@ echo ""
 bold "Terminal emulators"
 echo ""
 
-# Detect current default from an existing install
+# Detect current default from existing conf
 _current_term="tio"
-if [[ -f "$INSTALL_DIR/serial-connect" ]]; then
-    _ct=$(grep 'SERIAL_TERM=' "$INSTALL_DIR/serial-connect" 2>/dev/null | grep -o 'tio\|screen\|minicom\|picocom' | head -1)
-    [[ -n "$_ct" ]] && _current_term="$_ct"
+if [[ -f "$CONF_FILE" ]]; then
+    _ct=$(grep '^SERIAL_TERM=' "$CONF_FILE" 2>/dev/null | cut -d= -f2 | tr -d ' ')
+    [[ "$_ct" =~ ^(tio|screen|minicom|picocom)$ ]] && _current_term="$_ct"
 fi
 
 if (( !UPGRADE )); then
@@ -322,14 +322,13 @@ for tool in "${TOOLS[@]}"; do
     green "  ✓ $tool"
 done
 
-# Patch default terminal — reset to tio first to handle re-installs cleanly
-sed -i "s|SERIAL_TERM=\"\${SERIAL_TERM:-[^}]*}\"|SERIAL_TERM=\"\${SERIAL_TERM:-tio}\"|" \
-    "$INSTALL_DIR/serial-connect" 2>/dev/null || true
-if [[ "$TERM_CHOICE" != "tio" ]]; then
-    sed -i "s|SERIAL_TERM=\"\${SERIAL_TERM:-tio}\"|SERIAL_TERM=\"\${SERIAL_TERM:-${TERM_CHOICE}}\"|" \
-        "$INSTALL_DIR/serial-connect"
-    dim "  · default terminal set to: $TERM_CHOICE"
+# Write terminal preference to conf (no script patching)
+if grep -q "^SERIAL_TERM=" "$CONF_FILE" 2>/dev/null; then
+    sed -i "s|^SERIAL_TERM=.*|SERIAL_TERM=${TERM_CHOICE}|" "$CONF_FILE"
+else
+    printf '\nSERIAL_TERM=%s\n' "$TERM_CHOICE" >> "$CONF_FILE"
 fi
+dim "  · default terminal: $TERM_CHOICE (set in $(basename "$CONF_FILE"))"
 
 # System conf: created once; never overwritten to preserve user edits
 if [[ ! -f "$CONF_FILE" ]]; then
