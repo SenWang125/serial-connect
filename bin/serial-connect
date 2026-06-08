@@ -238,7 +238,15 @@ elif [[ -f "$CACHE_FILE" ]]; then
         _r=$(cut -d'|' -f1 "$_pf" 2>/dev/null)
         _baud=$(cut -d'|' -f2 "$_pf" 2>/dev/null)
         _bid=$(cut -d'|' -f3 "$_pf" 2>/dev/null)
-        if { fuser "${DEVS[$i]}" &>/dev/null 2>&1 || sudo -n fuser "${DEVS[$i]}" &>/dev/null 2>&1; }; then
+        _lf="/tmp/serial-connect-locks/$(basename "${DEVS[$i]}")"
+        _lock_live=0
+        if [[ -f "$_lf" ]]; then
+            _lpid=$(awk 'NR==1' "$_lf" 2>/dev/null)
+            [[ -n "$_lpid" && -d "/proc/$_lpid" ]] && _lock_live=1 || rm -f "$_lf" 2>/dev/null || true
+        fi
+        if { fuser "${DEVS[$i]}" &>/dev/null 2>&1 \
+            || sudo -n fuser "${DEVS[$i]}" &>/dev/null 2>&1 \
+            || (( _lock_live )); }; then
             printf 'OPEN|%s|%s\n' "${_baud:-${BAUDS[$i]}}" "$_bid" > "$_pf"
         elif [[ "$_r" == "OPEN" ]]; then
             _stale_open_idxs+=("$i")
