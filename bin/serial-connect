@@ -127,9 +127,16 @@ _lock_release() {
 launch() {
     local dev="$1" baud="$2"
     local agent_tcp=""
-    local agent_status="${HOME}/var/serial-agent/$(basename "$dev")/status.json"
-    [[ ! -f "$agent_status" ]] && agent_status="/tmp/serial-agent/$(basename "$dev")/status.json"
-    if [[ -f "$agent_status" ]]; then
+    local _devname; _devname=$(basename "$dev")
+    local agent_status="${HOME}/var/serial-agent/$_devname/status.json"
+    [[ ! -f "$agent_status" ]] && agent_status="/tmp/serial-agent/$_devname/status.json"
+    local _apid_file="/tmp/serial-agent/$_devname/daemon.pid"
+    local _agent_live=0
+    if [[ -f "$_apid_file" ]]; then
+        local _apid; _apid=$(cat "$_apid_file" 2>/dev/null)
+        [[ -n "$_apid" ]] && [[ -d "/proc/$_apid" ]] && _agent_live=1
+    fi
+    if [[ -f "$agent_status" ]] && (( _agent_live )); then
         local via; via=$(python3 -c "import json,sys; print(json.load(open('$agent_status')).get('via',''))" 2>/dev/null)
         [[ "$via" == tcp:* ]] && agent_tcp="${via#tcp:}"
     fi
