@@ -483,17 +483,35 @@ class Daemon:
             }.get(self.baud, termios.B115200)
             saved = termios.tcgetattr(fd)
             attrs = list(saved)
-            attrs[2] |= termios.CLOCAL | termios.CREAD
-            attrs[2] &= ~termios.HUPCL
-            attrs[3] &= ~(termios.ICANON | termios.ECHO | termios.ECHOE)
-            attrs[0] &= ~termios.ICRNL
+            # Full raw-mode setup (cfmakeraw equivalent + daemon-specific flags).
+            # The previous approach only cleared a subset of flags, leaving IXON/IXOFF
+            # (XON/XOFF flow control), OPOST (output processing), ISIG, and IEXTEN
+            # active — any 0x11/0x13 byte from the board would pause/resume output.
+            _IXOFF   = getattr(termios, 'IXOFF',   0)
+            _IXANY   = getattr(termios, 'IXANY',   0)
+            _ECHOK   = getattr(termios, 'ECHOK',   0)
+            _ECHONL  = getattr(termios, 'ECHONL',  0)
+            _CRTSCTS = getattr(termios, 'CRTSCTS', 0)
+            # c_iflag: disable all input translations and flow control
+            attrs[0] &= ~(termios.IGNBRK | termios.BRKINT | termios.PARMRK |
+                          termios.ISTRIP | termios.INLCR  | termios.IGNCR  |
+                          termios.ICRNL  | termios.IXON   | _IXOFF         | _IXANY)
+            # c_oflag: disable output processing (NL→CRNL etc.)
+            attrs[1] &= ~termios.OPOST
+            # c_cflag: 8n1, no hardware flow control, ignore modem lines, no DTR drop
+            attrs[2] &= ~(termios.CSIZE | termios.PARENB | _CRTSCTS | termios.HUPCL)
+            attrs[2] |=  termios.CS8 | termios.CLOCAL | termios.CREAD
+            # c_lflag: raw input — no echo, no canonical, no signals, no extensions
+            attrs[3] &= ~(termios.ECHO | _ECHOK | _ECHONL | termios.ECHOE |
+                          termios.ICANON | termios.ISIG | termios.IEXTEN)
+            # Baud rate
             attrs[4] = bconst; attrs[5] = bconst
-            # attrs[6] is a list; elements may be single-byte bytes objects or ints.
-            # tcsetattr expects a list — convert elements to int but keep as list.
+            # VMIN=0 VTIME=1: select() drives the wait; os.read() returns immediately
+            # or after a 100ms kernel timeout if a spurious wakeup delivered no data.
             vchars = [(b[0] if isinstance(b, bytes) else b) for b in attrs[6]]
             vchars[termios.VMIN] = 0; vchars[termios.VTIME] = 1
             attrs[6] = vchars   # list, NOT bytes — tcsetattr requires list
-            termios.tcsetattr(fd, termios.TCSANOW, attrs)
+            termios.tcsetattr(fd, termios.TCSAFLUSH, attrs)
             # Set a wide terminal window so the board doesn't wrap output mid-line
             import struct, fcntl
             try:
