@@ -304,11 +304,19 @@ if [[ "${1:-}" == "--label" ]]; then
         [[ -n "${_lbl_seen[$ser]+x}" ]] && continue
         _lbl_seen[$ser]=1
         _cur="${CFG_LABEL[$ser]:-}"
-        _probed=""
-        IFS='|' read -r _r _b _id \
-            <<< "$(cat "$PROBE_DIR/$(basename "${DEVS[$i]}")" 2>/dev/null || echo 'FAIL||')"
-        [[ -z "$_r" || "$_r" == "DEAD" ]] && _r="dead"
-        [[ ( "$_r" == "LIVE" || "$_r" == "OPEN" ) && -n "$_id" ]] && _probed="$_id"
+        _probed="" _r="dead"
+        # Check all ports of this device — use first LIVE/OPEN one for probed label
+        for j in "${_disp_order[@]}"; do
+            [[ "${SERS[$j]}" != "$ser" ]] && continue
+            IFS='|' read -r _rj _bj _idj \
+                <<< "$(cat "$PROBE_DIR/$(basename "${DEVS[$j]}")" 2>/dev/null || echo 'FAIL||')"
+            [[ -z "$_rj" || "$_rj" == "DEAD" ]] && _rj="dead"
+            if [[ "$_rj" == "LIVE" || "$_rj" == "OPEN" ]]; then
+                _r="$_rj"
+                [[ -n "$_idj" ]] && _probed="$_idj"
+                break
+            fi
+        done
         case "$_r" in
             LIVE) _sym="${GREEN}★${NC}" ;;
             OPEN) _sym="${CYAN}⊙${NC}"  ;;
