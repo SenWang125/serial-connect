@@ -143,21 +143,23 @@ launch() {
         local via; via=$(python3 -c "import json,sys; print(json.load(open('$agent_status')).get('via',''))" 2>/dev/null)
         [[ "$via" == tcp:* ]] && agent_tcp="${via#tcp:}"
     fi
-    if [[ -n "$agent_tcp" ]]; then
-        echo -e "  ${DIM}serial-agent via ser2net tcp:${agent_tcp} — connecting tio there${NC}"
-        echo -e "  ${DIM}Both tio and agent receive the full stream independently.${NC}"
-    else
-        # Full reset to a known-good state before handing to tio. Just -hupcl
-        # is not enough if the previous holder (e.g. serial-agent daemon killed
-        # with SIGKILL) left the device in raw/cfmakeraw state with IXON,
-        # CRTSCTS, or other flags that would confuse tio or the board.
-        stty -F "$dev" "$baud" cs8 -parenb -cstopb -crtscts clocal -hupcl 2>/dev/null
-    fi
+    # Always reset device to a known-good state. Clears IXON, CRTSCTS, raw mode
+    # etc. that a previous holder killed with SIGKILL may have left in the kernel
+    # TTY state. tio/screen/minicom all apply their own settings on top, so this
+    # is a safe no-op when none of those flags were dirty.
+    stty -F "$dev" "$baud" cs8 -parenb -cstopb -crtscts clocal -hupcl 2>/dev/null
+
     case "${SERIAL_TERM}" in
         tio)
             command -v tio &>/dev/null || { echo "tio not found: sudo apt install tio" >&2; exit 1; }
             local sock="/tmp/$(basename "$dev")-${USER}.sock"
-            local tio_target="${agent_tcp:+tcp:$agent_tcp}"; tio_target="${tio_target:-$dev}"
+            # TCP relay via ser2net is tio-specific; screen/minicom connect directly.
+            local tio_target="$dev"
+            if [[ -n "$agent_tcp" ]]; then
+                echo -e "  ${DIM}serial-agent via ser2net tcp:${agent_tcp} — connecting tio there${NC}"
+                echo -e "  ${DIM}Both tio and agent receive the full stream independently.${NC}"
+                tio_target="tcp:$agent_tcp"
+            fi
             echo -e "\n${GREEN}→${NC} tio $tio_target @ $(baud_display "$baud")  ${DIM}(Ctrl-T Q to quit)${NC}"
             echo -e "  ${DIM}Share: socat - UNIX-CONNECT:$sock${NC}\n"
             _lock_acquire "$dev"

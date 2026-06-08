@@ -225,14 +225,14 @@ probe_tty() {
     # board is alive.  Setting raw + drain here, once, is safe — no baud change,
     # no CDC overhead.
     if (( skip_stty )); then
-        stty -F "$dev" "$cfg_baud" raw -echo min 0 time 0 2>/dev/null
+        stty -F "$dev" "$cfg_baud" raw -echo -crtscts min 0 time 0 2>/dev/null
         IFS= read -t "$drain_t" -r -d '' -n 1024 -u $fd _drain 2>/dev/null || true
     fi
 
     local detected="" captured=""
     for baud in "${try_bauds[@]}"; do
         if (( !skip_stty )); then
-            stty -F "$dev" "$baud" raw -echo min 0 time 1 2>/dev/null
+            stty -F "$dev" "$baud" raw -echo -crtscts min 0 time 1 2>/dev/null
             IFS= read -t "$drain_t" -r -d '' -n 1024 -u $fd _drain 2>/dev/null || true
         fi
         printf '\r' >&$fd

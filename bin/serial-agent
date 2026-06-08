@@ -396,6 +396,12 @@ def ensure_symlink():
             if _TMP_LINK.resolve() != _REAL_BASE.resolve():
                 _TMP_LINK.unlink()
                 _TMP_LINK.symlink_to(_REAL_BASE)
+        elif _TMP_LINK.is_dir():
+            try:
+                _TMP_LINK.rmdir()          # only removes if empty
+                _TMP_LINK.symlink_to(_REAL_BASE)
+            except OSError:
+                pass                       # non-empty or permission denied; leave it
         elif not _TMP_LINK.exists():
             _TMP_LINK.symlink_to(_REAL_BASE)
     except OSError:
@@ -562,14 +568,14 @@ class Daemon:
             self.state = 'LOGIN'
         elif RE_PASSWORD.search(last):
             self.state = 'PASSWORD'
-        elif RE_SHELL2.search(last) or (RE_SHELL.search(last) and len(last) > 2):
+        elif RE_SHELL2.search(last) or (RE_SHELL.search(last) and len(last) >= 2):
             self.state = 'SHELL'
             self.t_prompt = t
             self.prompt_text = last.strip()
         elif RE_BOOT.search(clean[-300:]):
             self.state = 'BOOTING'
-        elif t - self.t_output > DEAD_AFTER:
-            self.state = 'DEAD'
+        # (DEAD is detected only via the idle-timeout in run(), not here, since
+        # _update_state is only called when data arrives — t_output was just set.)
         elif (self.t_output > self.t_prompt
               and t - self.t_output > 0.2
               and t - self.t_prompt > RUNNING_AFTER):
@@ -585,7 +591,9 @@ class Daemon:
                 existing.append(entry)
                 if len(existing) > MAX_EVENTS:
                     existing = existing[-MAX_EVENTS:]
-                self.events_file.write_text('\n'.join(existing) + '\n')
+                _etmp = self.events_file.with_suffix('.tmp')
+                _etmp.write_text('\n'.join(existing) + '\n')
+                _etmp.rename(self.events_file)
             except OSError:
                 pass
             self._prev_state = self.state
@@ -622,7 +630,9 @@ class Daemon:
         if len(self.buf_lines) > self.maxlines:
             self.buf_lines = self.buf_lines[-self.maxlines:]
         try:
-            self.buf_file.write_text('\n'.join(self.buf_lines) + '\n')
+            _btmp = self.buf_file.with_suffix('.tmp')
+            _btmp.write_text('\n'.join(self.buf_lines) + '\n')
+            _btmp.rename(self.buf_file)
         except OSError:
             pass
         self._write_status()
@@ -893,6 +903,17 @@ def cmd_start(args):
     AGENT_BASE.mkdir(parents=True, exist_ok=True)
 
     ddir = devdir(args.device)
+    # Guard: if a daemon is already running, report its status and return.
+    # Without this, 'start' would delete the running daemon's pid file, making
+    # it unmanageable — it holds the device open but can never be stopped.
+    if _daemon_running(args.device):
+        sf = ddir / 'status.json'
+        if sf.exists():
+            s = json.loads(sf.read_text())
+            print(f"ALREADY  daemon PID {s['pid']}  {args.device}  via {s['via']}")
+        else:
+            print(f"ALREADY  daemon running for {args.device}")
+        return
     # Remove ALL transient files so old daemon can't steal commands or data
     for stale in ('buf.log', 'status.json', 'daemon.pid', 'input.fifo', 'events.log'):
         (ddir / stale).unlink(missing_ok=True)
@@ -906,6 +927,9 @@ def cmd_start(args):
             print(f"daemon PID {s['pid']}  {args.device}  via {s['via']}")
             print(f"  buf:  {s['buf_file']}")
             print(f"  tail: tail -f {s['buf_file']}")
+        else:
+            print(f"daemon failed to start — check {ddir}/daemon.log", file=sys.stderr)
+            sys.exit(1)
         return
 
     os.setsid()
