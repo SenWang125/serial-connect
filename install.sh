@@ -208,6 +208,7 @@ if [[ -f "$INSTALL_DIR/serial-connect" ]]; then
     [[ -n "$_ct" ]] && _current_term="$_ct"
 fi
 
+if (( !UPGRADE )); then
 echo "  Select which terminals to install (comma-separated, e.g. 1,2)."
 echo "  The first choice becomes the default for serial-connect."
 echo "  tio + screen is recommended: tio for daily use, screen for sharing."
@@ -217,6 +218,7 @@ echo "    2) screen   Shareable sessions: screen -x ttyUSBx          (recommende
 echo "    3) minicom  Classic serial terminal"
 echo "    4) picocom  Minimal, lightweight"
 echo ""
+fi  # end !UPGRADE display block
 
 declare -A TERM_PKGS=([tio]=tio [screen]=screen [minicom]=minicom [picocom]=picocom)
 declare -a TERMS_TO_INSTALL=()
