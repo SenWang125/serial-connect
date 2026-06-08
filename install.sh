@@ -298,6 +298,34 @@ if [[ ":$PATH:" != *":$LINK_DIR:"* ]]; then
     fi
 fi
 
+# ── Restart running serial-agent daemons ──────────────────────────────────────
+_agent_bin="$INSTALL_DIR/serial-agent"
+if command -v "$_agent_bin" &>/dev/null || [[ -x "$_agent_bin" ]]; then
+    _running=$(python3 -c "
+import os, pathlib, json
+base = pathlib.Path.home() / 'var' / 'serial-agent'
+if base.exists():
+    for d in base.iterdir():
+        pf = d / 'daemon.pid'
+        if pf.exists():
+            try:
+                pid = int(pf.read_text().strip())
+                os.kill(pid, 0)
+                print(d.name)
+            except: pass
+" 2>/dev/null)
+    if [[ -n "$_running" ]]; then
+        echo ""
+        bold "Restarting running daemons..."
+        echo ""
+        while IFS= read -r _dev; do
+            "$_agent_bin" stop "/dev/$_dev" &>/dev/null
+            "$_agent_bin" start "/dev/$_dev" &>/dev/null
+            green "  ✓ restarted /dev/$_dev"
+        done <<< "$_running"
+    fi
+fi
+
 # ── Done ───────────────────────────────────────────────────────────────────────
 echo ""
 bold "Done. Quick start:"
