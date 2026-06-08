@@ -481,23 +481,30 @@ while true; do
             echo -e "  ${DIM}↩ back to port selection${NC}\n"
             continue
         fi
-        # Prefer serial-agent stop (SIGTERM + waits for clean exit) over
-        # fuser -k (SIGKILL) when the port is held by a serial-agent daemon.
-        # SIGKILL gives no chance for cleanup: terminal settings (raw mode,
-        # CLOCAL, etc.) are left in the kernel TTY state and can leave the
-        # board console unresponsive after reconnecting.
+        _fuser_pfx="fuser"
+        [[ -n "$_lock_user" && "$_lock_user" != "$USER" ]] && _fuser_pfx="sudo fuser"
+
+        # Step 1: serial-agent daemon gets SIGTERM via 'serial-agent stop'
+        # (proper cleanup: closes fd, removes pid file, restores tty state).
         _sa_pf="${HOME}/var/serial-agent/$(basename "${ROW_DEV[$choice]}")/daemon.pid"
         [[ ! -f "$_sa_pf" ]] && _sa_pf="/tmp/serial-agent/$(basename "${ROW_DEV[$choice]}")/daemon.pid"
         if [[ -f "$_sa_pf" ]] && kill -0 "$(cat "$_sa_pf" 2>/dev/null)" 2>/dev/null \
                 && command -v serial-agent &>/dev/null; then
             serial-agent stop "${ROW_DEV[$choice]}" 2>/dev/null || true
         fi
-        # Kill any remaining holders (non-daemon processes, or fallback if stop failed)
-        if [[ -n "$_lock_user" && "$_lock_user" != "$USER" ]]; then
-            sudo fuser -k "${ROW_DEV[$choice]}" 2>/dev/null || true
-        else
-            fuser -k "${ROW_DEV[$choice]}" 2>/dev/null || true
-        fi
+
+        # Step 2: SIGTERM all remaining holders (tio, minicom, ser2net, etc.)
+        # giving them a chance to restore their own terminal settings.
+        $_fuser_pfx -TERM "${ROW_DEV[$choice]}" 2>/dev/null || true
+
+        # Step 3: wait up to 0.5s for graceful exit
+        for _gi in 1 2 3 4 5; do
+            $_fuser_pfx "${ROW_DEV[$choice]}" &>/dev/null 2>&1 || break
+            sleep 0.1
+        done
+
+        # Step 4: SIGKILL anything still holding on
+        $_fuser_pfx -k "${ROW_DEV[$choice]}" 2>/dev/null || true
         sleep 0.1
         stty sane 2>/dev/null || true
         printf '\033[0m\033[?7h' 2>/dev/null || true  # reset terminal attributes + re-enable line wrap
