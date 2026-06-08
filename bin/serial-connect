@@ -488,6 +488,19 @@ while true; do
 done
 
 sel_dev="${ROW_DEV[$choice]}"; sel_baud="${ROW_BAUD[$choice]}"
+
+# Real-time lock check — cache may be stale if another user connected since last probe
+_lf="/tmp/serial-connect-locks/$(basename "$sel_dev")"
+if [[ -f "$_lf" ]]; then
+    _lpid=$(awk 'NR==1' "$_lf" 2>/dev/null)
+    _luser=$(awk 'NR==2' "$_lf" 2>/dev/null)
+    if [[ -d "/proc/$_lpid" && "$_luser" != "$USER" ]] && ! sudo -n true 2>/dev/null; then
+        echo -e "\n  ${YELLOW}⚠${NC}  ${sel_dev} is now held by user '${_luser}' — ask an admin to run:"
+        echo -e "  ${DIM}sudo fuser -k $sel_dev${NC}\n"
+        exit 1
+    fi
+fi
+
 while true; do
     read -rp "$(baud_prompt "$sel_baud"): " b || { printf "\n"; exit 0; }
     baud_valid "$b" && { [[ -n "$b" ]] && sel_baud=$(parse_baud "$b"); break; }
