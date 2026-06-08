@@ -204,8 +204,8 @@ echo ""
 # Detect current default from existing conf
 _current_term="tio"
 if [[ -f "$CONF_FILE" ]]; then
-    _ct=$(grep '^SERIAL_TERM=' "$CONF_FILE" 2>/dev/null | cut -d= -f2 | tr -d ' ')
-    [[ "$_ct" =~ ^(tio|screen|minicom|picocom)$ ]] && _current_term="$_ct"
+    _ct=$(grep '^SERIAL_TERM=' "$CONF_FILE" 2>/dev/null | cut -d= -f2 | tr -d ' ' || true)
+    if [[ "$_ct" =~ ^(tio|screen|minicom|picocom)$ ]]; then _current_term="$_ct"; fi
 fi
 
 if (( !UPGRADE )); then
