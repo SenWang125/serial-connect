@@ -234,6 +234,7 @@ probe_tty() {
         local raw=""
         IFS= read -t "$read_t" -r -d '' -n 200 -u $fd raw 2>/dev/null
         local clean; clean=$(printf '%s' "$raw" \
+            | sed 's/\x1b\[[0-9;]*[mGKJHFABCDfsuhlrn]//g' \
             | tr -dc '[:print:][:space:]' | tr -s '[:space:]' ' ' \
             | sed 's/^ //; s/ $//')
         local raw_len="${#raw}" clean_len="${#clean}"
