@@ -466,6 +466,7 @@ while true; do
             fuser -k "${ROW_DEV[$choice]}" 2>/dev/null || true
         fi
         sleep 0.3
+        stty sane 2>/dev/null || true
         rm -f "$CACHE_FILE" "$SIG_FILE"
         echo -e "  ${GREEN}Session closed.${NC}\n"
     fi

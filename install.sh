@@ -116,7 +116,7 @@ while IFS= read -r _existing; do
     [[ "$(readlink -f "$_existing" 2>/dev/null)" == "$INSTALL_DIR/"* ]] && continue
     yellow "  ⚠ Found existing installation: $_existing"
     _found_conflict=1
-done < <(command -v serial-connect serial-discover serial-agent 2>/dev/null | sort -u)
+done < <(for _t in serial-connect serial-discover serial-agent; do command -v "$_t" 2>/dev/null || true; done | sort -u)
 
 if (( _found_conflict )); then
     echo ""
