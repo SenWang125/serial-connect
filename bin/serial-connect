@@ -147,7 +147,11 @@ launch() {
         echo -e "  ${DIM}serial-agent via ser2net tcp:${agent_tcp} — connecting tio there${NC}"
         echo -e "  ${DIM}Both tio and agent receive the full stream independently.${NC}"
     else
-        stty -F "$dev" -hupcl 2>/dev/null
+        # Full reset to a known-good state before handing to tio. Just -hupcl
+        # is not enough if the previous holder (e.g. serial-agent daemon killed
+        # with SIGKILL) left the device in raw/cfmakeraw state with IXON,
+        # CRTSCTS, or other flags that would confuse tio or the board.
+        stty -F "$dev" "$baud" cs8 -parenb -cstopb -crtscts clocal -hupcl 2>/dev/null
     fi
     case "${SERIAL_TERM}" in
         tio)

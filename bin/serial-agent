@@ -943,8 +943,10 @@ def cmd_stop(args):
         except (OSError, ValueError):
             pass
         pf.unlink(missing_ok=True)
-    # Also kill any other processes still holding the device (stale restarts)
+    # Also kill any other processes still holding the device (stale restarts,
+    # ser2net, orphaned tio sessions). SIGTERM first, SIGKILL if they don't exit.
     import subprocess
+    fuser_pids = []
     try:
         r = subprocess.run(['fuser', args.device], capture_output=True, text=True)
         for p in r.stdout.split():
@@ -953,10 +955,20 @@ def cmd_stop(args):
                 if pid2 not in killed:
                     os.kill(pid2, signal.SIGTERM)
                     killed.append(pid2)
+                    fuser_pids.append(pid2)
             except (OSError, ValueError):
                 pass
     except FileNotFoundError:
         pass
+    if fuser_pids:
+        for _ in range(15):   # wait up to 1.5s for graceful exit
+            fuser_pids = [p for p in fuser_pids if os.path.exists(f'/proc/{p}')]
+            if not fuser_pids:
+                break
+            time.sleep(0.1)
+        for p in fuser_pids:  # SIGKILL anything that didn't respond
+            try: os.kill(p, signal.SIGKILL)
+            except OSError: pass
     if killed:
         print(f'SIGTERM → PIDs {killed}')
     else:
