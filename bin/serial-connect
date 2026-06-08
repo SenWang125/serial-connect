@@ -37,15 +37,18 @@ EOF
         # Installations in PATH
         printf "${BOLD}Installations found in PATH:${NC}\n"
         _this="$(readlink -f "${BASH_SOURCE[0]}")"
+        declare -A _seen_bins=()
         while IFS= read -r _bin; do
+            [[ -z "$_bin" ]] && continue
+            [[ -n "${_seen_bins[$_bin]+x}" ]] && continue
+            _seen_bins[$_bin]=1
             _real="$(readlink -f "$_bin" 2>/dev/null || echo "$_bin")"
             if [[ "$_real" == "$_this" ]]; then
                 printf "  ${GREEN}★${NC} %s  ${DIM}(this)${NC}\n" "$_bin"
             else
                 printf "  ${YELLOW}⚠${NC} %s  ${DIM}→ %s (shadowing or conflict)${NC}\n" "$_bin" "$_real"
             fi
-        done < <(command -v serial-connect 2>/dev/null; \
-                 IFS=':'; for d in $PATH; do [[ -x "$d/serial-connect" ]] && echo "$d/serial-connect"; done 2>/dev/null | sort -u)
+        done < <(IFS=':'; for d in $PATH; do [[ -x "$d/serial-connect" ]] && echo "$d/serial-connect"; done 2>/dev/null | sort -u)
         echo ""
         # Config
         printf "${BOLD}Config:${NC}\n"
