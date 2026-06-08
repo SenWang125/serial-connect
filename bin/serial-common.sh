@@ -13,30 +13,22 @@ if [[ -n "$_mate_prof" ]]; then
 fi
 unset _mate_prof _allow_bold
 
-# ── Config paths ───────────────────────────────────────────────────────────────
-# Two-layer config: system conf (chip table + probe settings, read-only for
-# non-root) and user conf (per-user label overrides, always writable).
-#
-# System conf search order: script dir → /etc
-# User conf: ~/.config/serial-boards.conf (labels only, written by --label)
-# Override both at runtime: BOARD_CFG=/path serial-connect
+# ── Config path ────────────────────────────────────────────────────────────────
+# Single conf file per install — no per-user overrides.
+#   Local install:  ~/.serial-connect/serial-boards.conf  (next to scripts)
+#   Global install: /etc/serial-boards.conf               (set by installer)
+# Override at runtime: BOARD_CFG=/path serial-connect
 _COMMON_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
-
-if [[ -n "${BOARD_CFG:-}" ]]; then
-    # Explicit override: single-file mode (backward compat / scripting)
-    _SYSTEM_CFG="$BOARD_CFG"
-    _LABEL_CFG="$BOARD_CFG"
-else
-    # System conf: chip table + probe settings
-    if   [[ -f "$_COMMON_DIR/serial-boards.conf" ]]; then _SYSTEM_CFG="$_COMMON_DIR/serial-boards.conf"
-    elif [[ -f "/etc/serial-boards.conf"          ]]; then _SYSTEM_CFG="/etc/serial-boards.conf"
-    else                                                    _SYSTEM_CFG="$_COMMON_DIR/serial-boards.conf"
+if [[ -z "${BOARD_CFG:-}" ]]; then
+    if [[ -f "$_COMMON_DIR/serial-boards.conf" ]]; then
+        BOARD_CFG="$_COMMON_DIR/serial-boards.conf"
+    else
+        BOARD_CFG="/etc/serial-boards.conf"
     fi
-    # User conf: per-user label overrides (may not exist yet)
-    _LABEL_CFG="${HOME}/.config/serial-boards.conf"
-    # BOARD_CFG points to label file for --help display and rewrite_labels
-    BOARD_CFG="$_LABEL_CFG"
 fi
+# Internal aliases — kept for compatibility with load_config/rewrite_labels
+_SYSTEM_CFG="$BOARD_CFG"
+_LABEL_CFG="$BOARD_CFG"
 
 # Per-user probe cache to avoid cross-user permission conflicts.
 SIG_FILE="/tmp/serial-connect-${USER}.sig"
@@ -294,13 +286,12 @@ load_cache() {
 rewrite_labels() {
     local -n _rl=$1
     [[ ${#_rl[@]} -eq 0 ]] && return 0
-    # If BOARD_CFG is not writable (e.g. /etc/serial-boards.conf on global install),
-    # fall back to per-user label conf, creating it if needed.
     if [[ ! -w "$BOARD_CFG" && ! -w "$(dirname "$BOARD_CFG")" ]]; then
-        BOARD_CFG="${HOME}/.config/serial-boards.conf"
-        mkdir -p "$(dirname "$BOARD_CFG")"
+        echo "Labels stored in $BOARD_CFG — requires admin access." >&2
+        echo "Run: sudo serial-connect --label" >&2
+        return 1
     fi
-    [[ ! -f "$BOARD_CFG" ]] && printf '# serial-boards.conf — per-user board labels\n' > "$BOARD_CFG"
+    [[ ! -f "$BOARD_CFG" ]] && { echo "Config not found: $BOARD_CFG" >&2; return 1; }
     local tmpfile; tmpfile=$(mktemp "${BOARD_CFG}.XXXXXX") || return 1
     local -A _done
     while IFS= read -r line; do

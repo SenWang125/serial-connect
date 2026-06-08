@@ -261,18 +261,14 @@ _TMP_LINK  = Path('/tmp/serial-agent')
 AGENT_BASE = Path(os.environ.get('SERIAL_AGENT_DIR', str(_REAL_BASE)))
 
 def _resolve_board_cfg() -> Path:
-    """Return the writable label config path for auto-label and label writes.
-    Matches serial-common.sh: per-user ~/.config first, then system conf."""
+    """Return the board config path. Matches serial-common.sh single-file model:
+    script dir first (local install), /etc fallback (global install)."""
     if env := os.environ.get('BOARD_CFG'):
         return Path(env)
-    user_cfg = Path.home() / '.config' / 'serial-boards.conf'
-    if user_cfg.exists():
-        return user_cfg
-    # If writable system conf exists, use it; otherwise default to user cfg
-    for p in [_SCRIPT_DIR / 'serial-boards.conf', Path('/etc/serial-boards.conf')]:
-        if p.exists():
-            return p if os.access(p, os.W_OK) else user_cfg
-    return user_cfg
+    local_cfg = _SCRIPT_DIR / 'serial-boards.conf'
+    if local_cfg.exists():
+        return local_cfg
+    return Path('/etc/serial-boards.conf')
 
 
 # ── Tunables ───────────────────────────────────────────────────────────────────
