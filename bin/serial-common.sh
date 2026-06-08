@@ -5,6 +5,13 @@
 # ── Colours ────────────────────────────────────────────────────────────────────
 BOLD=$'\033[1m'; GREEN=$'\033[32m'; CYAN=$'\033[36m'; YELLOW=$'\033[33m'
 DIM=$'\033[2m'; RED=$'\033[31m'; NC=$'\033[0m'
+# If MATE terminal has allow-bold=false, substitute cyan for bold so headers remain visible
+_mate_prof=$(dconf list /org/mate/terminal/profiles/ 2>/dev/null | head -1 | tr -d '/')
+if [[ -n "$_mate_prof" ]]; then
+    _allow_bold=$(dconf read /org/mate/terminal/profiles/${_mate_prof}/allow-bold 2>/dev/null)
+    [[ "$_allow_bold" == "false" ]] && BOLD=$'\033[36m'
+fi
+unset _mate_prof _allow_bold
 
 # ── Config paths ───────────────────────────────────────────────────────────────
 # Two-layer config: system conf (chip table + probe settings, read-only for
