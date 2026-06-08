@@ -156,6 +156,8 @@ launch() {
             _lock_acquire "$dev"
             trap '_lock_release "$dev"' EXIT INT TERM
             tio -b "$baud" -S "unix:$sock" "$tio_target" || {
+                stty sane 2>/dev/null || true
+                printf '\033[0m\033[?7h' 2>/dev/null || true
                 echo -e "\n${YELLOW}⚠${NC}  Port is in use by another user."
                 if sudo -n fuser "$dev" &>/dev/null 2>&1; then
                     echo -e "  ${DIM}Force-close: sudo fuser -k $dev${NC}"
