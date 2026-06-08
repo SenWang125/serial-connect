@@ -17,14 +17,80 @@ Usage: serial-connect [OPTION | /dev/ttyXXX]
   (no args)        interactive port picker with live probe
   /dev/ttyXXX      connect directly to a specific port
   --label          interactively assign labels to connected boards
+  --doctor         show installation health: paths, config, daemons, conflicts
   -h, --help       show this help
 
 Environment:
   SERIAL_TERM      terminal to use: tio (default), screen, picocom, minicom
-  BOARD_CFG        path to serial-boards.conf (default: same dir as this script)
+  BOARD_CFG        path to serial-boards.conf (override auto-detection)
 
-Config: ${BOARD_CFG}
+System config:  ${_SYSTEM_CFG}
+Label config:   ${_LABEL_CFG}
 EOF
+        exit 0 ;;
+
+    --doctor)
+        echo ""
+        printf "${BOLD}serial-connect doctor${NC}\n"
+        echo "─────────────────────"
+        echo ""
+        # Installations in PATH
+        printf "${BOLD}Installations found in PATH:${NC}\n"
+        _this="$(readlink -f "${BASH_SOURCE[0]}")"
+        while IFS= read -r _bin; do
+            _real="$(readlink -f "$_bin" 2>/dev/null || echo "$_bin")"
+            if [[ "$_real" == "$_this" ]]; then
+                printf "  ${GREEN}★${NC} %s  ${DIM}(this)${NC}\n" "$_bin"
+            else
+                printf "  ${YELLOW}⚠${NC} %s  ${DIM}→ %s (shadowing or conflict)${NC}\n" "$_bin" "$_real"
+            fi
+        done < <(command -v serial-connect 2>/dev/null; \
+                 IFS=':'; for d in $PATH; do [[ -x "$d/serial-connect" ]] && echo "$d/serial-connect"; done 2>/dev/null | sort -u)
+        echo ""
+        # Config
+        printf "${BOLD}Config:${NC}\n"
+        printf "  System conf:  %s" "$_SYSTEM_CFG"
+        [[ -f "$_SYSTEM_CFG" ]] && printf "  ${GREEN}✓${NC}\n" || printf "  ${RED}✗ not found${NC}\n"
+        printf "  Label conf:   %s" "$_LABEL_CFG"
+        [[ -f "$_LABEL_CFG" ]] && printf "  ${GREEN}✓${NC}\n" || printf "  ${DIM}(not created yet)${NC}\n"
+        echo ""
+        # Running daemons
+        printf "${BOLD}Running serial-agent daemons:${NC}\n"
+        _base="${HOME}/var/serial-agent"
+        _found_daemon=0
+        if [[ -d "$_base" ]]; then
+            for _ddir in "$_base"/*/; do
+                _dn="$(basename "$_ddir")"
+                _pf="$_ddir/daemon.pid"
+                [[ -f "$_pf" ]] || continue
+                _pid=$(cat "$_pf" 2>/dev/null)
+                if [[ -d "/proc/$_pid" ]]; then
+                    _state=$(python3 -c "import json; print(json.load(open('$_ddir/status.json')).get('state','?'))" 2>/dev/null || echo "?")
+                    _lock=""
+                    [[ -f "/tmp/serial-connect-locks/$_dn" ]] && _lock="  ${DIM}[lock ✓]${NC}"
+                    printf "  ${GREEN}●${NC} /dev/%-14s  PID %-8s  %s%b\n" "$_dn" "$_pid" "$_state" "$_lock"
+                    _found_daemon=1
+                fi
+            done
+        fi
+        (( _found_daemon )) || printf "  ${DIM}none${NC}\n"
+        echo ""
+        # Lock files
+        printf "${BOLD}Active port locks (/tmp/serial-connect-locks/):${NC}\n"
+        _found_lock=0
+        if [[ -d "/tmp/serial-connect-locks" ]]; then
+            for _lf in /tmp/serial-connect-locks/*; do
+                [[ -f "$_lf" ]] || continue
+                _lpid=$(awk 'NR==1' "$_lf" 2>/dev/null)
+                _luser=$(awk 'NR==2' "$_lf" 2>/dev/null)
+                if [[ -d "/proc/$_lpid" ]]; then
+                    printf "  ${CYAN}⊙${NC} /dev/%-14s  PID %-8s  user: %s\n" "$(basename "$_lf")" "$_lpid" "$_luser"
+                    _found_lock=1
+                fi
+            done
+        fi
+        (( _found_lock )) || printf "  ${DIM}none${NC}\n"
+        echo ""
         exit 0 ;;
 esac
 

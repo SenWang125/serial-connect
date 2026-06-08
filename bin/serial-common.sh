@@ -6,16 +6,29 @@
 BOLD=$'\033[1m'; GREEN=$'\033[32m'; CYAN=$'\033[36m'; YELLOW=$'\033[33m'
 DIM=$'\033[2m'; RED=$'\033[31m'; NC=$'\033[0m'
 
-# ── Config path ────────────────────────────────────────────────────────────────
-# Defaults to serial-boards.conf in the same directory as the sourcing script.
-# Override at runtime: BOARD_CFG=/path/to/serial-boards.conf serial-connect
+# ── Config paths ───────────────────────────────────────────────────────────────
+# Two-layer config: system conf (chip table + probe settings, read-only for
+# non-root) and user conf (per-user label overrides, always writable).
+#
+# System conf search order: script dir → /etc
+# User conf: ~/.config/serial-boards.conf (labels only, written by --label)
+# Override both at runtime: BOARD_CFG=/path serial-connect
 _COMMON_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
-if [[ -z "${BOARD_CFG:-}" ]]; then
-    if   [[ -f "$HOME/.config/serial-boards.conf" ]]; then BOARD_CFG="$HOME/.config/serial-boards.conf"
-    elif [[ -f "$_COMMON_DIR/serial-boards.conf"  ]]; then BOARD_CFG="$_COMMON_DIR/serial-boards.conf"
-    elif [[ -f "/etc/serial-boards.conf"           ]]; then BOARD_CFG="/etc/serial-boards.conf"
-    else                                                     BOARD_CFG="$_COMMON_DIR/serial-boards.conf"
+
+if [[ -n "${BOARD_CFG:-}" ]]; then
+    # Explicit override: single-file mode (backward compat / scripting)
+    _SYSTEM_CFG="$BOARD_CFG"
+    _LABEL_CFG="$BOARD_CFG"
+else
+    # System conf: chip table + probe settings
+    if   [[ -f "$_COMMON_DIR/serial-boards.conf" ]]; then _SYSTEM_CFG="$_COMMON_DIR/serial-boards.conf"
+    elif [[ -f "/etc/serial-boards.conf"          ]]; then _SYSTEM_CFG="/etc/serial-boards.conf"
+    else                                                    _SYSTEM_CFG="$_COMMON_DIR/serial-boards.conf"
     fi
+    # User conf: per-user label overrides (may not exist yet)
+    _LABEL_CFG="${HOME}/.config/serial-boards.conf"
+    # BOARD_CFG points to label file for --help display and rewrite_labels
+    BOARD_CFG="$_LABEL_CFG"
 fi
 
 # Per-user probe cache to avoid cross-user permission conflicts.
@@ -63,17 +76,19 @@ baud_display() {
 }
 
 # ── load_config ────────────────────────────────────────────────────────────────
-# Reads BOARD_CFG and populates:
-#   CFG_LABEL[serial]  — board label from SERIAL=LABEL
-#   CFG_BAUD[serial]   — per-board baud from SERIAL=LABEL:BAUD
-#   CHIP_NAMES[vid:pid] — chip name from VID:PID=NAME
-#   CHIP_BAUD[vid:pid]  — chip default baud from VID:PID=NAME:BAUD
-#   PROBE_BAUDS, PROBE_PARALLEL, PROBE_READ_MS, PROBE_DRAIN_MS — tuning
-load_config() {
-    [[ -f "$BOARD_CFG" ]] || return
+# Reads system conf (chip table + probe tuning) then user label conf (overrides).
+# Populates: CFG_LABEL, CFG_BAUD, CHIP_NAMES, CHIP_BAUD, PROBE_BAUDS, tuning vars.
+_load_conf_file() {
+    local file="$1" labels_only="${2:-0}"
+    [[ -f "$file" ]] || return
     while IFS='=' read -r key val; do
         [[ "$key" =~ ^[[:space:]]*# || -z "${key// /}" ]] && continue
         key="${key// /}"; val="${val%%#*}"; val="${val// /}"
+        if (( labels_only )); then
+            # User label conf: only process board serial→label entries
+            [[ "$key" =~ ^[0-9a-fA-F]{4}: ]] && continue  # skip chip table
+            [[ "$key" =~ ^(PROBE_|REPROBE_) ]] && continue # skip probe tuning
+        fi
         # Probe tuning scalars
         if [[ "$key" =~ ^(PROBE_(PARALLEL|READ_MS|DRAIN_MS)|REPROBE_DEAD)$ ]]; then
             [[ "$val" =~ ^[0-9]+$ ]] && printf -v "$key" '%s' "$val"
@@ -101,7 +116,7 @@ load_config() {
             fi
             continue
         fi
-        # Vendor wildcard: VID:xxxx=NAME or VID:xxxx=NAME:BAUD — matches any unlisted PID for that vendor
+        # Vendor wildcard: VID:xxxx=NAME or VID:xxxx=NAME:BAUD
         if [[ "$key" =~ ^[0-9a-fA-F]{4}:xxxx$ ]]; then
             local vid="${key%%:*}" wname="${val%%:*}"
             [[ -n "$wname" ]] && CHIP_WILDCARD["$vid"]="$wname"
@@ -118,7 +133,13 @@ load_config() {
             local b; b=$(parse_baud "$extra")
             (( b > 9600 )) && CFG_BAUD["$key"]="$b"
         fi
-    done < "$BOARD_CFG"
+    done < "$file"
+}
+
+load_config() {
+    _load_conf_file "$_SYSTEM_CFG" 0          # chip table + probe settings + shared labels
+    [[ "$_LABEL_CFG" != "$_SYSTEM_CFG" ]] && \
+        _load_conf_file "$_LABEL_CFG" 1        # per-user label overrides (labels only)
 }
 
 # ── get_baud ───────────────────────────────────────────────────────────────────
@@ -260,7 +281,13 @@ load_cache() {
 rewrite_labels() {
     local -n _rl=$1
     [[ ${#_rl[@]} -eq 0 ]] && return 0
-    [[ ! -f "$BOARD_CFG" ]] && { echo "Config not found: $BOARD_CFG" >&2; return 1; }
+    # If BOARD_CFG is not writable (e.g. /etc/serial-boards.conf on global install),
+    # fall back to per-user label conf, creating it if needed.
+    if [[ ! -w "$BOARD_CFG" && ! -w "$(dirname "$BOARD_CFG")" ]]; then
+        BOARD_CFG="${HOME}/.config/serial-boards.conf"
+        mkdir -p "$(dirname "$BOARD_CFG")"
+    fi
+    [[ ! -f "$BOARD_CFG" ]] && printf '# serial-boards.conf — per-user board labels\n' > "$BOARD_CFG"
     local tmpfile; tmpfile=$(mktemp "${BOARD_CFG}.XXXXXX") || return 1
     local -A _done
     while IFS= read -r line; do

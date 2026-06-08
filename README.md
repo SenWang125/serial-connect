@@ -26,15 +26,15 @@ The installer asks whether to install for the current user or system-wide:
 ```bash
 ./install.sh --local                 # current user only (default)
 sudo ./install.sh --global           # all users, system-wide
+./install.sh --upgrade               # re-install silently, keep existing choices
 ./install.sh --term tio              # set default terminal non-interactively
-./install.sh --term tio,screen       # install multiple terminals
 ```
 
 **Serial port access (udev rules)**
 
 The installer sets up a udev rule that gives all users access to `/dev/ttyUSB*` and `/dev/ttyACM*` without needing the `dialout` group or a re-login. It also prevents ModemManager from locking ports.
 
-If you don't have sudo (e.g. installing as a guest user), the installer will print the command for an admin to run once:
+If you don't have sudo (e.g. a guest account), the installer prints the command for an admin to run once:
 ```bash
 sudo cp udev/99-serial-connect.rules /etc/udev/rules.d/
 sudo udevadm control --reload-rules && sudo udevadm trigger
@@ -42,12 +42,48 @@ sudo udevadm control --reload-rules && sudo udevadm trigger
 
 **Uninstall:**
 ```bash
-./uninstall.sh              # removes local install (~/.serial-connect/)
-sudo ./uninstall.sh --global  # removes global install + udev rules
+./uninstall.sh                    # stops daemons, removes local install
+sudo ./uninstall.sh --global      # stops daemons, removes global install + udev rules
 ```
 
 **Requirements:** bash ≥ 5.1, python3
 **Optional:** `tio`, `screen`, `ser2net`, `inotify-tools`
+
+---
+
+## Shared machine setup
+
+On a machine with multiple users, one user owns the serial-agent daemons and serial ports. Other users can monitor port status and connect via ser2net multiplexing.
+
+**Setup (run as the port owner):**
+```bash
+# 1. Install globally so all users have the tools
+sudo ./install.sh --global
+
+# 2. Start a daemon for each board
+serial-agent start /dev/ttyUSB5
+
+# 3. Optional: expose via ser2net so others can attach
+serial-agent ser2net-gen | sudo tee /etc/ser2net.yaml
+sudo systemctl restart ser2net
+```
+
+**Other users** can then:
+```bash
+serial-connect          # see board status (OPEN = held by another user)
+serial-agent list       # see running daemons and board states
+```
+
+**Board labels** are stored in two layers:
+- `/etc/serial-boards.conf` — chip table + shared labels (admin-managed, read by all users)
+- `~/.config/serial-boards.conf` — per-user label overrides (writable without sudo)
+
+Running `serial-connect --label` writes to the per-user conf automatically.
+
+**Diagnose conflicts:**
+```bash
+serial-connect --doctor   # shows installations, config paths, daemons, lock files
+```
 
 ---
 

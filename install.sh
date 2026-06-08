@@ -3,9 +3,10 @@
 #
 # Usage:
 #   ./install.sh                    # interactive
-#   ./install.sh --term tio         # non-interactive, tio as default terminal
 #   ./install.sh --local            # current user only (default)
 #   sudo ./install.sh --global      # all users (/usr/local/bin)
+#   ./install.sh --term tio         # set default terminal non-interactively
+#   ./install.sh --upgrade          # re-install without prompts (keeps existing choices)
 
 set -euo pipefail
 
@@ -13,16 +14,18 @@ INSTALL_DIR=""
 TERM_CHOICE=""
 GLOBAL=0
 SCOPE_SET=0
+UPGRADE=0
 
 # ── Parse args ─────────────────────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --global)  GLOBAL=1; SCOPE_SET=1; shift ;;
         --local)   GLOBAL=0; SCOPE_SET=1; shift ;;
+        --upgrade) UPGRADE=1; SCOPE_SET=1; shift ;;
         --term)    TERM_CHOICE="$2"; shift 2 ;;
         --term=*)  TERM_CHOICE="${1#--term=}"; shift ;;
         --help|-h)
-            echo "Usage: ./install.sh [--local|--global] [--term tio|screen|minicom|picocom]"
+            echo "Usage: ./install.sh [--local|--global|--upgrade] [--term tio|screen|minicom|picocom]"
             exit 0 ;;
         *)         INSTALL_DIR="$1"; shift ;;
     esac
@@ -41,6 +44,15 @@ echo ""
 bold "serial-connect installer"
 echo "========================"
 echo ""
+
+# ── Upgrade: detect existing install and re-use its scope ─────────────────────
+if (( UPGRADE )); then
+    if [[ -d /usr/local/share/serial-connect ]]; then
+        GLOBAL=1
+    else
+        GLOBAL=0
+    fi
+fi
 
 # ── Scope prompt ───────────────────────────────────────────────────────────────
 if [[ -t 0 && $SCOPE_SET -eq 0 ]]; then
@@ -90,6 +102,40 @@ try_install() {
     fi
 }
 
+# ── Conflict detection ─────────────────────────────────────────────────────────
+echo ""
+bold "Checking for existing installations..."
+echo ""
+
+_found_conflict=0
+while IFS= read -r _existing; do
+    [[ -z "$_existing" ]] && continue
+    _existing_dir="$(dirname "$_existing")"
+    # Skip if it points to our own install target
+    [[ "$_existing_dir" == "$LINK_DIR" ]] && continue
+    [[ "$(readlink -f "$_existing" 2>/dev/null)" == "$INSTALL_DIR/"* ]] && continue
+    yellow "  ⚠ Found existing installation: $_existing"
+    _found_conflict=1
+done < <(command -v serial-connect serial-discover serial-agent 2>/dev/null | sort -u)
+
+if (( _found_conflict )); then
+    echo ""
+    if [[ -t 0 && $UPGRADE -eq 0 ]]; then
+        read -rp "  Remove conflicting installations? [Y/n]: " _rm || _rm="y"
+        if [[ "${_rm,,}" != "n" ]]; then
+            for _tool in serial-connect serial-discover serial-agent; do
+                _ep=$(command -v "$_tool" 2>/dev/null || true)
+                [[ -z "$_ep" ]] && continue
+                [[ "$(dirname "$_ep")" == "$LINK_DIR" ]] && continue
+                rm -f "$_ep" && dim "  · removed $_ep"
+            done
+            hash -r 2>/dev/null || true
+        fi
+    else
+        dim "  · skipping removal (non-interactive or --upgrade)"
+    fi
+fi
+
 # ── Required dependencies ──────────────────────────────────────────────────────
 echo ""
 bold "Checking required dependencies..."
@@ -132,6 +178,8 @@ UDEV_SRC="$SCRIPT_DIR/udev/99-serial-connect.rules"
 
 if [[ -f "$UDEV_DEST" ]]; then
     green "  ✓ udev rules already installed"
+elif [[ ! -f "$UDEV_SRC" ]]; then
+    yellow "  ⚠ udev rules source not found — skipping"
 elif (( HAS_SUDO )); then
     if sudo cp "$UDEV_SRC" "$UDEV_DEST" \
         && sudo udevadm control --reload-rules \
@@ -152,6 +200,14 @@ fi
 echo ""
 bold "Terminal emulators"
 echo ""
+
+# Detect current default from an existing install
+_current_term="tio"
+if [[ -f "$INSTALL_DIR/serial-connect" ]]; then
+    _ct=$(grep 'SERIAL_TERM=' "$INSTALL_DIR/serial-connect" 2>/dev/null | grep -o 'tio\|screen\|minicom\|picocom' | head -1)
+    [[ -n "$_ct" ]] && _current_term="$_ct"
+fi
+
 echo "  Select which terminals to install (comma-separated, e.g. 1,2)."
 echo "  The first choice becomes the default for serial-connect."
 echo "  tio + screen is recommended: tio for daily use, screen for sharing."
@@ -173,6 +229,8 @@ if [[ -n "$TERM_CHOICE" ]]; then
         [[ -z "${TERM_PKGS[$c]+x}" ]] && { red "Unknown terminal: $c. Valid: tio screen minicom picocom"; exit 1; }
         TERMS_TO_INSTALL+=("$c")
     done
+elif (( UPGRADE )); then
+    TERMS_TO_INSTALL=("$_current_term")
 elif [[ -t 0 ]]; then
     while true; do
         read -rp "  Choice [1-4, comma-separated, default=1,2]: " input
@@ -262,15 +320,19 @@ for tool in "${TOOLS[@]}"; do
     green "  ✓ $tool"
 done
 
+# Patch default terminal — reset to tio first to handle re-installs cleanly
+sed -i "s|SERIAL_TERM=\"\${SERIAL_TERM:-[^}]*}\"|SERIAL_TERM=\"\${SERIAL_TERM:-tio}\"|" \
+    "$INSTALL_DIR/serial-connect" 2>/dev/null || true
 if [[ "$TERM_CHOICE" != "tio" ]]; then
     sed -i "s|SERIAL_TERM=\"\${SERIAL_TERM:-tio}\"|SERIAL_TERM=\"\${SERIAL_TERM:-${TERM_CHOICE}}\"|" \
         "$INSTALL_DIR/serial-connect"
     dim "  · default terminal set to: $TERM_CHOICE"
 fi
 
+# System conf: created once; never overwritten to preserve user edits
 if [[ ! -f "$CONF_FILE" ]]; then
     cp "$SCRIPT_DIR/bin/serial-boards.conf" "$CONF_FILE"
-    green "  ✓ serial-boards.conf  (created)"
+    green "  ✓ serial-boards.conf  (created at $CONF_FILE)"
 else
     dim   "  · serial-boards.conf  (exists — not modified)"
 fi
@@ -285,27 +347,36 @@ for tool in serial-discover serial-connect serial-agent; do
     green "  ✓ $tool → $LINK_DIR/$tool"
 done
 
+# Add to PATH if needed (bash + zsh)
 if [[ ":$PATH:" != *":$LINK_DIR:"* ]]; then
     if (( GLOBAL )); then
-        echo ""
-        yellow "Note: $LINK_DIR is not yet in \$PATH for all users."
-        yellow "      Add to /etc/environment or /etc/profile.d/serial-connect.sh"
+        if [[ ! -f /etc/profile.d/serial-connect.sh ]]; then
+            printf 'export PATH="%s:$PATH"\n' "$LINK_DIR" > /etc/profile.d/serial-connect.sh
+            green "  ✓ added $LINK_DIR to /etc/profile.d/serial-connect.sh (all users)"
+        fi
     else
         LINE="export PATH=\"\$HOME/.local/bin:\$PATH\""
-        grep -qxF "$LINE" "$HOME/.bashrc" 2>/dev/null || echo "$LINE" >> "$HOME/.bashrc"
-        green "  ✓ added $LINK_DIR to ~/.bashrc"
+        for _rc in "$HOME/.bashrc" "$HOME/.zshrc"; do
+            [[ -f "$_rc" ]] || continue
+            grep -qxF "$LINE" "$_rc" 2>/dev/null || echo "$LINE" >> "$_rc"
+        done
+        # Create ~/.zshrc stub if zsh is the user's shell and no rc exists
+        if [[ "$SHELL" == */zsh && ! -f "$HOME/.zshrc" ]]; then
+            echo "$LINE" > "$HOME/.zshrc"
+        fi
+        green "  ✓ added $LINK_DIR to shell rc"
         dim   "    Run: source ~/.bashrc  or open a new terminal"
     fi
 fi
 
 # ── Restart running serial-agent daemons ──────────────────────────────────────
 _agent_bin="$INSTALL_DIR/serial-agent"
-if command -v "$_agent_bin" &>/dev/null || [[ -x "$_agent_bin" ]]; then
+if [[ -x "$_agent_bin" ]]; then
     _running=$(python3 -c "
-import os, pathlib, json
+import os, pathlib
 base = pathlib.Path.home() / 'var' / 'serial-agent'
 if base.exists():
-    for d in base.iterdir():
+    for d in sorted(base.iterdir()):
         pf = d / 'daemon.pid'
         if pf.exists():
             try:
@@ -316,12 +387,15 @@ if base.exists():
 " 2>/dev/null)
     if [[ -n "$_running" ]]; then
         echo ""
-        bold "Restarting running daemons..."
+        bold "Restarting running daemons to pick up new code..."
         echo ""
         while IFS= read -r _dev; do
-            "$_agent_bin" stop "/dev/$_dev" &>/dev/null
-            "$_agent_bin" start "/dev/$_dev" &>/dev/null
-            green "  ✓ restarted /dev/$_dev"
+            if "$_agent_bin" stop "/dev/$_dev" &>/dev/null \
+               && "$_agent_bin" start "/dev/$_dev" &>/dev/null; then
+                green "  ✓ restarted /dev/$_dev"
+            else
+                yellow "  ⚠ could not restart /dev/$_dev — restart manually: serial-agent stop/start /dev/$_dev"
+            fi
         done <<< "$_running"
     fi
 fi
