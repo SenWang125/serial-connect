@@ -113,7 +113,7 @@ LOCK_DIR="/tmp/serial-connect-locks"
 _lock_acquire() {
     local dev="$1"
     mkdir -p "$LOCK_DIR" && chmod 1777 "$LOCK_DIR" 2>/dev/null || true
-    printf '%s\n%s\n' "$$" "$USER" > "$LOCK_DIR/$(basename "$dev")"
+    printf '%s\n%s\n' "$$" "$USER" > "$LOCK_DIR/$(basename "$dev")" 2>/dev/null || true
 }
 
 _lock_release() {
@@ -157,7 +157,11 @@ launch() {
             trap '_lock_release "$dev"' EXIT INT TERM
             tio -b "$baud" -S "unix:$sock" "$tio_target" || {
                 echo -e "\n${YELLOW}⚠${NC}  Port is in use by another user."
-                echo -e "  ${DIM}To force-close: sudo fuser -k $dev${NC}"
+                if sudo -n fuser "$dev" &>/dev/null 2>&1; then
+                    echo -e "  ${DIM}Force-close: sudo fuser -k $dev${NC}"
+                else
+                    echo -e "  ${DIM}Ask an admin to run: sudo fuser -k $dev${NC}"
+                fi
                 exit 1
             }
             exit 0
