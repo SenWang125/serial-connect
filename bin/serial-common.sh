@@ -13,22 +13,35 @@ if [[ -n "$_mate_prof" ]]; then
 fi
 unset _mate_prof _allow_bold
 
-# ── Config path ────────────────────────────────────────────────────────────────
-# Single conf file per install — no per-user overrides.
-#   Local install:  ~/.serial-connect/serial-boards.conf  (next to scripts)
-#   Global install: /etc/serial-boards.conf               (set by installer)
-# Override at runtime: BOARD_CFG=/path serial-connect
+# ── Config paths ───────────────────────────────────────────────────────────────
+# Follows the standard Unix two-layer pattern (git/minicom/OpenOCD model):
+#
+#   Global install  (scripts in /usr/local/... or /opt/...):
+#     System conf:  /etc/serial-boards.conf           — chip table + admin labels
+#                   read-only for non-root; admin edits directly or via sudo --label
+#     User conf:    ~/.config/serial-connect/boards.conf — per-user labels + SERIAL_TERM
+#                   always writable; shadows system conf key-by-key
+#
+#   Local install   (scripts in ~/...):
+#     Single conf:  <script-dir>/serial-boards.conf   — everything in one file
+#
+# Override: BOARD_CFG=/path serial-connect  (single-file mode, skips layering)
 _COMMON_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
-if [[ -z "${BOARD_CFG:-}" ]]; then
-    if [[ -f "$_COMMON_DIR/serial-boards.conf" ]]; then
-        BOARD_CFG="$_COMMON_DIR/serial-boards.conf"
-    else
-        BOARD_CFG="/etc/serial-boards.conf"
-    fi
+
+if [[ -n "${BOARD_CFG:-}" ]]; then
+    _SYSTEM_CFG="$BOARD_CFG"
+    _LABEL_CFG="$BOARD_CFG"
+elif [[ "$_COMMON_DIR" == /usr/* || "$_COMMON_DIR" == /opt/* ]]; then
+    # Global install — two-layer
+    _SYSTEM_CFG="/etc/serial-boards.conf"
+    _LABEL_CFG="${XDG_CONFIG_HOME:-$HOME/.config}/serial-connect/boards.conf"
+    BOARD_CFG="$_LABEL_CFG"
+else
+    # Local install — single file next to scripts
+    _SYSTEM_CFG="$_COMMON_DIR/serial-boards.conf"
+    _LABEL_CFG="$_COMMON_DIR/serial-boards.conf"
+    BOARD_CFG="$_SYSTEM_CFG"
 fi
-# Internal aliases — kept for compatibility with load_config/rewrite_labels
-_SYSTEM_CFG="$BOARD_CFG"
-_LABEL_CFG="$BOARD_CFG"
 
 # Per-user probe cache to avoid cross-user permission conflicts.
 SIG_FILE="/tmp/serial-connect-${USER}.sig"
@@ -286,13 +299,23 @@ load_cache() {
 rewrite_labels() {
     local -n _rl=$1
     [[ ${#_rl[@]} -eq 0 ]] && return 0
-    if [[ ! -w "$BOARD_CFG" && ! -w "$(dirname "$BOARD_CFG")" ]]; then
-        echo "Labels stored in $BOARD_CFG — requires admin access." >&2
-        echo "Run: sudo serial-connect --label" >&2
+    # Always write to user label conf (_LABEL_CFG), creating it if needed
+    local _target="$_LABEL_CFG"
+    if [[ ! -f "$_target" ]]; then
+        mkdir -p "$(dirname "$_target")" 2>/dev/null || true
+        printf '# serial-connect — per-user board labels\n# Overrides /etc/serial-boards.conf key-by-key\n' \
+            > "$_target" 2>/dev/null || {
+            echo "Cannot create $_target — check permissions." >&2; return 1
+        }
+    fi
+    if [[ ! -w "$_target" ]]; then
+        echo "Label config not writable: $_target" >&2
+        echo "Run: sudo serial-connect --label  (to update system config)" >&2
         return 1
     fi
-    [[ ! -f "$BOARD_CFG" ]] && { echo "Config not found: $BOARD_CFG" >&2; return 1; }
-    local tmpfile; tmpfile=$(mktemp "${BOARD_CFG}.XXXXXX") || return 1
+    # Update BOARD_CFG to point at write target for caller display
+    BOARD_CFG="$_target"
+    local tmpfile; tmpfile=$(mktemp "${_target}.XXXXXX") || return 1
     local -A _done
     while IFS= read -r line; do
         if [[ "$line" =~ ^[[:space:]]*# ]] || [[ "$line" != *=* ]]; then
@@ -311,7 +334,7 @@ rewrite_labels() {
         else
             printf '%s\n' "$line"
         fi
-    done < "$BOARD_CFG" > "$tmpfile"
+    done < "$_target" > "$tmpfile"
     local first=1 ser
     for ser in "${!_rl[@]}"; do
         [[ -n "${_done[$ser]+x}" || -z "${_rl[$ser]}" ]] && continue
@@ -321,7 +344,7 @@ rewrite_labels() {
         fi
         printf '%s=%s\n' "$ser" "${_rl[$ser]}" >> "$tmpfile"
     done
-    mv "$tmpfile" "$BOARD_CFG" || { rm -f "$tmpfile"; return 1; }
+    mv "$tmpfile" "$_target" || { rm -f "$tmpfile"; return 1; }
 }
 
 # ── run_probes ─────────────────────────────────────────────────────────────────

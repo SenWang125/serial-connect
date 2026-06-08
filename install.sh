@@ -206,10 +206,13 @@ echo ""
 
 # Detect current default from existing conf
 _current_term="tio"
-if [[ -f "$CONF_FILE" ]]; then
-    _ct=$(grep '^SERIAL_TERM=' "$CONF_FILE" 2>/dev/null | cut -d= -f2 | tr -d ' ' || true)
-    if [[ "$_ct" =~ ^(tio|screen|minicom|picocom)$ ]]; then _current_term="$_ct"; fi
-fi
+_uc="${XDG_CONFIG_HOME:-$HOME/.config}/serial-connect/boards.conf"
+for _cf in "$_uc" "$CONF_FILE"; do
+    [[ -f "$_cf" ]] || continue
+    _ct=$(grep '^SERIAL_TERM=' "$_cf" 2>/dev/null | tail -1 | cut -d= -f2 | tr -d ' ' || true)
+    if [[ "$_ct" =~ ^(tio|screen|minicom|picocom)$ ]]; then _current_term="$_ct"; break; fi
+done
+unset _uc _cf _ct
 
 if (( !UPGRADE )); then
 echo "  Select which terminals to install (comma-separated, e.g. 1,2)."
@@ -325,19 +328,33 @@ for tool in "${TOOLS[@]}"; do
     green "  ✓ $tool"
 done
 
-# System conf: created once; never overwritten to preserve user edits
+# System conf (chip table + admin labels): created once, never overwritten
 if [[ ! -f "$CONF_FILE" ]]; then
     cp "$SCRIPT_DIR/bin/serial-boards.conf" "$CONF_FILE"
-    green "  ✓ serial-boards.conf  (created at $CONF_FILE)"
+    green "  ✓ system conf created: $CONF_FILE"
 else
-    dim   "  · serial-boards.conf  (exists — not modified)"
+    dim   "  · system conf exists — not modified: $CONF_FILE"
 fi
 
-# Write terminal preference to conf
-if grep -q "^SERIAL_TERM=" "$CONF_FILE" 2>/dev/null; then
-    sed -i "s|^SERIAL_TERM=.*|SERIAL_TERM=${TERM_CHOICE}|" "$CONF_FILE"
-elif [[ -f "$CONF_FILE" ]]; then
-    printf '\nSERIAL_TERM=%s\n' "$TERM_CHOICE" >> "$CONF_FILE"
+# User conf: ~/.config/serial-connect/boards.conf (global) or same as system (local)
+# SERIAL_TERM is a user preference — goes in user conf, never in system conf
+if (( GLOBAL )); then
+    _user_conf="${XDG_CONFIG_HOME:-$HOME/.config}/serial-connect/boards.conf"
+else
+    _user_conf="$CONF_FILE"
+fi
+mkdir -p "$(dirname "$_user_conf")" 2>/dev/null || true
+if [[ ! -f "$_user_conf" ]]; then
+    if (( GLOBAL )); then
+        printf '# serial-connect — per-user labels and preferences\n# Overrides /etc/serial-boards.conf key-by-key\nSERIAL_TERM=%s\n' "$TERM_CHOICE" > "$_user_conf"
+        green "  ✓ user conf created:   $_user_conf"
+    fi
+else
+    if grep -q "^SERIAL_TERM=" "$_user_conf" 2>/dev/null; then
+        sed -i "s|^SERIAL_TERM=.*|SERIAL_TERM=${TERM_CHOICE}|" "$_user_conf"
+    else
+        printf '\nSERIAL_TERM=%s\n' "$TERM_CHOICE" >> "$_user_conf"
+    fi
 fi
 dim "  · default terminal: $TERM_CHOICE"
 

@@ -261,14 +261,16 @@ _TMP_LINK  = Path('/tmp/serial-agent')
 AGENT_BASE = Path(os.environ.get('SERIAL_AGENT_DIR', str(_REAL_BASE)))
 
 def _resolve_board_cfg() -> Path:
-    """Return the board config path. Matches serial-common.sh single-file model:
-    script dir first (local install), /etc fallback (global install)."""
+    """Return the writable label config. Matches serial-common.sh two-layer model:
+    Global install (script in /usr/... or /opt/...): XDG user conf ~/.config/serial-connect/boards.conf
+    Local install (script in ~/...): script-dir/serial-boards.conf"""
     if env := os.environ.get('BOARD_CFG'):
         return Path(env)
-    local_cfg = _SCRIPT_DIR / 'serial-boards.conf'
-    if local_cfg.exists():
-        return local_cfg
-    return Path('/etc/serial-boards.conf')
+    is_global = str(_SCRIPT_DIR).startswith(('/usr/', '/opt/'))
+    if is_global:
+        xdg = Path(os.environ.get('XDG_CONFIG_HOME', Path.home() / '.config'))
+        return xdg / 'serial-connect' / 'boards.conf'
+    return _SCRIPT_DIR / 'serial-boards.conf'
 
 
 # ── Tunables ───────────────────────────────────────────────────────────────────
