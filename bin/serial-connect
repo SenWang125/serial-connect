@@ -429,15 +429,30 @@ while true; do
     }
     if [[ "${ROW_STATE[$choice]}" == "OPEN" ]]; then
         echo ""
+        # Use lock file as source of truth (cross-user safe)
+        _lf="/tmp/serial-connect-locks/$(basename "${ROW_DEV[$choice]}")"
+        _lock_user=""; _lock_pid=""
+        if [[ -f "$_lf" ]]; then
+            _lock_pid=$(awk 'NR==1' "$_lf" 2>/dev/null)
+            _lock_user=$(awk 'NR==2' "$_lf" 2>/dev/null)
+        fi
         echo -e "  ${CYAN}⊙${NC} ${ROW_DEV[$choice]} is currently held by:"
-        fuser -v "${ROW_DEV[$choice]}" 2>&1 | grep -v '^\s*$' | sed 's/^/    /'
+        if [[ -n "$_lock_user" ]]; then
+            echo -e "    user: ${_lock_user}  PID: ${_lock_pid}"
+        else
+            fuser -v "${ROW_DEV[$choice]}" 2>&1 | grep -v '^\s*$' | sed 's/^/    /'
+        fi
         echo ""
-        # Check if we can kill the holding process (same user or root)
-        _holder_uid=$(fuser "${ROW_DEV[$choice]}" 2>/dev/null | tr ' ' '\n' | grep -E '^[0-9]+$' | head -1 | xargs -I{} awk -F: 'NR==1{print $9}' /proc/{}/status 2>/dev/null | head -1)
-        if [[ -n "$_holder_uid" && "$_holder_uid" != "$(id -u)" ]] && ! sudo -n true 2>/dev/null; then
-            echo -e "  ${YELLOW}⚠${NC}  Port held by another user — cannot force-close."
-            echo -e "  ${DIM}To force-close: sudo fuser -k ${ROW_DEV[$choice]}${NC}"
-            echo ""
+        # Determine if we can force-close
+        _can_kill=0
+        if [[ -z "$_lock_user" || "$_lock_user" == "$USER" ]]; then
+            _can_kill=1
+        elif sudo -n true 2>/dev/null; then
+            _can_kill=1
+        fi
+        if (( !_can_kill )); then
+            echo -e "  ${YELLOW}⚠${NC}  Held by user '${_lock_user}' — ask an admin to run:"
+            echo -e "  ${DIM}sudo fuser -k ${ROW_DEV[$choice]}${NC}\n"
             continue
         fi
         read -rp "  Force close and connect? [y/N]: " confirm || { printf "\n"; exit 0; }
@@ -445,7 +460,11 @@ while true; do
             echo -e "  ${DIM}↩ back to port selection${NC}\n"
             continue
         fi
-        fuser -k "${ROW_DEV[$choice]}" 2>/dev/null
+        if [[ -n "$_lock_user" && "$_lock_user" != "$USER" ]]; then
+            sudo fuser -k "${ROW_DEV[$choice]}" 2>/dev/null || true
+        else
+            fuser -k "${ROW_DEV[$choice]}" 2>/dev/null || true
+        fi
         sleep 0.3
         rm -f "$CACHE_FILE" "$SIG_FILE"
         echo -e "  ${GREEN}Session closed.${NC}\n"
