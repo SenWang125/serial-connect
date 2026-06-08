@@ -78,8 +78,11 @@ fi
 
 # ── Sudo availability ──────────────────────────────────────────────────────────
 HAS_SUDO=0
-(( EUID == 0 )) && HAS_SUDO=1
-(( HAS_SUDO )) || sudo -n true 2>/dev/null && HAS_SUDO=1 || true
+if (( EUID == 0 )); then
+    HAS_SUDO=1
+elif sudo -n true 2>/dev/null; then
+    HAS_SUDO=1
+fi
 
 # ── Package manager detection ──────────────────────────────────────────────────
 pkg_install_cmd() {
@@ -322,14 +325,6 @@ for tool in "${TOOLS[@]}"; do
     green "  ✓ $tool"
 done
 
-# Write terminal preference to conf (no script patching)
-if grep -q "^SERIAL_TERM=" "$CONF_FILE" 2>/dev/null; then
-    sed -i "s|^SERIAL_TERM=.*|SERIAL_TERM=${TERM_CHOICE}|" "$CONF_FILE"
-else
-    printf '\nSERIAL_TERM=%s\n' "$TERM_CHOICE" >> "$CONF_FILE"
-fi
-dim "  · default terminal: $TERM_CHOICE (set in $(basename "$CONF_FILE"))"
-
 # System conf: created once; never overwritten to preserve user edits
 if [[ ! -f "$CONF_FILE" ]]; then
     cp "$SCRIPT_DIR/bin/serial-boards.conf" "$CONF_FILE"
@@ -337,6 +332,14 @@ if [[ ! -f "$CONF_FILE" ]]; then
 else
     dim   "  · serial-boards.conf  (exists — not modified)"
 fi
+
+# Write terminal preference to conf
+if grep -q "^SERIAL_TERM=" "$CONF_FILE" 2>/dev/null; then
+    sed -i "s|^SERIAL_TERM=.*|SERIAL_TERM=${TERM_CHOICE}|" "$CONF_FILE"
+elif [[ -f "$CONF_FILE" ]]; then
+    printf '\nSERIAL_TERM=%s\n' "$TERM_CHOICE" >> "$CONF_FILE"
+fi
+dim "  · default terminal: $TERM_CHOICE"
 
 # ── Symlink CLI tools ──────────────────────────────────────────────────────────
 mkdir -p "$LINK_DIR"
@@ -385,7 +388,7 @@ if base.exists():
                 os.kill(pid, 0)
                 print(d.name)
             except: pass
-" 2>/dev/null)
+" 2>/dev/null || true)
     if [[ -n "$_running" ]]; then
         echo ""
         bold "Restarting running daemons to pick up new code..."

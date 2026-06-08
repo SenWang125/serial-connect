@@ -274,14 +274,6 @@ def _resolve_board_cfg() -> Path:
             return p if os.access(p, os.W_OK) else user_cfg
     return user_cfg
 
-def _resolve_system_cfg() -> Path:
-    """Return the system conf (chip table + probe settings) — read-only on global install."""
-    if env := os.environ.get('BOARD_CFG'):
-        return Path(env)
-    for p in [_SCRIPT_DIR / 'serial-boards.conf', Path('/etc/serial-boards.conf')]:
-        if p.exists():
-            return p
-    return _SCRIPT_DIR / 'serial-boards.conf'
 
 # ── Tunables ───────────────────────────────────────────────────────────────────
 DEFAULT_LINES = 500      # buf.log ring buffer depth (lines)
@@ -398,9 +390,15 @@ def devdir(device: str) -> Path:
     return d
 
 def ensure_symlink():
+    """Keep /tmp/serial-agent pointing to the current user's storage.
+    If it points elsewhere (another user created it first), update it."""
     try:
-        if not _TMP_LINK.exists() and not _TMP_LINK.is_symlink():
-            _REAL_BASE.mkdir(parents=True, exist_ok=True)
+        _REAL_BASE.mkdir(parents=True, exist_ok=True)
+        if _TMP_LINK.is_symlink():
+            if _TMP_LINK.resolve() != _REAL_BASE.resolve():
+                _TMP_LINK.unlink()
+                _TMP_LINK.symlink_to(_REAL_BASE)
+        elif not _TMP_LINK.exists():
             _TMP_LINK.symlink_to(_REAL_BASE)
     except OSError:
         pass
@@ -688,6 +686,7 @@ class Daemon:
         self._lock_file = Path('/tmp/serial-connect-locks') / Path(self.device).name
         try:
             self._lock_file.parent.mkdir(mode=0o1777, exist_ok=True)
+            os.chmod(self._lock_file.parent, 0o1777)  # enforce sticky+world-write despite umask
             self._lock_file.write_text(f'{os.getpid()}\n{os.environ.get("USER", "")}\n')
         except OSError:
             self._lock_file = None
