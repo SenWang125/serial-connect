@@ -131,28 +131,16 @@ launch() {
     local _devname; _devname=$(basename "$dev")
     local agent_status="${HOME}/var/serial-agent/$_devname/status.json"
     [[ ! -f "$agent_status" ]] && agent_status="/tmp/serial-agent/$_devname/status.json"
-    local _apid_file="/tmp/serial-agent/$_devname/daemon.pid"
-    local _agent_live=0
-    if [[ -f "$_apid_file" ]]; then
-        local _apid; _apid=$(cat "$_apid_file" 2>/dev/null)
-        [[ -n "$_apid" ]] && [[ -d "/proc/$_apid" ]] && _agent_live=1
-    fi
-    if [[ -f "$agent_status" ]] && (( _agent_live )); then
-        local via; via=$(python3 -c "import json,sys; print(json.load(open('$agent_status')).get('via',''))" 2>/dev/null)
-        [[ "$via" == tcp:* ]] && agent_tcp="${via#tcp:}"
-    fi
+    local _agent_live; _agent_is_alive "$_devname" _agent_live
+    (( _agent_live )) && _read_agent_tcp_via "$agent_status" agent_tcp
     # tio only: if serial-agent is available but not running, auto-start it now so
     # tio connects via the built-in relay from the start.  Prevents the byte-splitting
     # and Disconnected/Connected noise that occurs when serial-agent starts mid-session
     # and grabs the physical port away from a tio already connected directly.
-    if [[ "${SERIAL_TERM}" == "tio" ]] && (( !_agent_live )) \
-            && command -v serial-agent &>/dev/null; then
+    if (( !_agent_live )) && command -v serial-agent &>/dev/null; then
         echo -e "  ${DIM}auto-starting serial-agent for $(basename "$dev") ...${NC}"
         serial-agent start "$dev" --baud "$baud" > /dev/null 2>&1 || true
-        if [[ -f "$agent_status" ]]; then
-            local via; via=$(python3 -c "import json,sys; print(json.load(open('$agent_status')).get('via',''))" 2>/dev/null)
-            [[ "$via" == tcp:* ]] && agent_tcp="${via#tcp:}"
-        fi
+        _read_agent_tcp_via "$agent_status" agent_tcp
     fi
     # Always reset device to a known-good state. Clears IXON, CRTSCTS, raw mode
     # etc. that a previous holder killed with SIGKILL may have left in the kernel
@@ -198,11 +186,7 @@ if [[ -n "${1:-}" && "${1:-}" != "--label" ]]; then
     baud="${PROBE_BAUDS[0]}"
     for i in "${!DEVS[@]}"; do [[ "${DEVS[$i]}" == "$dev" ]] && baud="${BAUDS[$i]}" && break; done
     trap 'printf "\n"; exit 0' INT
-    while true; do
-        read -rp "$(baud_prompt "$baud"): " b || { printf "\n"; exit 0; }
-        baud_valid "$b" && { [[ -n "$b" ]] && baud=$(parse_baud "$b"); break; }
-        echo "  Invalid — examples: 115200  115.2K  1.5M" >&2
-    done
+    _prompt_baud baud
     launch "$dev" "$baud"
 fi
 
@@ -237,18 +221,7 @@ elif [[ -f "$CACHE_FILE" ]]; then
         if { fuser "${DEVS[$i]}" &>/dev/null 2>&1 \
             || sudo -n fuser "${DEVS[$i]}" &>/dev/null 2>&1 \
             || (( _lock_live )); }; then
-            if [[ -z "$_bid" ]]; then
-                _sjson="/tmp/serial-agent/$(basename "${DEVS[$i]}")/status.json"
-                if [[ -f "$_sjson" ]]; then
-                    _pt=$(grep -o '"prompt_text"[[:space:]]*:[[:space:]]*"[^"]*"' "$_sjson" 2>/dev/null \
-                        | sed 's/.*"prompt_text"[[:space:]]*:[[:space:]]*"\([^"]*\)"/\1/')
-                    if   [[ "$_pt" =~ @([A-Za-z0-9._-]+)[[:space:]]*: ]];       then _bid="${BASH_REMATCH[1]}"
-                    elif [[ "$_pt" =~ ([A-Za-z0-9._-]+)[[:space:]]+login: ]];    then _bid="${BASH_REMATCH[1]}"
-                    elif [[ "$_pt" =~ [Bb]oard:[[:space:]]*([A-Za-z0-9._-]+) ]]; then _bid="${BASH_REMATCH[1]}"
-                    elif [[ "$_pt" =~ ^([A-Za-z0-9._-]+):[~/] ]];               then _bid="${BASH_REMATCH[1]}"
-                    fi
-                fi
-            fi
+            [[ -z "$_bid" ]] && _agent_hostname "$(basename "${DEVS[$i]}")" _bid
             printf 'OPEN|%s|%s\n' "${_baud:-${BAUDS[$i]}}" "$_bid" > "$_pf"
         elif [[ "$_r" == "OPEN" ]]; then
             _stale_open_idxs+=("$i")
@@ -524,10 +497,6 @@ if [[ -f "$_lf" ]]; then
     fi
 fi
 
-while true; do
-    read -rp "$(baud_prompt "$sel_baud"): " b || { printf "\n"; exit 0; }
-    baud_valid "$b" && { [[ -n "$b" ]] && sel_baud=$(parse_baud "$b"); break; }
-    echo "  Invalid — examples: 115200  115.2K  1.5M" >&2
-done
+_prompt_baud sel_baud
 
 launch "$sel_dev" "$sel_baud"

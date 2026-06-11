@@ -87,6 +87,17 @@ baud_display() {
     fi
 }
 
+# ── _prompt_baud ───────────────────────────────────────────────────────────────
+# Interactively prompt for a baud rate change; updates the named variable.
+# Usage: _prompt_baud VARNAME  (reads/writes the variable named by VARNAME)
+_prompt_baud() {
+    while true; do
+        read -rp "$(baud_prompt "${!1}"): " b || { printf "\n"; exit 0; }
+        baud_valid "$b" && { [[ -n "$b" ]] && printf -v "$1" '%s' "$(parse_baud "$b")"; break; }
+        echo "  Invalid — examples: 115200  115.2K  1.5M" >&2
+    done
+}
+
 # ── load_config ────────────────────────────────────────────────────────────────
 # Reads system conf (chip table + probe tuning) then user label conf (overrides).
 # Populates: CFG_LABEL, CFG_BAUD, CHIP_NAMES, CHIP_BAUD, PROBE_BAUDS, tuning vars.
@@ -163,6 +174,53 @@ load_config() {
 # Resolve baud for a device: per-board override > chip default > 115200
 get_baud() { local vid="${1%%:*}"; echo "${CFG_BAUD[$2]:-${CHIP_BAUD[$1]:-${CHIP_BAUD_WILDCARD[$vid]:-${PROBE_BAUDS[0]}}}}"; }
 
+# ── _extract_hostname ──────────────────────────────────────────────────────────
+# Parse a hostname from a shell prompt or login banner string.
+# Usage: _extract_hostname TEXT OUTVAR  (sets OUTVAR; clears it on no match)
+# Patterns: user@host:  /  host login:  /  Board: host  /  host:~/path
+_extract_hostname() {
+    printf -v "$2" '%s' ''
+    if   [[ "$1" =~ @([A-Za-z0-9._-]+)[[:space:]]*: ]];       then printf -v "$2" '%s' "${BASH_REMATCH[1]}"
+    elif [[ "$1" =~ ([A-Za-z0-9._-]+)[[:space:]]+login: ]];    then printf -v "$2" '%s' "${BASH_REMATCH[1]}"
+    elif [[ "$1" =~ [Bb]oard:[[:space:]]*([A-Za-z0-9._-]+) ]]; then printf -v "$2" '%s' "${BASH_REMATCH[1]}"
+    elif [[ "$1" =~ ^([A-Za-z0-9._-]+):[~/] ]];               then printf -v "$2" '%s' "${BASH_REMATCH[1]}"
+    fi
+}
+
+# ── _agent_hostname ────────────────────────────────────────────────────────────
+# Extract hostname from serial-agent's status.json prompt_text for DEVNAME.
+# Usage: _agent_hostname DEVNAME OUTVAR
+_agent_hostname() {
+    printf -v "$2" '%s' ''
+    local _sjson="/tmp/serial-agent/$1/status.json"
+    [[ -f "$_sjson" ]] || return
+    local _pt
+    _pt=$(grep -o '"prompt_text"[[:space:]]*:[[:space:]]*"[^"]*"' "$_sjson" 2>/dev/null \
+        | sed 's/.*"prompt_text"[[:space:]]*:[[:space:]]*"\([^"]*\)"/\1/')
+    [[ -n "$_pt" ]] && _extract_hostname "$_pt" "$2"
+}
+
+# ── _agent_is_alive ────────────────────────────────────────────────────────────
+# Set OUTVAR to 1 if the serial-agent daemon is running for DEVNAME, else 0.
+# Usage: _agent_is_alive DEVNAME OUTVAR
+_agent_is_alive() {
+    printf -v "$2" '%s' '0'
+    local _pf="/tmp/serial-agent/$1/daemon.pid"
+    [[ -f "$_pf" ]] || return
+    local _pid; _pid=$(cat "$_pf" 2>/dev/null) || return
+    [[ -n "$_pid" && -d "/proc/$_pid" ]] && printf -v "$2" '%s' '1'
+}
+
+# ── _read_agent_tcp_via ────────────────────────────────────────────────────────
+# Read the TCP relay address from serial-agent's status.json.
+# Usage: _read_agent_tcp_via STATUS_JSON OUTVAR  (sets OUTVAR to host:port or "")
+_read_agent_tcp_via() {
+    printf -v "$2" '%s' ''
+    [[ -f "$1" ]] || return
+    local _v; _v=$(python3 -c "import json,sys; print(json.load(open('$1')).get('via',''))" 2>/dev/null)
+    [[ "$_v" == tcp:* ]] && printf -v "$2" '%s' "${_v#tcp:}"
+}
+
 # ── probe_tty ──────────────────────────────────────────────────────────────────
 # Probe a single tty: send CR, try each baud in PROBE_BAUDS order, detect live.
 # Output: STATUS|BAUD|board_id  (STATUS: LIVE OPEN DEAD FAIL)
@@ -181,23 +239,9 @@ probe_tty() {
             rm -f "$_lockfile" 2>/dev/null || true
         fi
     fi
-    if [[ -f "$_agent_pidfile" ]]; then
-        local _a_pid; _a_pid=$(cat "$_agent_pidfile" 2>/dev/null)
-        [[ -n "$_a_pid" ]] && [[ -d "/proc/$_a_pid" ]] && _agent_alive=1
-    fi
+    _agent_is_alive "$_devname" _agent_alive
     if (( _agent_alive )); then
-        local _sjson="/tmp/serial-agent/$_devname/status.json"
-        local _hostname=""
-        if [[ -f "$_sjson" ]]; then
-            local _pt
-            _pt=$(grep -o '"prompt_text"[[:space:]]*:[[:space:]]*"[^"]*"' "$_sjson" 2>/dev/null \
-                | sed 's/.*"prompt_text"[[:space:]]*:[[:space:]]*"\([^"]*\)"/\1/')
-            if   [[ "$_pt" =~ @([A-Za-z0-9._-]+)[[:space:]]*: ]];       then _hostname="${BASH_REMATCH[1]}"
-            elif [[ "$_pt" =~ ([A-Za-z0-9._-]+)[[:space:]]+login: ]];    then _hostname="${BASH_REMATCH[1]}"
-            elif [[ "$_pt" =~ [Bb]oard:[[:space:]]*([A-Za-z0-9._-]+) ]]; then _hostname="${BASH_REMATCH[1]}"
-            elif [[ "$_pt" =~ ^([A-Za-z0-9._-]+):[~/] ]];               then _hostname="${BASH_REMATCH[1]}"
-            fi
-        fi
+        local _hostname; _agent_hostname "$_devname" _hostname
         printf 'OPEN|%s|%s\n' "$cfg_baud" "$_hostname"
         return
     fi
@@ -272,12 +316,7 @@ probe_tty() {
 
     [[ -z "$detected" ]] && { printf 'DEAD|%s|\n' "$cfg_baud"; return; }
 
-    local id=""
-    if   [[ "$captured" =~ @([A-Za-z0-9._-]+)[[:space:]]*: ]];       then id="${BASH_REMATCH[1]}"
-    elif [[ "$captured" =~ ([A-Za-z0-9._-]+)[[:space:]]+login: ]];    then id="${BASH_REMATCH[1]}"
-    elif [[ "$captured" =~ [Bb]oard:[[:space:]]*([A-Za-z0-9._-]+) ]]; then id="${BASH_REMATCH[1]}"
-    elif [[ "$captured" =~ ^([A-Za-z0-9._-]+):[~/] ]];               then id="${BASH_REMATCH[1]}"
-    fi
+    local id; _extract_hostname "$captured" id
     # No fallback to raw captured text — garbage output leaves the board unlabelled.
     printf 'LIVE|%s|%s\n' "$detected" "$id"
 }
