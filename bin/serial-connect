@@ -529,24 +529,6 @@ while true; do
         sleep 0.1
         stty sane 2>/dev/null || true
         printf '\033[0m\033[?7h' 2>/dev/null || true  # reset terminal attributes + re-enable line wrap
-        # Re-probe all ports of the freed adapter immediately so the cache
-        # reflects the actual post-release state before the next menu render.
-        _freed_ser=""
-        for i in "${!DEVS[@]}"; do
-            [[ "${DEVS[$i]}" == "${ROW_DEV[$choice]}" ]] && _freed_ser="${SERS[$i]}" && break
-        done
-        if [[ -n "$_freed_ser" ]]; then
-            _freed_idxs=()
-            for i in "${!DEVS[@]}"; do
-                [[ "${SERS[$i]}" == "$_freed_ser" ]] && _freed_idxs+=("$i")
-            done
-            for i in "${_freed_idxs[@]}"; do
-                _PROBE_TIMEOUTS["$(basename "${DEVS[$i]}")"]=$(( PROBE_READ_MS * PROBE_READ_SCALE ))
-            done
-            run_probes "${_freed_idxs[@]}"
-            _PROBE_TIMEOUTS=()
-            save_cache "$PROBE_DIR"
-        fi
         echo -e "  ${GREEN}Session closed.${NC}\n"
     fi
     break
