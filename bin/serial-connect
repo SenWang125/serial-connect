@@ -143,6 +143,19 @@ launch() {
         local via; via=$(python3 -c "import json,sys; print(json.load(open('$agent_status')).get('via',''))" 2>/dev/null)
         [[ "$via" == tcp:* ]] && agent_tcp="${via#tcp:}"
     fi
+    # tio only: if serial-agent is available but not running, auto-start it now so
+    # tio connects via the built-in relay from the start.  Prevents the byte-splitting
+    # and Disconnected/Connected noise that occurs when serial-agent starts mid-session
+    # and grabs the physical port away from a tio already connected directly.
+    if [[ "${SERIAL_TERM}" == "tio" ]] && (( !_agent_live )) \
+            && command -v serial-agent &>/dev/null; then
+        echo -e "  ${DIM}auto-starting serial-agent for $(basename "$dev") ...${NC}"
+        serial-agent start "$dev" --baud "$baud" > /dev/null 2>&1 || true
+        if [[ -f "$agent_status" ]]; then
+            local via; via=$(python3 -c "import json,sys; print(json.load(open('$agent_status')).get('via',''))" 2>/dev/null)
+            [[ "$via" == tcp:* ]] && agent_tcp="${via#tcp:}"
+        fi
+    fi
     # Always reset device to a known-good state. Clears IXON, CRTSCTS, raw mode
     # etc. that a previous holder killed with SIGKILL may have left in the kernel
     # TTY state. tio/screen/minicom all apply their own settings on top, so this
