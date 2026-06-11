@@ -46,8 +46,8 @@ sudo udevadm control --reload-rules && sudo udevadm trigger
 sudo ./uninstall.sh --global      # stops daemons, removes global install + udev rules
 ```
 
-**Requirements:** bash ≥ 5.1, python3
-**Optional:** `tio`, `screen`, `ser2net`, `inotify-tools`
+**Requirements:** bash ≥ 5.1, python3, `tio`
+**Optional:** `ser2net`, `inotify-tools`
 
 ---
 
@@ -135,8 +135,6 @@ serial-connect --label       # rename boards interactively
 serial-connect --help        # show usage
 ```
 
-Override terminal: `SERIAL_TERM=screen serial-connect`
-
 ### Labelling boards
 
 `serial-connect --label` opens an interactive editor to assign human-readable names to connected boards. Labels are saved by USB serial number and persist across reboots and re-enumeration.
@@ -177,7 +175,7 @@ serial-discover --json                   # all ports as JSON
 serial-discover --json | jq '.[] | select(.label=="AM62D2-EVM")' # filter by label
 serial-discover --gen-udev   # write /tmp/99-serial-aliases.rules — copy to /etc/udev/rules.d/ to make permanent
 serial-discover --tmp-udev   # create /dev/tty<LABEL> symlinks for this session — useful for debugging
-                             # or when external tools need a stable /dev path (e.g. minicom -D /dev/ttyMyBoard)
+                             # or when external tools need a stable /dev path directly
 serial-discover --rm-udev    # remove installed rules and session symlinks
 ```
 

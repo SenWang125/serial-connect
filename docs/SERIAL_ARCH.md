@@ -19,21 +19,26 @@ serial-discover  ─────────────────────
   • ttyACM skipped (USB CDC_SET_LINE_CODING blocks for ~12s)
   • BOARD_ID propagated: one LIVE port names ALL ports of same USB serial
 
-serial-connect  ────────────────────────────────────────────────────────────► human terminal
-  • interactive menu (tio / screen / minicom / picocom via $SERIAL_TERM)
+serial-connect  ────────────────────────────────────────────────────────────► human terminal (tio)
+  • interactive menu with live probe
   • cache: /tmp/serial-connect.{sig,cache} — avoids reprobing on each run
   • selective re-probe: only unrecognized boards checked each run
-  • auto-detects ser2net TCP (reads serial-agent status.json) → tio tcp:...
+  • auto-starts serial-agent if not running → tio connects via built-in relay TCP
+  • auto-detects relay/ser2net TCP (reads serial-agent status.json) → tio tcp:...
   • HUPCL cleared before probe + sudo -n fuser for root-owned sessions
 
 tio.sh [N|/dev/ttyXXX] [baud]  ────────────────────────────────────────────► tmux session
   • named tmux session per device (reattaches if exists)
   • tio with unix socket: /tmp/ttyUSBx.sock  ← socat can share it
 
-ser2net  (optional, recommended for coexistence)
-  • holds physical serial port exclusively
-  • fans bytes to multiple TCP clients (human tio + agent daemon both get FULL stream)
-  • without ser2net: human and agent split bytes (data corruption)
+serial-agent built-in TCP relay  (automatic, no configuration needed)
+  • daemon binds ephemeral 127.0.0.1 port on startup
+  • fans bytes to tio and any other TCP clients (full stream to each)
+  • status.json reports via: "tcp:127.0.0.1:PORT" — serial-connect auto-detects
+
+ser2net  (optional, for multi-user / network access)
+  • holds physical serial port exclusively, fans to TCP clients
+  • takes precedence over built-in relay when configured
   • config: /etc/ser2net.yaml  (generate with: serial-agent ser2net-gen)
 
 serial-agent daemon ──────────────────────────────────────────────────────► ~/var/serial-agent/DEVICE/
@@ -141,21 +146,23 @@ serial-agent send/run/health...
 
 ---
 
-## Ser2net Coexistence
+## Coexistence (tio + serial-agent)
 
-**Without ser2net (WRONG — bytes split):**
+**Default — built-in relay (no configuration needed):**
 ```
-board → /dev/ttyUSB1 ← tio (gets some bytes)
-                     ← serial-agent daemon (gets other bytes)  ← DATA CORRUPTION
+board → /dev/ttyUSB1 ← serial-agent daemon
+                              ├─→ tio tcp:127.0.0.1:PORT        (human, full stream)
+                              └─→ any other TCP client           (full stream)
 ```
+serial-connect auto-starts serial-agent before launching tio.
+serial-agent binds an ephemeral loopback port and fans bytes to all TCP clients.
 
-**With ser2net (CORRECT — full stream to each):**
+**Optional — ser2net (multi-user / network access):**
 ```
 board → /dev/ttyUSB1 ← ser2net:3001
                               ├─→ tio tcp:localhost:3001         (human, full stream)
                               └─→ serial-agent daemon TCP        (agent, full stream)
 ```
-
 Generate ser2net config: `serial-agent ser2net-gen --output /tmp/ser2net.yaml`
 Install: `sudo cp /tmp/ser2net.yaml /etc/ser2net.yaml && sudo systemctl restart ser2net`
 
@@ -169,7 +176,6 @@ Install: `sudo cp /tmp/ser2net.yaml /etc/ser2net.yaml && sudo systemctl restart 
 | Terminal line wrapping | Board's shell has narrow default terminal | Use `--no-wrap` flag OR `connect --setup-terminal` (runs `stty cols 220`) |
 | `--exit-code` with `exit` cmd | `exit` kills shell before EXITCODE echo can run | Use `run DEVICE script.sh` instead |
 | Stale daemons after crash | D-state processes can't be SIGKILL'd quickly | `serial-agent stop DEVICE` now uses fuser to kill all holders |
-| Root-owned minicom invisible to fuser | `/proc/N/fd/` not readable by other users | `sudo -n fuser` fallback added |
 | UBOOT/PANIC detection untested | No live board in final test session | Regex added; state machine logic is correct |
 
 ---

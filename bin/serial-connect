@@ -5,7 +5,6 @@
 #
 # Probe results are cached per device topology. Re-probes only when the device
 # set changes or new unrecognized boards appear.
-# Override terminal: SERIAL_TERM=screen serial-connect
 
 source "$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)/serial-common.sh"
 
@@ -21,7 +20,6 @@ Usage: serial-connect [OPTION | /dev/ttyXXX]
   -h, --help       show this help
 
 Environment:
-  SERIAL_TERM      terminal to use: tio (default), screen, picocom, minicom
   BOARD_CFG        path to serial-boards.conf (override auto-detection)
 
 System config:  ${_SYSTEM_CFG}
@@ -158,63 +156,34 @@ launch() {
     fi
     # Always reset device to a known-good state. Clears IXON, CRTSCTS, raw mode
     # etc. that a previous holder killed with SIGKILL may have left in the kernel
-    # TTY state. tio/screen/minicom all apply their own settings on top, so this
-    # is a safe no-op when none of those flags were dirty.
+    # TTY state. tio applies its own settings on top, so this is a safe no-op.
     stty -F "$dev" "$baud" cs8 -parenb -cstopb -crtscts clocal -hupcl 2>/dev/null
 
-    case "${SERIAL_TERM}" in
-        tio)
-            command -v tio &>/dev/null || { echo "tio not found: sudo apt install tio" >&2; exit 1; }
-            local sock="/tmp/$(basename "$dev")-${USER}.sock"
-            # TCP relay via ser2net is tio-specific; screen/minicom connect directly.
-            local tio_target="$dev"
-            if [[ -n "$agent_tcp" ]]; then
-                local _relay_label="ser2net"
-                [[ "$agent_tcp" == 127.0.0.1:* ]] && _relay_label="built-in relay"
-                echo -e "  ${DIM}serial-agent via ${_relay_label} tcp:${agent_tcp} — connecting tio there${NC}"
-                echo -e "  ${DIM}Both tio and agent receive the full stream independently.${NC}"
-                tio_target="tcp:$agent_tcp"
-            fi
-            echo -e "\n${GREEN}→${NC} tio $tio_target @ $(baud_display "$baud")  ${DIM}(Ctrl-T Q to quit)${NC}"
-            echo -e "  ${DIM}Share: socat - UNIX-CONNECT:$sock${NC}\n"
-            _lock_acquire "$dev"
-            trap '_lock_release "$dev"' EXIT INT TERM
-            tio -b "$baud" -S "unix:$sock" "$tio_target" || {
-                stty sane 2>/dev/null || true
-                printf '\033[0m\033[?7h' 2>/dev/null || true
-                echo -e "\n${YELLOW}⚠${NC}  Port is in use by another user."
-                if sudo -n fuser "$dev" &>/dev/null 2>&1; then
-                    echo -e "  ${DIM}Force-close: sudo fuser -k $dev${NC}"
-                else
-                    echo -e "  ${DIM}Ask an admin to run: sudo fuser -k $dev${NC}"
-                fi
-                exit 1
-            }
-            exit 0
-            ;;
-        screen)
-            command -v screen &>/dev/null || { echo "screen not found: sudo apt install screen" >&2; exit 1; }
-            local sname; sname="$(basename "$dev")"
-            echo -e "\n${GREEN}→${NC} screen $dev @ $(baud_display "$baud")  ${DIM}(Ctrl-A K to kill)${NC}"
-            echo -e "  ${DIM}Share: screen -x $sname${NC}\n"
-            _lock_acquire "$dev"
-            trap '_lock_release "$dev"' EXIT INT TERM
-            screen -S "$sname" "$dev" "$baud"
-            ;;
-        picocom)
-            command -v picocom &>/dev/null || { echo "picocom not found" >&2; exit 1; }
-            echo -e "\n${GREEN}→${NC} picocom $dev @ $(baud_display "$baud")  ${DIM}(Ctrl-A Ctrl-X to exit)${NC}\n"
-            _lock_acquire "$dev"
-            trap '_lock_release "$dev"' EXIT INT TERM
-            picocom -b "$baud" --imap lfcrnl "$dev"
-            ;;
-        minicom|*)
-            echo -e "\n${GREEN}→${NC} minicom $dev @ $(baud_display "$baud")  ${DIM}(Ctrl-A X to exit)${NC}\n"
-            _lock_acquire "$dev"
-            trap '_lock_release "$dev"' EXIT INT TERM
-            minicom -D "$dev" -b "$baud" -w -c on
-            ;;
-    esac
+    command -v tio &>/dev/null || { echo "tio not found: sudo apt install tio" >&2; exit 1; }
+    local sock="/tmp/$(basename "$dev")-${USER}.sock"
+    local tio_target="$dev"
+    if [[ -n "$agent_tcp" ]]; then
+        local _relay_label="ser2net"
+        [[ "$agent_tcp" == 127.0.0.1:* ]] && _relay_label="built-in relay"
+        echo -e "  ${DIM}serial-agent via ${_relay_label} tcp:${agent_tcp} — connecting tio there${NC}"
+        echo -e "  ${DIM}Both tio and agent receive the full stream independently.${NC}"
+        tio_target="tcp:$agent_tcp"
+    fi
+    echo -e "\n${GREEN}→${NC} tio $tio_target @ $(baud_display "$baud")  ${DIM}(Ctrl-T Q to quit)${NC}"
+    echo -e "  ${DIM}Share: socat - UNIX-CONNECT:$sock${NC}\n"
+    _lock_acquire "$dev"
+    trap '_lock_release "$dev"' EXIT INT TERM
+    tio -b "$baud" -S "unix:$sock" "$tio_target" || {
+        stty sane 2>/dev/null || true
+        printf '\033[0m\033[?7h' 2>/dev/null || true
+        echo -e "\n${YELLOW}⚠${NC}  Port is in use by another user."
+        if sudo -n fuser "$dev" &>/dev/null 2>&1; then
+            echo -e "  ${DIM}Force-close: sudo fuser -k $dev${NC}"
+        else
+            echo -e "  ${DIM}Ask an admin to run: sudo fuser -k $dev${NC}"
+        fi
+        exit 1
+    }
 }
 
 
@@ -514,7 +483,7 @@ while true; do
             serial-agent stop "${ROW_DEV[$choice]}" 2>/dev/null || true
         fi
 
-        # Step 2: SIGTERM all remaining holders (tio, minicom, ser2net, etc.)
+        # Step 2: SIGTERM all remaining holders (tio, ser2net, etc.)
         # giving them a chance to restore their own terminal settings.
         $_fuser_pfx -TERM "${ROW_DEV[$choice]}" 2>/dev/null || true
 

@@ -309,7 +309,6 @@ serial-agent wait-state "$DEV" SHELL          # block until shell ready
 serial-agent stop "$DEV"                      # kill daemon (fuses all holders)
 
 # Environment overrides
-SERIAL_TERM=minicom serial-connect             # use minicom instead of tio
 SERIAL_AGENT_DIR=/custom/path serial-agent ... # custom state directory
 BOARD=AM62D2-EVM serial-agent connect ...      # specify board
 ```

@@ -25,7 +25,7 @@ while [[ $# -gt 0 ]]; do
         --term)    TERM_CHOICE="$2"; shift 2 ;;
         --term=*)  TERM_CHOICE="${1#--term=}"; shift ;;
         --help|-h)
-            echo "Usage: ./install.sh [--local|--global|--upgrade] [--term tio|screen|minicom|picocom]"
+            echo "Usage: ./install.sh [--local|--global|--upgrade] [--term tio]"
             exit 0 ;;
         *)         INSTALL_DIR="$1"; shift ;;
     esac
@@ -199,75 +199,14 @@ else
     dim    "    sudo udevadm control --reload-rules && sudo udevadm trigger"
 fi
 
-# ── Terminal emulator selection ────────────────────────────────────────────────
+# ── Terminal emulator ──────────────────────────────────────────────────────────
 echo ""
-bold "Terminal emulators"
+bold "Terminal emulator"
 echo ""
 
-# Detect current default from existing conf
-_current_term="tio"
-_uc="${XDG_CONFIG_HOME:-$HOME/.config}/serial-connect/boards.conf"
-for _cf in "$_uc" "$CONF_FILE"; do
-    [[ -f "$_cf" ]] || continue
-    _ct=$(grep '^SERIAL_TERM=' "$_cf" 2>/dev/null | tail -1 | cut -d= -f2 | tr -d ' ' || true)
-    if [[ "$_ct" =~ ^(tio|screen|minicom|picocom)$ ]]; then _current_term="$_ct"; break; fi
-done
-unset _uc _cf _ct
-
-if (( !UPGRADE )); then
-echo "  Select which terminals to install (comma-separated, e.g. 1,2)."
-echo "  The first choice becomes the default for serial-connect."
-echo "  tio + screen is recommended: tio for daily use, screen for sharing."
-echo ""
-echo "    1) tio      Modern, auto-reconnects on reset              (recommended)"
-echo "    2) screen   Shareable sessions: screen -x ttyUSBx          (recommended)"
-echo "    3) minicom  Classic serial terminal"
-echo "    4) picocom  Minimal, lightweight"
-echo ""
-fi  # end !UPGRADE display block
-
-declare -A TERM_PKGS=([tio]=tio [screen]=screen [minicom]=minicom [picocom]=picocom)
-declare -a TERMS_TO_INSTALL=()
+declare -a TERMS_TO_INSTALL=(tio)
 declare -a MISSING_PKGS=()
-
-if [[ -n "$TERM_CHOICE" ]]; then
-    IFS=',' read -ra _choices <<< "$TERM_CHOICE"
-    for c in "${_choices[@]}"; do
-        c="${c// /}"
-        [[ -z "${TERM_PKGS[$c]+x}" ]] && { red "Unknown terminal: $c. Valid: tio screen minicom picocom"; exit 1; }
-        TERMS_TO_INSTALL+=("$c")
-    done
-elif (( UPGRADE )); then
-    TERMS_TO_INSTALL=("$_current_term")
-elif [[ -t 0 ]]; then
-    while true; do
-        read -rp "  Choice [1-4, comma-separated, default=1,2]: " input
-        input="${input:-1,2}"
-        TERMS_TO_INSTALL=()
-        valid=1
-        IFS=',' read -ra nums <<< "$input"
-        for n in "${nums[@]}"; do
-            n="${n// /}"
-            case "$n" in
-                1) TERMS_TO_INSTALL+=(tio) ;;
-                2) TERMS_TO_INSTALL+=(screen) ;;
-                3) TERMS_TO_INSTALL+=(minicom) ;;
-                4) TERMS_TO_INSTALL+=(picocom) ;;
-                *) echo "  Invalid choice: $n — enter numbers 1-4 separated by commas"; valid=0; break ;;
-            esac
-        done
-        [[ $valid -eq 1 && ${#TERMS_TO_INSTALL[@]} -gt 0 ]] && break
-    done
-    declare -a _dedup=(); declare -A _seen=()
-    for t in "${TERMS_TO_INSTALL[@]}"; do
-        [[ -z "${_seen[$t]+x}" ]] && _dedup+=("$t") && _seen[$t]=1
-    done
-    TERMS_TO_INSTALL=("${_dedup[@]}")
-else
-    TERMS_TO_INSTALL=(tio)
-fi
-
-TERM_CHOICE="${TERMS_TO_INSTALL[0]}"
+TERM_CHOICE="tio"
 
 echo ""
 for t in "${TERMS_TO_INSTALL[@]}"; do
