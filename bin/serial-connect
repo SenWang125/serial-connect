@@ -250,12 +250,6 @@ elif [[ -f "$CACHE_FILE" ]]; then
         ser="${SERS[$i]}"
         result=$(cat "$PROBE_DIR/$(basename "${DEVS[$i]}")" 2>/dev/null || echo "")
         [[ "$result" =~ ^(LIVE|OPEN)\| ]] && _recog[$ser]=1
-        # If REPROBE_DEAD=0, skip re-probing serials with all-dead cache entries.
-        # Labeled boards are NOT exempted here: FT4232H and similar chips power up
-        # from USB host regardless of target board state, so the device signature
-        # never changes between board power-off and power-on — without this, a
-        # labeled board cached as dead would never be re-probed.
-        (( !REPROBE_DEAD )) && [[ "$result" =~ ^(DEAD|FAIL)\| ]] && _recog[$ser]=1
     done
     declare -a _reprobe_idxs=()
     for i in "${!DEVS[@]}"; do
