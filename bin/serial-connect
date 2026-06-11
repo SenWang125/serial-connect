@@ -259,7 +259,11 @@ elif [[ -f "$CACHE_FILE" ]]; then
         fi
     done
     if (( ${#_stale_open_idxs[@]} > 0 )); then
-        run_probes "${_stale_open_idxs[@]}"; save_cache "$PROBE_DIR"
+        local _prev_ms=$PROBE_READ_MS
+        (( PROBE_READ_MS < 300 )) && PROBE_READ_MS=300
+        run_probes "${_stale_open_idxs[@]}"
+        PROBE_READ_MS=$_prev_ms
+        save_cache "$PROBE_DIR"
     fi
     declare -A _recog
     for i in "${!DEVS[@]}"; do
@@ -285,7 +289,11 @@ elif [[ -f "$CACHE_FILE" ]]; then
         fi
     done
     if (( ${#_reprobe_idxs[@]} > 0 )); then
-        run_probes "${_reprobe_idxs[@]}"; save_cache "$PROBE_DIR"
+        local _prev_ms=$PROBE_READ_MS
+        (( PROBE_READ_MS < 300 )) && PROBE_READ_MS=300
+        run_probes "${_reprobe_idxs[@]}"
+        PROBE_READ_MS=$_prev_ms
+        save_cache "$PROBE_DIR"
     fi
     unset _recog
 else
