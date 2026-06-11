@@ -237,6 +237,18 @@ elif [[ -f "$CACHE_FILE" ]]; then
         if { fuser "${DEVS[$i]}" &>/dev/null 2>&1 \
             || sudo -n fuser "${DEVS[$i]}" &>/dev/null 2>&1 \
             || (( _lock_live )); }; then
+            if [[ -z "$_bid" ]]; then
+                _sjson="/tmp/serial-agent/$(basename "${DEVS[$i]}")/status.json"
+                if [[ -f "$_sjson" ]]; then
+                    _pt=$(grep -o '"prompt_text"[[:space:]]*:[[:space:]]*"[^"]*"' "$_sjson" 2>/dev/null \
+                        | sed 's/.*"prompt_text"[[:space:]]*:[[:space:]]*"\([^"]*\)"/\1/')
+                    if   [[ "$_pt" =~ @([A-Za-z0-9._-]+)[[:space:]]*: ]];       then _bid="${BASH_REMATCH[1]}"
+                    elif [[ "$_pt" =~ ([A-Za-z0-9._-]+)[[:space:]]+login: ]];    then _bid="${BASH_REMATCH[1]}"
+                    elif [[ "$_pt" =~ [Bb]oard:[[:space:]]*([A-Za-z0-9._-]+) ]]; then _bid="${BASH_REMATCH[1]}"
+                    elif [[ "$_pt" =~ ^([A-Za-z0-9._-]+):[~/] ]];               then _bid="${BASH_REMATCH[1]}"
+                    fi
+                fi
+            fi
             printf 'OPEN|%s|%s\n' "${_baud:-${BAUDS[$i]}}" "$_bid" > "$_pf"
         elif [[ "$_r" == "OPEN" ]]; then
             _stale_open_idxs+=("$i")
