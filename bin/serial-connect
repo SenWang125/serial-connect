@@ -137,7 +137,7 @@ launch() {
     # tio connects via the built-in relay from the start.  Prevents the byte-splitting
     # and Disconnected/Connected noise that occurs when serial-agent starts mid-session
     # and grabs the physical port away from a tio already connected directly.
-    if (( !_agent_live )) && command -v serial-agent &>/dev/null; then
+    if (( !_agent_live )) && command -v serial-agent &>/dev/null; then  # tio only: relies on TCP relay
         echo -e "  ${DIM}auto-starting serial-agent for $(basename "$dev") ...${NC}"
         serial-agent start "$dev" --baud "$baud" > /dev/null 2>&1 || true
         _read_agent_tcp_via "$agent_status" agent_tcp
