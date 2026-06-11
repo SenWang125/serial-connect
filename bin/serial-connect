@@ -259,10 +259,12 @@ elif [[ -f "$CACHE_FILE" ]]; then
         fi
     done
     if (( ${#_stale_open_idxs[@]} > 0 )); then
-        local _prev_ms=$PROBE_READ_MS
-        (( PROBE_READ_MS < 300 )) && PROBE_READ_MS=300
+        # Stale-OPEN: port was held recently — board was alive.  Use full scale factor.
+        for i in "${_stale_open_idxs[@]}"; do
+            _PROBE_TIMEOUTS["$(basename "${DEVS[$i]}")"]=$(( PROBE_READ_MS * PROBE_READ_SCALE ))
+        done
         run_probes "${_stale_open_idxs[@]}"
-        PROBE_READ_MS=$_prev_ms
+        _PROBE_TIMEOUTS=()
         save_cache "$PROBE_DIR"
     fi
     declare -A _recog
@@ -289,10 +291,17 @@ elif [[ -f "$CACHE_FILE" ]]; then
         fi
     done
     if (( ${#_reprobe_idxs[@]} > 0 )); then
-        local _prev_ms=$PROBE_READ_MS
-        (( PROBE_READ_MS < 300 )) && PROBE_READ_MS=300
+        # Dead boards: scale timeout based on history.
+        # Port has a cached hostname → was alive before → full scale factor.
+        # No hostname → never seen alive → default PROBE_READ_MS (no override).
+        for i in "${_reprobe_idxs[@]}"; do
+            _pf="$PROBE_DIR/$(basename "${DEVS[$i]}")"
+            IFS='|' read -r _ _ _hn _ < "$_pf" 2>/dev/null || true
+            [[ -n "$_hn" ]] && \
+                _PROBE_TIMEOUTS["$(basename "${DEVS[$i]}")"]=$(( PROBE_READ_MS * PROBE_READ_SCALE ))
+        done
         run_probes "${_reprobe_idxs[@]}"
-        PROBE_READ_MS=$_prev_ms
+        _PROBE_TIMEOUTS=()
         save_cache "$PROBE_DIR"
     fi
     unset _recog

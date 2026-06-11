@@ -50,7 +50,10 @@ CACHE_FILE="/tmp/serial-connect-${USER}.cache"
 # All defaults live in serial-boards.conf. Structures initialised empty here.
 declare -A CHIP_NAMES=() CHIP_BAUD=() CHIP_WILDCARD=() CHIP_BAUD_WILDCARD=() CFG_LABEL CFG_BAUD
 declare -a PROBE_BAUDS=()
-PROBE_PARALLEL=0 PROBE_READ_MS=100 PROBE_DRAIN_MS=10 REPROBE_DEAD=1
+PROBE_PARALLEL=0 PROBE_READ_MS=100 PROBE_DRAIN_MS=10 REPROBE_DEAD=1 PROBE_READ_SCALE=3
+# Per-device probe timeout overrides (devbasename → read_ms).
+# Populated by callers before run_probes; inherited by subshells.
+declare -A _PROBE_TIMEOUTS=()
 
 # ── parse_baud ─────────────────────────────────────────────────────────────────
 # Convert human-readable baud string to integer: 1.5M→1500000, 115.2K→115200
@@ -118,7 +121,7 @@ _load_conf_file() {
             continue
         fi
         # Probe tuning scalars
-        if [[ "$key" =~ ^(PROBE_(PARALLEL|READ_MS|DRAIN_MS)|REPROBE_DEAD)$ ]]; then
+        if [[ "$key" =~ ^(PROBE_(PARALLEL|READ_MS|DRAIN_MS|READ_SCALE)|REPROBE_DEAD)$ ]]; then
             [[ "$val" =~ ^[0-9]+$ ]] && printf -v "$key" '%s' "$val"
             continue
         fi
@@ -269,8 +272,9 @@ probe_tty() {
         done
     fi
 
+    local _eff_ms="${_PROBE_TIMEOUTS[$(basename "$dev")]:-$PROBE_READ_MS}"
     local read_t drain_t
-    read_t="$(( PROBE_READ_MS  / 1000 )).$(printf '%03d' $(( PROBE_READ_MS  % 1000 )))"
+    read_t="$(( _eff_ms   / 1000 )).$(printf '%03d' $(( _eff_ms   % 1000 )))"
     drain_t="$(( PROBE_DRAIN_MS / 1000 )).$(printf '%03d' $(( PROBE_DRAIN_MS % 1000 )))"
 
     local skip_stty=0
@@ -430,7 +434,9 @@ run_probes() {
             > "$PROBE_DIR/$(basename "${DEVS[$i]}")" ) &
         pids+=($!); (( active++ )) || true
     done
-    local wdog_s=$(( (${#PROBE_BAUDS[@]} * (PROBE_READ_MS + PROBE_DRAIN_MS) + 999) / 1000 + 1 ))
+    local _max_read=$PROBE_READ_MS _t
+    for _t in "${_PROBE_TIMEOUTS[@]}"; do (( _t > _max_read )) && _max_read=$_t; done
+    local wdog_s=$(( (${#PROBE_BAUDS[@]} * (_max_read + PROBE_DRAIN_MS) + 999) / 1000 + 1 ))
     ( sleep "$wdog_s"; kill -9 "${pids[@]}" 2>/dev/null ) &
     local wdog=$!
     wait "${pids[@]}" 2>/dev/null
