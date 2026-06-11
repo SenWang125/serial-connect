@@ -273,9 +273,10 @@ probe_tty() {
     fi
 
     local _eff_ms="${_PROBE_TIMEOUTS[$(basename "$dev")]:-$PROBE_READ_MS}"
+    local _eff_drain_ms=$(( PROBE_DRAIN_MS * _eff_ms / PROBE_READ_MS ))
     local read_t drain_t
-    read_t="$(( _eff_ms   / 1000 )).$(printf '%03d' $(( _eff_ms   % 1000 )))"
-    drain_t="$(( PROBE_DRAIN_MS / 1000 )).$(printf '%03d' $(( PROBE_DRAIN_MS % 1000 )))"
+    read_t="$(( _eff_ms        / 1000 )).$(printf '%03d' $(( _eff_ms        % 1000 )))"
+    drain_t="$(( _eff_drain_ms / 1000 )).$(printf '%03d' $(( _eff_drain_ms % 1000 )))"
 
     local skip_stty=0
     [[ "$dev" =~ /dev/ttyACM ]] && skip_stty=1
@@ -346,7 +347,7 @@ save_cache() {
         local result; result=$(cat "$probe_dir/$(basename "${DEVS[$i]}")" 2>/dev/null || echo "FAIL|")
         local _st _bd _hn
         IFS='|' read -r _st _bd _hn <<< "$result"
-        if [[ "$_st" == "OPEN" && -z "$_hn" && -n "${_prev_hn[$key]:-}" ]]; then
+        if [[ -z "$_hn" && -n "${_prev_hn[$key]:-}" ]]; then
             result="${_st}|${_bd}|${_prev_hn[$key]}"
         fi
         echo "${key}|${result}" >> "$CACHE_FILE"
