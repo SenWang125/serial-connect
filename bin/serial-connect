@@ -142,7 +142,7 @@ launch() {
     fi
 
     command -v tio &>/dev/null || { echo "tio not found: sudo apt install tio" >&2; exit 1; }
-    local sock="/tmp/$(basename "$dev").sock"
+    local sock="/tmp/$(basename "$dev")-serial.sock"
     local tio_target="$dev"
     local _socat_pid="" _pty_link=""
 
@@ -462,7 +462,7 @@ while true; do
         fi
         if (( !_can_kill )); then
             echo -e "  ${YELLOW}⚠${NC}  Held by user '${_lock_user}'"
-            _share_sock="/tmp/$(basename "${ROW_DEV[$choice]}").sock"
+            _share_sock="/tmp/$(basename "${ROW_DEV[$choice]}")-serial.sock"
             if [[ -S "$_share_sock" ]]; then
                 echo -e "  Observe (read-only):  ${DIM}socat - UNIX-CONNECT:${_share_sock}${NC}"
             fi
@@ -516,7 +516,7 @@ if [[ -f "$_lf" ]]; then
     _luser=$(awk 'NR==2' "$_lf" 2>/dev/null)
     if [[ -d "/proc/$_lpid" && "$_luser" != "$USER" ]] && ! sudo -n true 2>/dev/null; then
         echo -e "\n  ${YELLOW}⚠${NC}  ${sel_dev} is now held by user '${_luser}'"
-        _share_sock="/tmp/$(basename "$sel_dev").sock"
+        _share_sock="/tmp/$(basename "$sel_dev")-serial.sock"
         [[ -S "$_share_sock" ]] && \
             echo -e "  Observe (read-only):  ${DIM}socat - UNIX-CONNECT:${_share_sock}${NC}"
         echo -e "  Take over (admin):    ${DIM}sudo fuser -k $sel_dev${NC}\n"

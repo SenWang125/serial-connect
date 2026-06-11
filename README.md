@@ -150,6 +150,12 @@ board → /dev/ttyUSBx ← serial-agent daemon (TCP relay 127.0.0.1:PORT)
 
 Both tio and serial-agent receive the full byte stream independently — no byte-splitting. `socat` must be installed (`sudo apt install socat`).
 
+tio exposes a sharing socket at `/tmp/ttyUSBx-serial.sock`. Any user can attach read-only:
+```bash
+socat - UNIX-CONNECT:/tmp/ttyUSB5-serial.sock
+```
+When a port is held by another user, `serial-connect` shows this command automatically.
+
 If socat is unavailable, serial-connect falls back to connecting tio directly to the physical device with a warning.
 
 ### Labelling boards
