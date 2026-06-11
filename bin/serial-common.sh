@@ -185,9 +185,24 @@ probe_tty() {
         local _a_pid; _a_pid=$(cat "$_agent_pidfile" 2>/dev/null)
         [[ -n "$_a_pid" ]] && [[ -d "/proc/$_a_pid" ]] && _agent_alive=1
     fi
+    if (( _agent_alive )); then
+        local _sjson="/tmp/serial-agent/$_devname/status.json"
+        local _hostname=""
+        if [[ -f "$_sjson" ]]; then
+            local _pt
+            _pt=$(grep -o '"prompt_text"[[:space:]]*:[[:space:]]*"[^"]*"' "$_sjson" 2>/dev/null \
+                | sed 's/.*"prompt_text"[[:space:]]*:[[:space:]]*"\([^"]*\)"/\1/')
+            if   [[ "$_pt" =~ @([A-Za-z0-9._-]+)[[:space:]]*: ]];       then _hostname="${BASH_REMATCH[1]}"
+            elif [[ "$_pt" =~ ([A-Za-z0-9._-]+)[[:space:]]+login: ]];    then _hostname="${BASH_REMATCH[1]}"
+            elif [[ "$_pt" =~ [Bb]oard:[[:space:]]*([A-Za-z0-9._-]+) ]]; then _hostname="${BASH_REMATCH[1]}"
+            elif [[ "$_pt" =~ ^([A-Za-z0-9._-]+):[~/] ]];               then _hostname="${BASH_REMATCH[1]}"
+            fi
+        fi
+        printf 'OPEN|%s|%s\n' "$cfg_baud" "$_hostname"
+        return
+    fi
     { fuser "$dev" &>/dev/null 2>&1 \
         || sudo -n fuser "$dev" &>/dev/null 2>&1 \
-        || (( _agent_alive )) \
         || (( _lock_alive )); } \
         && { printf 'OPEN|%s|\n' "$cfg_baud"; return; }
 
@@ -261,6 +276,7 @@ probe_tty() {
     if   [[ "$captured" =~ @([A-Za-z0-9._-]+)[[:space:]]*: ]];       then id="${BASH_REMATCH[1]}"
     elif [[ "$captured" =~ ([A-Za-z0-9._-]+)[[:space:]]+login: ]];    then id="${BASH_REMATCH[1]}"
     elif [[ "$captured" =~ [Bb]oard:[[:space:]]*([A-Za-z0-9._-]+) ]]; then id="${BASH_REMATCH[1]}"
+    elif [[ "$captured" =~ ^([A-Za-z0-9._-]+):[~/] ]];               then id="${BASH_REMATCH[1]}"
     fi
     # No fallback to raw captured text — garbage output leaves the board unlabelled.
     printf 'LIVE|%s|%s\n' "$detected" "$id"
@@ -274,10 +290,22 @@ save_cache() {
     local sig=""
     for i in "${!DEVS[@]}"; do sig+="${VIDS[$i]}:${PIDS[$i]}:${SERS[$i]}"$'\n'; done
     printf '%s' "$(printf '%s' "$sig" | sort -u)" > "$SIG_FILE"
+    local -A _prev_hn=()
+    if [[ -f "$CACHE_FILE" ]]; then
+        local _pk _ps _pb _ph
+        while IFS='|' read -r _pk _ps _pb _ph _rest; do
+            [[ -n "$_pk" && -n "$_ph" ]] && _prev_hn["$_pk"]="$_ph"
+        done < "$CACHE_FILE"
+    fi
     : > "$CACHE_FILE"
     for i in "${!DEVS[@]}"; do
         local key="${VIDS[$i]}:${PIDS[$i]}:${SERS[$i]}:${IFNS[$i]}"
         local result; result=$(cat "$probe_dir/$(basename "${DEVS[$i]}")" 2>/dev/null || echo "FAIL|")
+        local _st _bd _hn
+        IFS='|' read -r _st _bd _hn <<< "$result"
+        if [[ "$_st" == "OPEN" && -z "$_hn" && -n "${_prev_hn[$key]:-}" ]]; then
+            result="${_st}|${_bd}|${_prev_hn[$key]}"
+        fi
         echo "${key}|${result}" >> "$CACHE_FILE"
     done
 }

@@ -156,7 +156,9 @@ launch() {
             # TCP relay via ser2net is tio-specific; screen/minicom connect directly.
             local tio_target="$dev"
             if [[ -n "$agent_tcp" ]]; then
-                echo -e "  ${DIM}serial-agent via ser2net tcp:${agent_tcp} — connecting tio there${NC}"
+                local _relay_label="ser2net"
+                [[ "$agent_tcp" == 127.0.0.1:* ]] && _relay_label="built-in relay"
+                echo -e "  ${DIM}serial-agent via ${_relay_label} tcp:${agent_tcp} — connecting tio there${NC}"
                 echo -e "  ${DIM}Both tio and agent receive the full stream independently.${NC}"
                 tio_target="tcp:$agent_tcp"
             fi

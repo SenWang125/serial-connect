@@ -252,7 +252,7 @@ DESIGN NOTES
 import argparse, errno, json, os, re, select, signal, socket, sys, termios, time
 from datetime import datetime
 from pathlib import Path
-from threading import Thread, Event
+from threading import Thread, Event, Lock
 
 # ── Storage ────────────────────────────────────────────────────────────────────
 _SCRIPT_DIR = Path(__file__).resolve().parent
@@ -454,6 +454,9 @@ class Daemon:
         self._stop        = Event()
         self._sock        = None
         self._fd          = None
+        self._given_tcp   = tcp
+        self._relay_clients: list = []
+        self._relay_lock  = Lock()
 
     def _connect(self):
         """Open the serial device or TCP connection and configure terminal settings.
@@ -472,8 +475,8 @@ class Daemon:
         Returns the file descriptor (int) of the opened connection.
         Raises OSError on failure (caught by run()'s reconnect loop).
         """
-        if self.tcp:
-            host, port = self.tcp
+        if self._given_tcp:
+            host, port = self._given_tcp
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             s.connect((host, port))
             self._sock = s
@@ -610,6 +613,19 @@ class Daemon:
         self.maxlines). The full ring is rewritten to buf.log on every call so
         readers always see a consistent snapshot.
         """
+        if self._relay_clients:
+            with self._relay_lock:
+                dead = []
+                for c in list(self._relay_clients):
+                    try:
+                        c.sendall(data)
+                    except OSError:
+                        dead.append(c)
+                for c in dead:
+                    try:
+                        self._relay_clients.remove(c)
+                    except ValueError:
+                        pass
         text = data.decode('utf-8', errors='replace')
         self.t_output = now()
         self._update_state(text)
@@ -682,6 +698,60 @@ class Daemon:
             except OSError:
                 time.sleep(0.1)
 
+    def _start_relay_if_direct(self):
+        """Bind a loopback TCP relay so tio can share the port without byte-splitting.
+
+        When no external ser2net TCP is configured the daemon holds the physical
+        serial port directly.  This method starts a lightweight TCP listener on
+        an ephemeral loopback port, fans all incoming serial bytes to every
+        connected TCP client, and forwards client writes back to the device.
+        status.json is updated so serial-connect auto-routes tio to this port.
+        """
+        if self._given_tcp:
+            return
+        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind(('127.0.0.1', 0))
+        port = srv.getsockname()[1]
+        srv.listen(8)
+        self.tcp = ('127.0.0.1', port)
+        self._write_status()
+        Thread(target=self._relay_accept_loop, args=(srv,), daemon=True).start()
+
+    def _relay_accept_loop(self, srv):
+        srv.settimeout(1.0)
+        while not self._stop.is_set():
+            try:
+                conn, _ = srv.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            with self._relay_lock:
+                self._relay_clients.append(conn)
+            Thread(target=self._relay_client_reader, args=(conn,), daemon=True).start()
+        srv.close()
+
+    def _relay_client_reader(self, conn):
+        try:
+            while not self._stop.is_set():
+                data = conn.recv(4096)
+                if not data:
+                    break
+                self._send_raw(data)
+        except OSError:
+            pass
+        finally:
+            with self._relay_lock:
+                try:
+                    self._relay_clients.remove(conn)
+                except ValueError:
+                    pass
+            try:
+                conn.close()
+            except OSError:
+                pass
+
     def run(self):
         """Main daemon loop. Runs after double-fork in cmd_start.
 
@@ -721,6 +791,7 @@ class Daemon:
         signal.signal(signal.SIGTERM, lambda *_: self._stop.set())
         signal.signal(signal.SIGINT,  lambda *_: self._stop.set())
         Thread(target=self._writer, daemon=True).start()
+        self._start_relay_if_direct()
 
         backoff = 1.0
         while not self._stop.is_set():
