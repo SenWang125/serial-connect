@@ -23,8 +23,8 @@ serial-connect  ─────────────────────�
   • interactive menu with live probe
   • cache: /tmp/serial-connect.{sig,cache} — avoids reprobing on each run
   • selective re-probe: only unrecognized boards checked each run
-  • auto-starts serial-agent if not running → tio connects via built-in relay TCP
-  • auto-detects relay/ser2net TCP (reads serial-agent status.json) → tio tcp:...
+  • auto-starts serial-agent if not running → socat PTY bridge to built-in relay
+  • auto-detects relay/ser2net TCP (reads serial-agent status.json) → socat bridge
   • HUPCL cleared before probe + sudo -n fuser for root-owned sessions
 
 tio.sh [N|/dev/ttyXXX] [baud]  ────────────────────────────────────────────► tmux session
@@ -33,8 +33,9 @@ tio.sh [N|/dev/ttyXXX] [baud]  ────────────────�
 
 serial-agent built-in TCP relay  (automatic, no configuration needed)
   • daemon binds ephemeral 127.0.0.1 port on startup
-  • fans bytes to tio and any other TCP clients (full stream to each)
+  • fans bytes to all TCP clients (full stream to each)
   • status.json reports via: "tcp:127.0.0.1:PORT" — serial-connect auto-detects
+  • serial-connect bridges to tio via socat PTY (tio v2.7 has no tcp: device support)
 
 ser2net  (optional, for multi-user / network access)
   • holds physical serial port exclusively, fans to TCP clients
@@ -148,14 +149,15 @@ serial-agent send/run/health...
 
 ## Coexistence (tio + serial-agent)
 
-**Default — built-in relay (no configuration needed):**
+**Default — built-in relay + socat PTY bridge (requires socat):**
 ```
-board → /dev/ttyUSB1 ← serial-agent daemon
-                              ├─→ tio tcp:127.0.0.1:PORT        (human, full stream)
+board → /dev/ttyUSB1 ← serial-agent daemon (TCP relay 127.0.0.1:PORT)
+                              ├─→ socat PTY /tmp/ttyUSB1-pty    (tio opens this)
                               └─→ any other TCP client           (full stream)
 ```
-serial-connect auto-starts serial-agent before launching tio.
-serial-agent binds an ephemeral loopback port and fans bytes to all TCP clients.
+serial-connect auto-starts serial-agent, then uses socat to create a PTY that
+bridges to the relay.  tio opens the PTY as a regular device.  tio v2.7 has no
+native tcp: device support — the PTY bridge is required for coexistence.
 
 **Optional — ser2net (multi-user / network access):**
 ```

@@ -133,34 +133,54 @@ launch() {
     [[ ! -f "$agent_status" ]] && agent_status="/tmp/serial-agent/$_devname/status.json"
     local _agent_live; _agent_is_alive "$_devname" _agent_live
     (( _agent_live )) && _read_agent_tcp_via "$agent_status" agent_tcp
-    # tio only: if serial-agent is available but not running, auto-start it now so
-    # tio connects via the built-in relay from the start.  Prevents the byte-splitting
-    # and Disconnected/Connected noise that occurs when serial-agent starts mid-session
-    # and grabs the physical port away from a tio already connected directly.
-    if (( !_agent_live )) && command -v serial-agent &>/dev/null; then  # tio only: relies on TCP relay
+    # If serial-agent is available but not running, auto-start it so it can monitor
+    # the session (buf.log, state machine) while tio holds the human terminal.
+    if (( !_agent_live )) && command -v serial-agent &>/dev/null; then  # tio only: relies on socat PTY bridge
         echo -e "  ${DIM}auto-starting serial-agent for $(basename "$dev") ...${NC}"
         serial-agent start "$dev" --baud "$baud" > /dev/null 2>&1 || true
         _read_agent_tcp_via "$agent_status" agent_tcp
     fi
-    # Always reset device to a known-good state. Clears IXON, CRTSCTS, raw mode
-    # etc. that a previous holder killed with SIGKILL may have left in the kernel
-    # TTY state. tio applies its own settings on top, so this is a safe no-op.
-    stty -F "$dev" "$baud" cs8 -parenb -cstopb -crtscts clocal -hupcl 2>/dev/null
 
     command -v tio &>/dev/null || { echo "tio not found: sudo apt install tio" >&2; exit 1; }
     local sock="/tmp/$(basename "$dev")-${USER}.sock"
     local tio_target="$dev"
+    local _socat_pid="" _pty_link=""
+
     if [[ -n "$agent_tcp" ]]; then
-        local _relay_label="ser2net"
-        [[ "$agent_tcp" == 127.0.0.1:* ]] && _relay_label="built-in relay"
-        echo -e "  ${DIM}serial-agent via ${_relay_label} tcp:${agent_tcp} — connecting tio there${NC}"
-        echo -e "  ${DIM}Both tio and agent receive the full stream independently.${NC}"
-        tio_target="tcp:$agent_tcp"
+        # tio v2.7 does not support tcp:host:port as a device target.
+        # Bridge via socat: serial-agent holds the physical port through its TCP relay;
+        # socat allocates a PTY and forwards it to the relay so tio can open a real device.
+        if command -v socat &>/dev/null; then
+            local _relay_label="ser2net"
+            [[ "$agent_tcp" == 127.0.0.1:* ]] && _relay_label="built-in relay"
+            _pty_link="/tmp/${_devname}-${USER}-pty"
+            rm -f "$_pty_link"
+            socat pty,raw,echo=0,link="$_pty_link",wait-slave "tcp:$agent_tcp" &
+            _socat_pid=$!
+            local _i; for _i in $(seq 40); do
+                [[ -e "$_pty_link" ]] && break; sleep 0.05
+            done
+            if [[ -e "$_pty_link" ]]; then
+                echo -e "  ${DIM}serial-agent via ${_relay_label} → socat PTY — full stream to both${NC}"
+                tio_target="$_pty_link"
+            else
+                kill "$_socat_pid" 2>/dev/null; _socat_pid=""; _pty_link=""
+                echo -e "  ${YELLOW}⚠${NC}  socat PTY bridge failed — connecting tio directly"
+            fi
+        else
+            echo -e "  ${YELLOW}⚠${NC}  install socat for relay coexistence — connecting tio directly"
+        fi
     fi
+
+    # Only reset TTY state when tio owns the physical device directly.
+    # When serial-agent holds the port (relay active), it manages TTY settings.
+    [[ "$tio_target" == "$dev" ]] && \
+        stty -F "$dev" "$baud" cs8 -parenb -cstopb -crtscts clocal -hupcl 2>/dev/null
+
     echo -e "\n${GREEN}→${NC} tio $tio_target @ $(baud_display "$baud")  ${DIM}(Ctrl-T Q to quit)${NC}"
     echo -e "  ${DIM}Share: socat - UNIX-CONNECT:$sock${NC}\n"
     _lock_acquire "$dev"
-    trap '_lock_release "$dev"' EXIT INT TERM
+    trap '_lock_release "$dev"; [[ -n "$_socat_pid" ]] && { kill "$_socat_pid" 2>/dev/null; rm -f "$_pty_link"; }' EXIT INT TERM
     tio -b "$baud" -S "unix:$sock" "$tio_target" || {
         stty sane 2>/dev/null || true
         printf '\033[0m\033[?7h' 2>/dev/null || true
