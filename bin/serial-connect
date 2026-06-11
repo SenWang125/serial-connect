@@ -192,13 +192,7 @@ launch() {
     stty sane 2>/dev/null || true
     printf '\033[0m\033[?7h' 2>/dev/null || true
     if (( _tio_exit != 0 )) && [[ "$tio_target" == "$dev" ]]; then
-        # tio failed on direct device — port likely grabbed by someone else
-        echo -e "\n${YELLOW}⚠${NC}  Port is in use by another user."
-        if sudo -n fuser "$dev" &>/dev/null 2>&1; then
-            echo -e "  ${DIM}Force-close: sudo fuser -k $dev${NC}"
-        else
-            echo -e "  ${DIM}Ask an admin to run: sudo fuser -k $dev${NC}"
-        fi
+        echo -e "\n${YELLOW}⚠${NC}  $dev is in use by another process."
     fi
 }
 
