@@ -46,7 +46,7 @@ sudo udevadm control --reload-rules && sudo udevadm trigger
 sudo ./uninstall.sh --global      # stops daemons, removes global install + udev rules
 ```
 
-**Requirements:** bash ≥ 5.1, python3, `tio`
+**Requirements:** bash ≥ 5.1, python3, `tio`, `socat`
 **Optional:** `ser2net`, `inotify-tools`
 
 ---
@@ -134,6 +134,23 @@ serial-connect /dev/ttyUSB1  # direct connect, skip menu
 serial-connect --label       # rename boards interactively
 serial-connect --help        # show usage
 ```
+
+### Coexistence with serial-agent
+
+When you connect via `serial-connect`, it auto-starts `serial-agent` in the background so the daemon can keep monitoring the board (buf.log, state machine) while tio holds your terminal session.
+
+`tio` v2.7 has no TCP device-target support — `tio tcp:host:port` is treated as a literal file path and fails. The connection is instead bridged through a socat PTY:
+
+```
+board → /dev/ttyUSBx ← serial-agent daemon (TCP relay 127.0.0.1:PORT)
+                               └── socat PTY /tmp/ttyUSBx-pty
+                                       ↑
+                               tio /tmp/ttyUSBx-pty  (opens PTY as a device)
+```
+
+Both tio and serial-agent receive the full byte stream independently — no byte-splitting. `socat` must be installed (`sudo apt install socat`).
+
+If socat is unavailable, serial-connect falls back to connecting tio directly to the physical device with a warning.
 
 ### Labelling boards
 
