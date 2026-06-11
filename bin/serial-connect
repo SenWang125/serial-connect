@@ -529,7 +529,6 @@ while true; do
         sleep 0.1
         stty sane 2>/dev/null || true
         printf '\033[0m\033[?7h' 2>/dev/null || true  # reset terminal attributes + re-enable line wrap
-        rm -f "$CACHE_FILE" "$SIG_FILE"
         echo -e "  ${GREEN}Session closed.${NC}\n"
     fi
     break
