@@ -462,7 +462,7 @@ while true; do
         fi
         if (( !_can_kill )); then
             echo -e "  ${YELLOW}⚠${NC}  Held by user '${_lock_user}'"
-            local _share_sock="/tmp/$(basename "${ROW_DEV[$choice]}").sock"
+            _share_sock="/tmp/$(basename "${ROW_DEV[$choice]}").sock"
             if [[ -S "$_share_sock" ]]; then
                 echo -e "  Observe (read-only):  ${DIM}socat - UNIX-CONNECT:${_share_sock}${NC}"
             fi
