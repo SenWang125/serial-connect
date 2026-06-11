@@ -183,14 +183,23 @@ launch() {
     echo -e "\n${GREEN}→${NC} tio $tio_target @ $(baud_display "$baud")  ${DIM}(Ctrl-T Q to quit)${NC}"
     echo -e "  ${DIM}Share: socat - UNIX-CONNECT:$sock${NC}\n"
     _lock_acquire "$dev"
+    # INT/TERM trap for Ctrl-C — locals are in scope when signal fires mid-session.
+    # EXIT trap is intentionally NOT set: it fires after launch() returns (when locals
+    # are already out of scope), so cleanup would silently no-op.  Inline cleanup below
+    # handles the normal exit path where locals are still accessible.
     trap '_lock_release "$dev"
-          [[ -n "$_socat_pid" ]] && { kill "$_socat_pid" 2>/dev/null; wait "$_socat_pid" 2>/dev/null; rm -f "$_pty_link"; }
+          [[ -n "$_socat_pid" ]] && { kill "$_socat_pid" 2>/dev/null; rm -f "$_pty_link"; }
           (( _agent_autostarted )) && serial-agent stop "$dev" > /dev/null 2>&1 || true' \
-        EXIT INT TERM
+        INT TERM
     tio -b "$baud" -S "unix:$sock" "$tio_target"
     local _tio_exit=$?
+    # Inline cleanup — runs on normal tio exit with locals still in scope.
+    trap - INT TERM
     stty sane 2>/dev/null || true
     printf '\033[0m\033[?7h' 2>/dev/null || true
+    [[ -n "$_socat_pid" ]] && { kill "$_socat_pid" 2>/dev/null; wait "$_socat_pid" 2>/dev/null; rm -f "$_pty_link"; }
+    (( _agent_autostarted )) && serial-agent stop "$dev" > /dev/null 2>&1 || true
+    _lock_release "$dev"
     if (( _tio_exit != 0 )) && [[ "$tio_target" == "$dev" ]]; then
         echo -e "\n${YELLOW}⚠${NC}  $dev is in use by another process."
     fi
