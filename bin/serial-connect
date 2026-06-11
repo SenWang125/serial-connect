@@ -131,14 +131,17 @@ launch() {
     local _devname; _devname=$(basename "$dev")
     local agent_status="${HOME}/var/serial-agent/$_devname/status.json"
     [[ ! -f "$agent_status" ]] && agent_status="/tmp/serial-agent/$_devname/status.json"
-    local _agent_live; _agent_is_alive "$_devname" _agent_live
+    local _agent_live _agent_autostarted=0
+    _agent_is_alive "$_devname" _agent_live
     (( _agent_live )) && _read_agent_tcp_via "$agent_status" agent_tcp
     # If serial-agent is available but not running, auto-start it so it can monitor
     # the session (buf.log, state machine) while tio holds the human terminal.
+    # Track auto-start: we stop the daemon on exit so the port goes free again.
     if (( !_agent_live )) && command -v serial-agent &>/dev/null; then  # tio only: relies on socat PTY bridge
         echo -e "  ${DIM}auto-starting serial-agent for $(basename "$dev") ...${NC}"
         serial-agent start "$dev" --baud "$baud" > /dev/null 2>&1 || true
         _read_agent_tcp_via "$agent_status" agent_tcp
+        _agent_autostarted=1
     fi
 
     command -v tio &>/dev/null || { echo "tio not found: sudo apt install tio" >&2; exit 1; }
@@ -155,7 +158,7 @@ launch() {
             [[ "$agent_tcp" == 127.0.0.1:* ]] && _relay_label="built-in relay"
             _pty_link="/tmp/${_devname}-${USER}-pty"
             rm -f "$_pty_link"
-            socat pty,raw,echo=0,link="$_pty_link",wait-slave "tcp:$agent_tcp" &
+            socat pty,raw,echo=0,link="$_pty_link",wait-slave "tcp:$agent_tcp" 2>/dev/null &
             _socat_pid=$!
             local _i; for _i in $(seq 40); do
                 [[ -e "$_pty_link" ]] && break; sleep 0.05
@@ -180,18 +183,23 @@ launch() {
     echo -e "\n${GREEN}→${NC} tio $tio_target @ $(baud_display "$baud")  ${DIM}(Ctrl-T Q to quit)${NC}"
     echo -e "  ${DIM}Share: socat - UNIX-CONNECT:$sock${NC}\n"
     _lock_acquire "$dev"
-    trap '_lock_release "$dev"; [[ -n "$_socat_pid" ]] && { kill "$_socat_pid" 2>/dev/null; rm -f "$_pty_link"; }' EXIT INT TERM
-    tio -b "$baud" -S "unix:$sock" "$tio_target" || {
-        stty sane 2>/dev/null || true
-        printf '\033[0m\033[?7h' 2>/dev/null || true
+    trap '_lock_release "$dev"
+          [[ -n "$_socat_pid" ]] && { kill "$_socat_pid" 2>/dev/null; wait "$_socat_pid" 2>/dev/null; rm -f "$_pty_link"; }
+          (( _agent_autostarted )) && serial-agent stop "$dev" > /dev/null 2>&1 || true' \
+        EXIT INT TERM
+    tio -b "$baud" -S "unix:$sock" "$tio_target"
+    local _tio_exit=$?
+    stty sane 2>/dev/null || true
+    printf '\033[0m\033[?7h' 2>/dev/null || true
+    if (( _tio_exit != 0 )) && [[ "$tio_target" == "$dev" ]]; then
+        # tio failed on direct device — port likely grabbed by someone else
         echo -e "\n${YELLOW}⚠${NC}  Port is in use by another user."
         if sudo -n fuser "$dev" &>/dev/null 2>&1; then
             echo -e "  ${DIM}Force-close: sudo fuser -k $dev${NC}"
         else
             echo -e "  ${DIM}Ask an admin to run: sudo fuser -k $dev${NC}"
         fi
-        exit 1
-    }
+    fi
 }
 
 
