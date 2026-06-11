@@ -461,8 +461,12 @@ while true; do
             _can_kill=1
         fi
         if (( !_can_kill )); then
-            echo -e "  ${YELLOW}⚠${NC}  Held by user '${_lock_user}' — ask an admin to run:"
-            echo -e "  ${DIM}sudo fuser -k ${ROW_DEV[$choice]}${NC}\n"
+            echo -e "  ${YELLOW}⚠${NC}  Held by user '${_lock_user}'"
+            local _share_sock="/tmp/$(basename "${ROW_DEV[$choice]}").sock"
+            if [[ -S "$_share_sock" ]]; then
+                echo -e "  Observe (read-only):  ${DIM}socat - UNIX-CONNECT:${_share_sock}${NC}"
+            fi
+            echo -e "  Take over (admin):    ${DIM}sudo fuser -k ${ROW_DEV[$choice]}${NC}\n"
             continue
         fi
         read -rp "  Force close and connect? [y/N]: " confirm || { printf "\n"; exit 0; }
@@ -511,8 +515,11 @@ if [[ -f "$_lf" ]]; then
     _lpid=$(awk 'NR==1' "$_lf" 2>/dev/null)
     _luser=$(awk 'NR==2' "$_lf" 2>/dev/null)
     if [[ -d "/proc/$_lpid" && "$_luser" != "$USER" ]] && ! sudo -n true 2>/dev/null; then
-        echo -e "\n  ${YELLOW}⚠${NC}  ${sel_dev} is now held by user '${_luser}' — ask an admin to run:"
-        echo -e "  ${DIM}sudo fuser -k $sel_dev${NC}\n"
+        echo -e "\n  ${YELLOW}⚠${NC}  ${sel_dev} is now held by user '${_luser}'"
+        _share_sock="/tmp/$(basename "$sel_dev").sock"
+        [[ -S "$_share_sock" ]] && \
+            echo -e "  Observe (read-only):  ${DIM}socat - UNIX-CONNECT:${_share_sock}${NC}"
+        echo -e "  Take over (admin):    ${DIM}sudo fuser -k $sel_dev${NC}\n"
         exit 1
     fi
 fi
