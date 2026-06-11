@@ -344,6 +344,7 @@ save_cache() {
     for i in "${!DEVS[@]}"; do
         local key="${VIDS[$i]}:${PIDS[$i]}:${SERS[$i]}:${IFNS[$i]}"
         local result; result=$(cat "$probe_dir/$(basename "${DEVS[$i]}")" 2>/dev/null || echo "FAIL|")
+        result="${result:-FAIL|}"  # empty = probe killed by watchdog; treat as FAIL
         local _st _bd _hn
         IFS='|' read -r _st _bd _hn <<< "$result"
         if [[ -z "$_hn" && -n "${_prev_hn[$key]:-}" ]]; then
@@ -436,7 +437,9 @@ run_probes() {
     done
     local _max_read=$PROBE_READ_MS _t
     for _t in "${_PROBE_TIMEOUTS[@]}"; do (( _t > _max_read )) && _max_read=$_t; done
-    local wdog_s=$(( (${#PROBE_BAUDS[@]} * (_max_read + PROBE_DRAIN_MS) + 999) / 1000 + 1 ))
+    local _n=${#idxs[@]}
+    local _batches=$(( _n <= _par ? 1 : (_n + _par - 1) / _par ))
+    local wdog_s=$(( (_batches * ${#PROBE_BAUDS[@]} * (_max_read + PROBE_DRAIN_MS) + 999) / 1000 + 2 ))
     ( sleep "$wdog_s"; kill -9 "${pids[@]}" 2>/dev/null ) &
     local wdog=$!
     wait "${pids[@]}" 2>/dev/null

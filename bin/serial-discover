@@ -20,23 +20,22 @@ port_indices
 PROBE_DIR=$(mktemp -d /tmp/serial-probe.XXXXXX)
 trap 'rm -rf "$PROBE_DIR"' EXIT
 
-# Adaptive timeouts: boards labeled in config or with a cached hostname get
-# PROBE_READ_SCALE * PROBE_READ_MS so recently-released ports aren't missed.
-declare -A _known_sers=()
-for i in "${!DEVS[@]}"; do
-    [[ -n "${CFG_LABEL[${SERS[$i]}]:-}" ]] && _known_sers["${SERS[$i]}"]=1
-done
+# Adaptive timeouts: scale only ports that have a captured hostname in the cache.
+# These are console ports that were previously alive — typically one per adapter.
+# Do NOT scale all ports of a known adapter: JTAG/debug ports never respond and
+# would hold parallel probe slots for the full 9-baud timeout, causing the
+# watchdog to kill legitimate probes and produce empty (corrupt) cache entries.
 if [[ -f "$CACHE_FILE" ]]; then
+    declare -A _dev_by_key=()
+    for i in "${!DEVS[@]}"; do
+        _dev_by_key["${VIDS[$i]}:${PIDS[$i]}:${SERS[$i]}:${IFNS[$i]}"]="$(basename "${DEVS[$i]}")"
+    done
     while IFS='|' read -r _ck _ _ _ch; do
-        [[ -n "$_ch" ]] || continue
-        IFS=':' read -r _ _ _cser _ <<< "$_ck"
-        [[ -n "$_cser" ]] && _known_sers["$_cser"]=1
+        [[ -n "$_ch" && -n "${_dev_by_key[$_ck]+x}" ]] && \
+            _PROBE_TIMEOUTS["${_dev_by_key[$_ck]}"]=$(( PROBE_READ_MS * PROBE_READ_SCALE ))
     done < "$CACHE_FILE"
+    unset _dev_by_key
 fi
-for i in "${!DEVS[@]}"; do
-    [[ -n "${_known_sers[${SERS[$i]}]+x}" ]] && \
-        _PROBE_TIMEOUTS["$(basename "${DEVS[$i]}")"]=$(( PROBE_READ_MS * PROBE_READ_SCALE ))
-done
 
 run_probes "${!DEVS[@]}"
 _PROBE_TIMEOUTS=()
