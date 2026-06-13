@@ -139,7 +139,7 @@ launch() {
     # Track auto-start: we stop the daemon on exit so the port goes free again.
     if (( !_agent_live )) && command -v serial-agent &>/dev/null; then  # tio only: relies on socat PTY bridge
         echo -e "  ${DIM}auto-starting serial-agent for $(basename "$dev") ...${NC}"
-        serial-agent start "$dev" --baud "$baud" > /dev/null 2>&1 || true
+        serial-agent start "$dev" --baud "$baud" --idle-timeout 120 > /dev/null 2>&1 || true
         _read_agent_tcp_via "$agent_status" agent_tcp
         _agent_autostarted=1
     fi
@@ -190,7 +190,7 @@ launch() {
     trap '_lock_release "$dev"
           [[ -n "$_socat_pid" ]] && { kill "$_socat_pid" 2>/dev/null; rm -f "$_pty_link"; }
           (( _agent_autostarted )) && serial-agent stop "$dev" > /dev/null 2>&1 || true' \
-        INT TERM
+        INT TERM HUP
     tio -b "$baud" -S "unix:$sock" "$tio_target"
     local _tio_exit=$?
     # Inline cleanup — runs on normal tio exit with locals still in scope.

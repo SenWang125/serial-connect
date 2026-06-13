@@ -51,6 +51,7 @@ CACHE_FILE="/tmp/serial-connect-${USER}.cache"
 declare -A CHIP_NAMES=() CHIP_BAUD=() CHIP_WILDCARD=() CHIP_BAUD_WILDCARD=() CFG_LABEL CFG_BAUD
 declare -a PROBE_BAUDS=()
 PROBE_PARALLEL=0 PROBE_READ_MS=100 PROBE_DRAIN_MS=10 REPROBE_DEAD=1 PROBE_READ_SCALE=3
+RELAY_BASE_PORT=0   # 0 = OS-assigned ephemeral; set in serial-boards.conf to use a fixed range
 # Per-device probe timeout overrides (devbasename → read_ms).
 # Populated by callers before run_probes; inherited by subshells.
 declare -A _PROBE_TIMEOUTS=()
@@ -121,7 +122,7 @@ _load_conf_file() {
             continue
         fi
         # Probe tuning scalars
-        if [[ "$key" =~ ^(PROBE_(PARALLEL|READ_MS|DRAIN_MS|READ_SCALE)|REPROBE_DEAD)$ ]]; then
+        if [[ "$key" =~ ^(PROBE_(PARALLEL|READ_MS|DRAIN_MS|READ_SCALE)|REPROBE_DEAD|RELAY_BASE_PORT)$ ]]; then
             [[ "$val" =~ ^[0-9]+$ ]] && printf -v "$key" '%s' "$val"
             continue
         fi

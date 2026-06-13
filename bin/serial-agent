@@ -432,11 +432,12 @@ class Daemon:
       - Watch events.log for state transitions (via CLI 'wait-state').
     """
 
-    def __init__(self, device, tcp, baud, lines):
-        self.device   = device
-        self.tcp      = tcp
-        self.baud     = baud
-        self.maxlines = lines
+    def __init__(self, device, tcp, baud, lines, idle_timeout=0):
+        self.device       = device
+        self.tcp          = tcp
+        self.baud         = baud
+        self.maxlines     = lines
+        self.idle_timeout = idle_timeout   # auto-stop when no relay clients for this many seconds (0=never)
         self.ddir     = devdir(device)
         self.buf_file    = self.ddir / 'buf.log'
         self.status_file = self.ddir / 'status.json'
@@ -454,9 +455,10 @@ class Daemon:
         self._stop        = Event()
         self._sock        = None
         self._fd          = None
-        self._given_tcp   = tcp
+        self._given_tcp      = tcp
         self._relay_clients: list = []
-        self._relay_lock  = Lock()
+        self._relay_lock     = Lock()
+        self._t_last_client  = 0.0   # monotonic time of last relay client connect/disconnect
 
     def _connect(self):
         """Open the serial device or TCP connection and configure terminal settings.
@@ -711,8 +713,17 @@ class Daemon:
             return
         srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        srv.bind(('127.0.0.1', 0))
+        base = _relay_base_port()
+        if base:
+            for _p in range(base, base + 256):
+                try: srv.bind(('127.0.0.1', _p)); break
+                except OSError: continue
+            else:
+                srv.bind(('127.0.0.1', 0))   # fallback to ephemeral
+        else:
+            srv.bind(('127.0.0.1', 0))
         port = srv.getsockname()[1]
+        self._t_last_client = now()   # start idle timer from relay creation
         srv.listen(8)
         self.tcp = ('127.0.0.1', port)
         self._write_status()
@@ -729,6 +740,7 @@ class Daemon:
                 break
             with self._relay_lock:
                 self._relay_clients.append(conn)
+                self._t_last_client = now()
             Thread(target=self._relay_client_reader, args=(conn,), daemon=True).start()
         srv.close()
 
@@ -747,6 +759,7 @@ class Daemon:
                     self._relay_clients.remove(conn)
                 except ValueError:
                     pass
+                self._t_last_client = now()   # restart idle timer when client disconnects
             try:
                 conn.close()
             except OSError:
@@ -828,6 +841,14 @@ class Daemon:
                             if self.state != 'DEAD':
                                 self.state = 'DEAD'
                                 self._write_status()
+                        # Auto-stop when started with --idle-timeout and no relay
+                        # clients have been connected for that many seconds.
+                        if (self.idle_timeout > 0
+                                and not self._relay_clients
+                                and self._t_last_client > 0
+                                and now() - self._t_last_client > self.idle_timeout):
+                            print(f'[serial-agent] idle {self.idle_timeout}s — auto-stopping', flush=True)
+                            self._stop.set()
             except (ConnectionRefusedError, OSError) as e:
                 print(f'[serial-agent] connect error: {e} — retry in {backoff}s', flush=True)
                 self.state = 'DEAD'
@@ -854,6 +875,21 @@ class Daemon:
 # ══════════════════════════════════════════════════════════════════════════════
 # Utilities
 # ══════════════════════════════════════════════════════════════════════════════
+def _relay_base_port() -> int:
+    """Return RELAY_BASE_PORT from serial-boards.conf, or 0 (ephemeral) if unset."""
+    try:
+        for line in _boards_conf().read_text().splitlines():
+            line = line.split('#')[0].strip()
+            if line.upper().startswith('RELAY_BASE_PORT'):
+                _, _, val = line.partition('=')
+                port = int(val.strip())
+                if 1024 <= port <= 64999:
+                    return port
+    except Exception:
+        pass
+    return 0
+
+
 def find_ser2net_port(device: str):
     for cfg in ('/etc/ser2net.yaml', '/etc/ser2net.conf'):
         try:
@@ -1010,7 +1046,7 @@ def cmd_start(args):
     sys.stdin  = open('/dev/null', 'r')
     sys.stdout = open(ddir / 'daemon.log', 'a', buffering=1)
     sys.stderr = sys.stdout
-    Daemon(args.device, tcp, args.baud, args.lines).run()
+    Daemon(args.device, tcp, args.baud, args.lines, args.idle_timeout).run()
 
 
 def cmd_stop(args):
@@ -2308,6 +2344,10 @@ def main():
     sp.add_argument('--tcp',  metavar='HOST:PORT')
     sp.add_argument('--baud', type=int, default=115200)
     sp.add_argument('--lines',type=int, default=DEFAULT_LINES)
+    sp.add_argument('--idle-timeout', type=int, default=0, dest='idle_timeout',
+                    metavar='SECS',
+                    help='Auto-stop after SECS idle seconds with no relay clients (0=never). '
+                         'Pass 120 when auto-starting from serial-connect.')
 
     sp = sub.add_parser('stop');   dev(sp); sp.set_defaults(func=cmd_stop)
     sp = sub.add_parser('status'); dev(sp); sp.set_defaults(func=cmd_status)
