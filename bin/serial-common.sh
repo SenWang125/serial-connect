@@ -221,7 +221,7 @@ _agent_is_alive() {
 _read_agent_tcp_via() {
     printf -v "$2" '%s' ''
     [[ -f "$1" ]] || return
-    local _v; _v=$(python3 -c "import json,sys; print(json.load(open('$1')).get('via',''))" 2>/dev/null)
+    local _v; _v=$(awk -F'"' '/"via"/{print $4;exit}' "$1" 2>/dev/null)
     [[ "$_v" == tcp:* ]] && printf -v "$2" '%s' "${_v#tcp:}"
 }
 
@@ -357,10 +357,14 @@ save_cache() {
 
 load_cache() {
     local probe_dir="$1"
+    # Read cache once into a hash map — O(M+N) vs O(N*M) grep-per-device.
+    declare -A _lc=()
+    while IFS='|' read -r _k _rest; do
+        [[ -n "$_k" && -z "${_lc[$_k]+x}" ]] && _lc["$_k"]="$_rest"
+    done < "$CACHE_FILE" 2>/dev/null
     for i in "${!DEVS[@]}"; do
         local key="${VIDS[$i]}:${PIDS[$i]}:${SERS[$i]}:${IFNS[$i]}"
-        local cached; cached=$(grep "^${key}|" "$CACHE_FILE" 2>/dev/null | head -1 | cut -d'|' -f2-)
-        echo "${cached:-DEAD|}" > "$probe_dir/$(basename "${DEVS[$i]}")"
+        echo "${_lc[$key]:-DEAD|}" > "$probe_dir/$(basename "${DEVS[$i]}")"
     done
 }
 

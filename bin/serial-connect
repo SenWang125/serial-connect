@@ -66,7 +66,7 @@ EOF
                 [[ -f "$_pf" ]] || continue
                 _pid=$(cat "$_pf" 2>/dev/null)
                 if [[ -d "/proc/$_pid" ]]; then
-                    _state=$(python3 -c "import json; print(json.load(open('$_ddir/status.json')).get('state','?'))" 2>/dev/null || echo "?")
+                    _state=$(awk -F'"' '/"state"/{print $4;exit}' "$_ddir/status.json" 2>/dev/null || echo "?")
                     _lock=""
                     [[ -f "/tmp/serial-connect-locks/$_dn" ]] && _lock="  ${DIM}[lock ✓]${NC}"
                     printf "  ${GREEN}●${NC} /dev/%-14s  PID %-8s  %s%b\n" "$_dn" "$_pid" "$_state" "$_lock"
@@ -230,14 +230,40 @@ trap 'rm -rf "$PROBE_DIR"' EXIT
 
 if [[ "$cur_sig" != "$prev_sig" ]]; then
     echo "$cur_sig" > "$SIG_FILE"
-    [[ -n "$prev_sig" ]] && echo -e "\n${YELLOW}⚠  Device configuration changed — re-probing${NC}\n"
-    run_probes "${!DEVS[@]}"; save_cache "$PROBE_DIR"
+    if [[ -n "$prev_sig" && -f "$CACHE_FILE" ]]; then
+        # Opt 2 — incremental: load cache for existing serials, probe only new arrivals.
+        # Removed serials simply aren't in DEVS so their cache entries are never read.
+        echo -e "\n${YELLOW}⚠  Device configuration changed — probing new devices${NC}\n"
+        load_cache "$PROBE_DIR"
+        declare -a _new_idxs=()
+        for i in "${!DEVS[@]}"; do
+            grep -qF "${VIDS[$i]}:${PIDS[$i]}:${SERS[$i]}" <<< "$prev_sig" || _new_idxs+=("$i")
+        done
+        (( ${#_new_idxs[@]} > 0 )) && run_probes "${_new_idxs[@]}"
+    else
+        run_probes "${!DEVS[@]}"
+    fi
+    save_cache "$PROBE_DIR"
 elif [[ -f "$CACHE_FILE" ]]; then
     load_cache "$PROBE_DIR"
-    # Reconcile cached state with current fuser status for all ports.
+
+    # Opt 1 — batch fuser: one call for all devices instead of N per-port calls.
+    # Builds _fuser_held[/dev/ttyXXX]=1 for every device currently held.
+    # fuser outputs device names to stderr and PIDs to stdout; 2>&1 merges them
+    # onto one line per device so the regex can match both in one read.
+    declare -A _fuser_held=()
+    while IFS= read -r _fl; do
+        if [[ "$_fl" =~ ^(/dev/tty[^:]+):[[:space:]]*(.*) ]]; then
+            [[ -n "${BASH_REMATCH[2]//[[:space:]]/}" ]] && _fuser_held[${BASH_REMATCH[1]}]=1
+        fi
+    done < <({ fuser /dev/ttyUSB* /dev/ttyACM* 2>&1
+                sudo -n fuser /dev/ttyUSB* /dev/ttyACM* 2>&1; } 2>/dev/null)
+
+    # Reconcile cached state with current fuser/lock status for all ports.
     # Any state + fuser held  → OPEN (catches stale DEAD/FAIL/LIVE entries).
-    # Cached OPEN + not held  → re-probe; session ended, actual state is unknown.
+    # Cached OPEN + not held  → mark DEAD here; re-probed in the single pass below.
     declare -a _stale_open_idxs=()
+    declare -A _stale_open_set=()
     for i in "${!DEVS[@]}"; do
         _pf="$PROBE_DIR/$(basename "${DEVS[$i]}")"
         _r=$(cut -d'|' -f1 "$_pf" 2>/dev/null)
@@ -249,29 +275,36 @@ elif [[ -f "$CACHE_FILE" ]]; then
             _lpid=$(awk 'NR==1' "$_lf" 2>/dev/null)
             [[ -n "$_lpid" && -d "/proc/$_lpid" ]] && _lock_live=1 || rm -f "$_lf" 2>/dev/null || true
         fi
-        if { fuser "${DEVS[$i]}" &>/dev/null 2>&1 \
-            || sudo -n fuser "${DEVS[$i]}" &>/dev/null 2>&1 \
-            || (( _lock_live )); }; then
+        if [[ -n "${_fuser_held[${DEVS[$i]}]+x}" ]] || (( _lock_live )); then
             [[ -z "$_bid" ]] && _agent_hostname "$(basename "${DEVS[$i]}")" _bid
             printf 'OPEN|%s|%s\n' "${_baud:-${BAUDS[$i]}}" "$_bid" > "$_pf"
         elif [[ "$_r" == "OPEN" ]]; then
             _stale_open_idxs+=("$i")
+            _stale_open_set[$i]=1
         fi
     done
-    if (( ${#_stale_open_idxs[@]} > 0 )); then
-        # Stale-OPEN: port was held recently — board was alive.  Use full scale factor.
-        for i in "${_stale_open_idxs[@]}"; do
-            _PROBE_TIMEOUTS["$(basename "${DEVS[$i]}")"]=$(( PROBE_READ_MS * PROBE_READ_SCALE ))
-        done
-        run_probes "${_stale_open_idxs[@]}"
-        _PROBE_TIMEOUTS=()
-        save_cache "$PROBE_DIR"
-    fi
+
+    # Opt 3 — merge reprobe passes: stale-OPEN entries are rewritten as DEAD so
+    # _recog won't count them, then they fall into the single combined reprobe below.
+    # Hostname is preserved so the scale-factor logic applies correctly.
+    for i in "${_stale_open_idxs[@]}"; do
+        _pf="$PROBE_DIR/$(basename "${DEVS[$i]}")"
+        _cached_hn=$(cut -d'|' -f3 "$_pf" 2>/dev/null || echo "")
+        printf 'DEAD|%s|%s\n' "${BAUDS[$i]}" "$_cached_hn" > "$_pf"
+        _PROBE_TIMEOUTS["$(basename "${DEVS[$i]}")"]=$(( PROBE_READ_MS * PROBE_READ_SCALE ))
+    done
+
     declare -A _recog
     for i in "${!DEVS[@]}"; do
         ser="${SERS[$i]}"
         result=$(cat "$PROBE_DIR/$(basename "${DEVS[$i]}")" 2>/dev/null || echo "")
         [[ "$result" =~ ^(LIVE|OPEN)\| ]] && _recog[$ser]=1
+        # REPROBE_DEAD=0: skip re-probing dead serials, but never skip stale-OPEN
+        # ports — they must be re-probed regardless of their serial's other states.
+        if (( !REPROBE_DEAD )) && [[ "$result" =~ ^(DEAD|FAIL)\| ]] \
+                && [[ -z "${_stale_open_set[$i]+x}" ]]; then
+            _recog[$ser]=1
+        fi
     done
     declare -a _reprobe_idxs=()
     for i in "${!DEVS[@]}"; do
@@ -279,9 +312,7 @@ elif [[ -f "$CACHE_FILE" ]]; then
         _reprobe_idxs+=("$i")
     done
     # Also re-probe LIVE cached ports whose detected baud doesn't match the
-    # configured baud — guards against false-positive baud detections where
-    # the probe happened to get 0 bytes at the correct baud and then caught
-    # stray bytes at a wrong baud that passed the printable threshold.
+    # configured baud — guards against false-positive baud detections.
     for i in "${!DEVS[@]}"; do
         [[ -n "${_recog[${SERS[$i]}]+x}" ]] || continue
         _pf="$PROBE_DIR/$(basename "${DEVS[$i]}")"
@@ -290,11 +321,11 @@ elif [[ -f "$CACHE_FILE" ]]; then
             _reprobe_idxs+=("$i")
         fi
     done
+    # Single combined reprobe pass (stale-OPEN + unrecognized + baud-mismatch).
+    # Scale timeout for ports with a cached hostname — they were alive before.
     if (( ${#_reprobe_idxs[@]} > 0 )); then
-        # Dead boards: scale timeout based on history.
-        # Port has a cached hostname → was alive before → full scale factor.
-        # No hostname → never seen alive → default PROBE_READ_MS (no override).
         for i in "${_reprobe_idxs[@]}"; do
+            [[ -n "${_PROBE_TIMEOUTS[$(basename "${DEVS[$i]}")]+x}" ]] && continue
             _pf="$PROBE_DIR/$(basename "${DEVS[$i]}")"
             IFS='|' read -r _ _ _hn _ < "$_pf" 2>/dev/null || true
             [[ -n "$_hn" ]] && \
@@ -304,7 +335,7 @@ elif [[ -f "$CACHE_FILE" ]]; then
         _PROBE_TIMEOUTS=()
         save_cache "$PROBE_DIR"
     fi
-    unset _recog
+    unset _recog _fuser_held _stale_open_set
 else
     run_probes "${!DEVS[@]}"; save_cache "$PROBE_DIR"
 fi
@@ -379,23 +410,22 @@ if [[ "${1:-}" == "--label" ]]; then
     exit 0
 fi
 
-# ── Dynamic column widths ──────────────────────────────────────────────────────
-dev_w=6; chip_w=6
+# ── Dynamic column widths (single pass) ───────────────────────────────────────
+dev_w=6; chip_w=6; board_w=6
 for i in "${!DEVS[@]}"; do
     dn=$(basename "${DEVS[$i]}")
     (( ${#dn}        > dev_w  )) && dev_w=${#dn}
     (( ${#CHIPS[$i]} > chip_w )) && chip_w=${#CHIPS[$i]}
+    ser="${SERS[$i]}"
+    if [[ -n "${BOARD_ID[$ser]+x}" ]]; then
+        (( ${#BOARD_ID[$ser]} > board_w )) && board_w=${#BOARD_ID[$ser]}
+    else
+        local ser_disp="${ser}"; (( ${#ser} > 12 )) && ser_disp="${ser:0:10}"
+        fb=$(( ${#CHIPS[$i]} + 1 + ${#ser_disp} ))
+        (( fb > board_w )) && board_w=$fb
+    fi
 done
-(( dev_w++ )); (( chip_w++ ))
-board_w=6
-for ser in "${!BOARD_ID[@]}"; do (( ${#BOARD_ID[$ser]} > board_w )) && board_w=${#BOARD_ID[$ser]}; done
-for i in "${!DEVS[@]}"; do
-    [[ -n "${BOARD_ID[${SERS[$i]}]+x}" ]] && continue
-    ser="${SERS[$i]}"; ser_disp="${ser}"; (( ${#ser} > 12 )) && ser_disp="${ser:0:10}"
-    fb=$(( ${#CHIPS[$i]} + 1 + ${#ser_disp} ))
-    (( fb > board_w )) && board_w=$fb
-done
-(( board_w++ ))
+(( dev_w++ )); (( chip_w++ )); (( board_w++ ))
 rule_w=$(( 2 + 1 + 5 + dev_w + 2 + 6 + 4 + board_w + 2 + chip_w + 2 + 5 + 13 ))
 
 # ── Menu ───────────────────────────────────────────────────────────────────────
