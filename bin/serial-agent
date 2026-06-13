@@ -792,13 +792,24 @@ class Daemon:
         """
         self.pid_file.write_text(str(os.getpid()))
         self._write_status()
-        self._lock_file = Path('/tmp/serial-connect-locks') / Path(self.device).name
-        try:
-            self._lock_file.parent.mkdir(mode=0o1777, exist_ok=True)
-            os.chmod(self._lock_file.parent, 0o1777)  # enforce sticky+world-write despite umask
-            self._lock_file.write_text(f'{os.getpid()}\n{os.environ.get("USER", "")}\n')
-        except OSError:
-            self._lock_file = None
+
+        # on-demand: only hold the physical port while a relay client is connected.
+        # The lock file is also only written while the fd is held — the port appears
+        # free (not OPEN) to serial-connect/discover when no tio session is active.
+        # Always-on (idle_timeout=0 or external TCP): hold fd and lock continuously.
+        on_demand = self.idle_timeout > 0 and not self._given_tcp
+        _lf_path = Path('/tmp/serial-connect-locks') / Path(self.device).name
+        if not on_demand:
+            try:
+                _lf_path.parent.mkdir(mode=0o1777, exist_ok=True)
+                os.chmod(_lf_path.parent, 0o1777)
+                _lf_path.write_text(f'{os.getpid()}\n{os.environ.get("USER", "")}\n')
+                self._lock_file = _lf_path
+            except OSError:
+                self._lock_file = None
+        else:
+            self._lock_file = None   # acquired/released dynamically with fd
+
         if not self.fifo_file.exists():
             os.mkfifo(self.fifo_file)
         signal.signal(signal.SIGTERM, lambda *_: self._stop.set())
@@ -808,6 +819,27 @@ class Daemon:
 
         backoff = 1.0
         while not self._stop.is_set():
+            # On-demand: park until a relay client connects.
+            if on_demand and not self._relay_clients:
+                if (self._t_last_client > 0
+                        and now() - self._t_last_client > self.idle_timeout):
+                    print(f'[serial-agent] idle {self.idle_timeout}s — auto-stopping', flush=True)
+                    self._stop.set()
+                    break
+                time.sleep(0.1)
+                continue
+
+            # On-demand: acquire lock file now that we're about to hold the fd.
+            if on_demand and self._lock_file is None:
+                try:
+                    _lf_path.parent.mkdir(mode=0o1777, exist_ok=True)
+                    os.chmod(_lf_path.parent, 0o1777)
+                    _lf_path.write_text(f'{os.getpid()}\n{os.environ.get("USER", "")}\n')
+                    self._lock_file = _lf_path
+                except OSError:
+                    pass
+
+            _clients_gone = False
             try:
                 rfd = self._connect()
                 backoff = 1.0
@@ -816,22 +848,23 @@ class Daemon:
                 print(f'[serial-agent] {self.device} connected '
                       f'via {"tcp" if self.tcp else "direct"}', flush=True)
                 while not self._stop.is_set():
+                    # On-demand: release device when all relay clients have left.
+                    if on_demand and not self._relay_clients:
+                        _clients_gone = True
+                        break
                     r, _, _ = select.select([rfd], [], [], 0.5)
                     if r:
                         try:
                             data = os.read(rfd, 4096)
                         except OSError as _e:
                             if _e.errno == errno.EAGAIN:
-                                continue   # spurious select wakeup — no data yet
+                                continue   # spurious wakeup — no data yet
                             raise
                         if not data:
                             break
                         self._append(data)
                     else:
-                        # Startup probe: if board has sent NOTHING after 0.5s, send CR
-                        # so an idle board at shell will echo its prompt → SHELL state.
-                        # Do NOT probe if t_output is set — board is already talking
-                        # (e.g. U-Boot banner); sending CR would interrupt autoboot.
+                        # Startup probe.
                         if (not _probe_sent and self.state == 'UNKNOWN'
                                 and not self.t_output
                                 and now() - t_connected > 0.5):
@@ -841,20 +874,20 @@ class Daemon:
                             if self.state != 'DEAD':
                                 self.state = 'DEAD'
                                 self._write_status()
-                        # Auto-stop when started with --idle-timeout and no relay
-                        # clients have been connected for that many seconds.
-                        if (self.idle_timeout > 0
+                        # Always-on idle-stop (on-demand uses the outer-loop check).
+                        if (not on_demand and self.idle_timeout > 0
                                 and not self._relay_clients
                                 and self._t_last_client > 0
                                 and now() - self._t_last_client > self.idle_timeout):
                             print(f'[serial-agent] idle {self.idle_timeout}s — auto-stopping', flush=True)
                             self._stop.set()
             except (ConnectionRefusedError, OSError) as e:
-                print(f'[serial-agent] connect error: {e} — retry in {backoff}s', flush=True)
-                self.state = 'DEAD'
-                self._write_status()
-                time.sleep(backoff)
-                backoff = min(backoff * 2, 30)
+                if not _clients_gone:
+                    print(f'[serial-agent] connect error: {e} — retry in {backoff}s', flush=True)
+                    self.state = 'DEAD'
+                    self._write_status()
+                    time.sleep(backoff)
+                    backoff = min(backoff * 2, 30)
             finally:
                 if self._sock:
                     try: self._sock.close()
@@ -864,6 +897,15 @@ class Daemon:
                     try: os.close(self._fd)
                     except: pass
                     self._fd = None
+                if on_demand:
+                    # Release lock file — port is no longer held by this daemon.
+                    if self._lock_file is not None:
+                        try: self._lock_file.unlink(missing_ok=True)
+                        except OSError: pass
+                        self._lock_file = None
+                    if _clients_gone:
+                        self.state = 'UNKNOWN'
+                        self._write_status()
 
         self.pid_file.unlink(missing_ok=True)
         if getattr(self, '_lock_file', None):
