@@ -408,29 +408,14 @@ if [[ "${1:-}" == "--label" ]]; then
     exit 0
 fi
 
-# ── Dynamic column widths (single pass) ───────────────────────────────────────
-dev_w=6; chip_w=6; board_w=6
-for i in "${!DEVS[@]}"; do
-    dn=$(basename "${DEVS[$i]}")
-    (( ${#dn}        > dev_w  )) && dev_w=${#dn}
-    (( ${#CHIPS[$i]} > chip_w )) && chip_w=${#CHIPS[$i]}
-    ser="${SERS[$i]}"
-    if [[ -n "${BOARD_ID[$ser]+x}" ]]; then
-        (( ${#BOARD_ID[$ser]} > board_w )) && board_w=${#BOARD_ID[$ser]}
-    else
-        local ser_disp="${ser}"; (( ${#ser} > 12 )) && ser_disp="${ser:0:10}"
-        fb=$(( ${#CHIPS[$i]} + 1 + ${#ser_disp} ))
-        (( fb > board_w )) && board_w=$fb
-    fi
-done
-(( dev_w++ )); (( chip_w++ )); (( board_w++ ))
-rule_w=$(( 2 + 1 + 5 + dev_w + 2 + 6 + 4 + board_w + 2 + chip_w + 2 + 5 + 13 ))
+# ── Dynamic column widths ─────────────────────────────────────────────────────
+_build_column_widths 5   # 5 = row-number column width
 
 # ── Menu ───────────────────────────────────────────────────────────────────────
 echo -e "${BOLD}Select serial port:${NC}\n"
 printf "  ${BOLD}%-1s  %-4s  %-${dev_w}s  %-6s    %-${board_w}s  %-${chip_w}s  %-5s  %s${NC}\n" \
     "·" "  #" "Port" "Status" "Board" "Chip" "P#" "Baud"
-printf '─%.0s' $(seq 1 "$rule_w"); echo
+_print_rule
 
 display_order
 row=1; prev_ser="__unset__"
@@ -455,15 +440,7 @@ for i in "${_disp_order[@]}"; do
         dead) sym=" ";             dc="$DIM"; sc="$DIM";    pc="$DIM" ;;
         FAIL) sym="${RED}✗${NC}";  dc="$DIM"; sc="${RED}";   pc="$DIM" ;;
     esac
-    board_name="${BOARD_ID[$ser]:-}"
-    [[ -z "$board_name" ]] && { ser_disp="${ser}"; (( ${#ser} > 12 )) && ser_disp="${ser:0:10}"; board_name="${chip}-${ser_disp}"; }
-    if [[ -n "${_active_ser[$ser]+x}" ]]; then
-        board_col=$(printf "%-${board_w}s" "$board_name")
-        chip_col=$(printf "%-${chip_w}s" "$chip")
-    else
-        board_col="${DIM}$(printf "%-${board_w}s" "$board_name")${NC}"
-        chip_col="${DIM}$(printf "%-${chip_w}s" "$chip")${NC}"
-    fi
+    _render_board_chip "$ser" "$chip" "$board_w" "$chip_w"
     baud_col=""; [[ "$state" == "LIVE" || "$state" == "OPEN" ]] && baud_col=$(baud_display "$baud")
     printf "  %b  %b%3d)${NC}  %b%-${dev_w}s${NC}  %b%-6s${NC}    %s  %s  %b%-5s${NC}  %s\n" \
         "$sym" "$BOLD" "$row" "$dc" "$devname" "$sc" "$state" \

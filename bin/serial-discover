@@ -28,7 +28,7 @@ trap 'rm -rf "$PROBE_DIR"' EXIT
 if [[ -f "$CACHE_FILE" ]]; then
     declare -A _dev_by_key=()
     for i in "${!DEVS[@]}"; do
-        _dev_by_key["${VIDS[$i]}:${PIDS[$i]}:${SERS[$i]}:${IFNS[$i]}"]="$(basename "${DEVS[$i]}")"
+        _dev_by_key["${VIDS[$i]}:${PIDS[$i]}:${SERS[$i]}:${IFNS[$i]}"]="${DEVS[$i]##*/}"
     done
     while IFS='|' read -r _ck _ _ _ch; do
         [[ -n "$_ch" && -n "${_dev_by_key[$_ck]+x}" ]] && \
@@ -44,33 +44,14 @@ save_cache "$PROBE_DIR"
 build_board_ids
 build_active_ser
 
-# ── Dynamic column widths ───────────────────────────────────────────────────────
-dev_w=6; chip_w=6
-for i in "${!DEVS[@]}"; do
-    dn=$(basename "${DEVS[$i]}")
-    (( ${#dn}        > dev_w  )) && dev_w=${#dn}
-    (( ${#CHIPS[$i]} > chip_w )) && chip_w=${#CHIPS[$i]}
-done
-(( dev_w++ )); (( chip_w++ ))
-board_w=6
-for ser in "${!BOARD_ID[@]}"; do
-    (( ${#BOARD_ID[$ser]} > board_w )) && board_w=${#BOARD_ID[$ser]}
-done
-for i in "${!DEVS[@]}"; do
-    [[ -n "${BOARD_ID[${SERS[$i]}]+x}" ]] && continue
-    ser="${SERS[$i]}"
-    ser_disp="${ser}"; (( ${#ser} > 12 )) && ser_disp="${ser:0:10}"
-    fb=$(( ${#CHIPS[$i]} + 1 + ${#ser_disp} ))
-    (( fb > board_w )) && board_w=$fb
-done
-(( board_w++ ))
-rule_w=$(( 2 + 1 + dev_w + 2 + 6 + 4 + board_w + 2 + chip_w + 2 + 5 + 13 ))
+# ── Dynamic column widths ─────────────────────────────────────────────────────
+_build_column_widths 0   # no row-number column in serial-discover
 
 # ── Alias map: /dev symlinks ────────────────────────────────────────────────────
 declare -A _dev_alias
 while IFS= read -r sl; do
     tgt=$(readlink -f "$sl" 2>/dev/null)
-    [[ -n "$tgt" ]] && _dev_alias[$tgt]=$(basename "$sl")
+    [[ -n "$tgt" ]] && _dev_alias[$tgt]="${sl##*/}"
 done < <(find /dev -maxdepth 1 -type l ! -path "/dev/serial/*" 2>/dev/null)
 
 # ── JSON output ─────────────────────────────────────────────────────────────────
@@ -78,15 +59,14 @@ if [[ "${1:-}" == "--json" ]]; then
     echo '['
     sep=""
     for i in "${!DEVS[@]}"; do
-        dev="${DEVS[$i]}"; devname=$(basename "$dev")
-        raw=$(cat "$PROBE_DIR/$devname" 2>/dev/null || echo "FAIL||")
-        state=$(cut -d'|' -f1 <<< "$raw")
-        baud_raw=$(cut -d'|' -f2 <<< "$raw")
+        dev="${DEVS[$i]}"; devname="${dev##*/}"
+        local state baud_raw probe_id
+        IFS='|' read -r state baud_raw probe_id _ < "$PROBE_DIR/$devname" 2>/dev/null \
+            || { state='FAIL'; baud_raw=''; probe_id=''; }
         [[ "$state" == "DEAD" ]] && state="dead"
         [[ -z "$baud_raw" || ! "$baud_raw" =~ ^[0-9]+$ ]] && baud_raw="${BAUDS[$i]}"
         label="${CFG_LABEL[${SERS[$i]}]:-}"
         board="${BOARD_ID[${SERS[$i]}]:-}"
-        probe_id=$(cut -d'|' -f3 <<< "$raw")
         hostname="${probe_id:-$board}"
         alias_val="${_dev_alias[${DEVS[$i]}]:-}"
         label="${label//\"/\'}"; hostname="${hostname//\"/\'}"; alias_val="${alias_val//\"/\'}"
@@ -102,7 +82,7 @@ fi
 if [[ "${1:-}" == "--tmp-udev" ]]; then
     declare -A _tseen
     for i in "${!DEVS[@]}"; do
-        raw=$(cut -d'|' -f1 "$PROBE_DIR/$(basename "${DEVS[$i]}")" 2>/dev/null)
+        IFS='|' read -r raw _ _ < "$PROBE_DIR/${DEVS[$i]##*/}" 2>/dev/null || raw=""
         [[ "$raw" != "LIVE" && "$raw" != "OPEN" ]] && continue
         label="${LABELS[$i]}"; [[ -z "$label" ]] && continue
         ser="${SERS[$i]}"; ifn="${IFNS[$i]}"
@@ -140,19 +120,18 @@ fi
 echo -e "${BOLD}USB Serial Port Discovery${NC}  $(date '+%Y-%m-%d %H:%M:%S')\n"
 printf "  ${BOLD}%-1s  %-${dev_w}s  %-6s    %-${board_w}s  %-${chip_w}s  %-5s  %s${NC}\n" \
     "·" "Port" "Status" "Board" "Chip" "P#" "Baud"
-printf '─%.0s' $(seq 1 "$rule_w"); echo
+_print_rule
 
 display_order
 prev_ser="__unset__"
 for i in "${_disp_order[@]}"; do
-    dev="${DEVS[$i]}"; devname=$(basename "$dev")
+    dev="${DEVS[$i]}"; devname="${dev##*/}"
     ser="${SERS[$i]}"; chip="${CHIPS[$i]}"; baud="${BAUDS[$i]}"
 
     [[ "$ser" != "$prev_ser" && "$prev_ser" != "__unset__" ]] && echo ""
     prev_ser="$ser"
 
-    IFS='|' read -r raw probe_baud _ \
-        <<< "$(cat "$PROBE_DIR/$devname" 2>/dev/null || echo 'FAIL||')"
+    IFS='|' read -r raw probe_baud _ < "$PROBE_DIR/$devname" 2>/dev/null || { raw='FAIL'; probe_baud=''; }
     [[ -z "$raw" || "$raw" == "DEAD" ]] && state="dead" || state="$raw"
     [[ "$state" == "LIVE" && "$probe_baud" =~ ^[0-9]+$ ]] && baud="$probe_baud"
 
@@ -164,15 +143,7 @@ for i in "${_disp_order[@]}"; do
         FAIL) sym="${RED}✗${NC}";   dc="$RED";  sc="$RED"   ;;
     esac
 
-    board_name="${BOARD_ID[$ser]:-}"
-    [[ -z "$board_name" ]] && { ser_disp="${ser}"; (( ${#ser} > 12 )) && ser_disp="${ser:0:10}"; board_name="${chip}-${ser_disp}"; }
-    if [[ -n "${_active_ser[$ser]+x}" ]]; then
-        board_col=$(printf "%-${board_w}s" "$board_name")
-        chip_col=$(printf "%-${chip_w}s" "$chip")
-    else
-        board_col="${DIM}$(printf "%-${board_w}s" "$board_name")${NC}"
-        chip_col="${DIM}$(printf "%-${chip_w}s" "$chip")${NC}"
-    fi
+    _render_board_chip "$ser" "$chip" "$board_w" "$chip_w"
 
     baud_col=""
     [[ "$state" == "LIVE" || "$state" == "OPEN" ]] && baud_col=$(baud_display "$baud")
@@ -210,14 +181,14 @@ GENERIC
 echo "# Live/open multi-port interfaces"
 declare -A _seen
 for i in "${!DEVS[@]}"; do
-    raw=$(cut -d'|' -f1 "$PROBE_DIR/$(basename "${DEVS[$i]}")" 2>/dev/null)
+    IFS='|' read -r raw _ _ < "$PROBE_DIR/${DEVS[$i]##*/}" 2>/dev/null || raw=""
     [[ "$raw" != "LIVE" && "$raw" != "OPEN" ]] && continue
     vid="${VIDS[$i]}"; pid="${PIDS[$i]}"; ser="${SERS[$i]}"; ifn="${IFNS[$i]}"
     vp="${vid}:${pid}"
     case "$vp" in "10c4:ea60"|"1a86:7523"|"0403:6001") continue ;; esac
     [[ -n "${_seen[$ser:$ifn]+x}" ]] && continue; _seen["$ser:$ifn"]=1
     label="${LABELS[$i]}"
-    [[ -z "$label" ]] && { echo "# SKIP $(basename "${DEVS[$i]}") serial=${ser} — no label"; continue; }
+    [[ -z "$label" ]] && { echo "# SKIP ${DEVS[$i]##*/} serial=${ser} — no label"; continue; }
     safe="${label//[^A-Za-z0-9_-]/_}"
     echo "# ${label} — ${CHIPS[$i]} if${ifn}"
     echo "SUBSYSTEM==\"tty\", ATTRS{idVendor}==\"${vid}\", ATTRS{idProduct}==\"${pid}\", \\"

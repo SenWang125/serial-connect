@@ -547,6 +547,60 @@ build_active_ser() {
     done
 }
 
+# ── _build_column_widths ──────────────────────────────────────────────────────
+# Compute dev_w, chip_w, board_w, rule_w in one pass (no forks).
+# Args: extra_rule_w — tool-specific padding added to rule_w
+#   serial-connect passes 5 (row-number column), serial-discover passes 0.
+# Sets globals: dev_w  chip_w  board_w  rule_w
+_build_column_widths() {
+    local _extra="${1:-0}" _i _dn _ser _sd _fb
+    dev_w=6; chip_w=6; board_w=6
+    for _i in "${!DEVS[@]}"; do
+        _dn="${DEVS[$_i]##*/}"
+        (( ${#_dn}         > dev_w  )) && dev_w=${#_dn}
+        (( ${#CHIPS[$_i]}  > chip_w )) && chip_w=${#CHIPS[$_i]}
+        _ser="${SERS[$_i]}"
+        if [[ -n "${BOARD_ID[$_ser]+x}" ]]; then
+            (( ${#BOARD_ID[$_ser]} > board_w )) && board_w=${#BOARD_ID[$_ser]}
+        else
+            _sd="${_ser}"; (( ${#_ser} > 12 )) && _sd="${_ser:0:10}"
+            _fb=$(( ${#CHIPS[$_i]} + 1 + ${#_sd} ))
+            (( _fb > board_w )) && board_w=$_fb
+        fi
+    done
+    (( dev_w++ )); (( chip_w++ )); (( board_w++ ))
+    rule_w=$(( dev_w + board_w + chip_w + 37 + _extra ))
+}
+
+# ── _render_board_chip ────────────────────────────────────────────────────────
+# Set board_col and chip_col for one display row.
+# Dims both when all ports for the serial are dead (_active_ser not set).
+# Uses printf -v (zero subshells) instead of board_col=$(printf ...).
+# Args: ser chip board_w chip_w  — sets globals board_col chip_col
+_render_board_chip() {
+    local _ser="$1" _chip="$2" _bw="$3" _cw="$4"
+    local _bname="${BOARD_ID[$_ser]:-}"
+    if [[ -z "$_bname" ]]; then
+        local _sd="${_ser}"; (( ${#_ser} > 12 )) && _sd="${_ser:0:10}"
+        _bname="${_chip}-${_sd}"
+    fi
+    local _bf _cf
+    printf -v _bf "%-${_bw}s" "$_bname"
+    printf -v _cf "%-${_cw}s" "$_chip"
+    if [[ -n "${_active_ser[$_ser]+x}" ]]; then
+        board_col="$_bf"; chip_col="$_cf"
+    else
+        board_col="${DIM}${_bf}${NC}"; chip_col="${DIM}${_cf}${NC}"
+    fi
+}
+
+# ── _print_rule ───────────────────────────────────────────────────────────────
+# Print a rule_w-wide horizontal line of '─' with a trailing newline.
+# Uses printf -v + parameter expansion — no forks, no seq.
+_print_rule() {
+    local _line; printf -v _line '%*s' "$rule_w" ''; printf '%s\n' "${_line// /─}"
+}
+
 # ── display_order ─────────────────────────────────────────────────────────────
 # Populate _disp_order array: indices sorted by (first-occurrence serial, interface).
 # Keeps multi-port adapters grouped even when another device grabs a ttyUSBN in between.
