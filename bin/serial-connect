@@ -146,6 +146,7 @@ launch() {
 
     command -v tio &>/dev/null || { echo "tio not found: sudo apt install tio" >&2; exit 1; }
     local sock="/tmp/$(basename "$dev")-serial.sock"
+    rm -f "$sock" 2>/dev/null || true   # remove stale socket left by a killed previous session
     local tio_target="$dev"
     local _socat_pid="" _pty_link=""
 
