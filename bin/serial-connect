@@ -537,11 +537,12 @@ while true; do
         [[ -n "$_lock_user" && "$_lock_user" != "$USER" ]] && _fuser_pfx="sudo fuser"
 
         # Step 1a: kill the old session's process group (bash + tio + socat).
-        # The lock file holds the PID of the serial-connect bash that owns the session.
         # tio v2.7 enters reconnect mode after its PTY disappears — it stays alive
-        # watching for the PTY path to reappear and grabs it when a new socat creates
-        # it, locking out the incoming session.  Killing the process group eliminates
-        # the whole session (bash, tio, socat) in one shot before new socat is created.
+        # watching for the PTY path to reappear and grabs it when the new socat
+        # creates the same path, locking out the incoming session.
+        # Killing by process group catches bash + tio + socat in one shot, before
+        # the new socat creates its PTY.  SIGKILL fallback handles tio reconnect-mode
+        # processes that ignore SIGTERM.
         if [[ -n "$_lock_pid" && -d "/proc/$_lock_pid" ]]; then
             _pgid=$(ps -o pgid= -p "$_lock_pid" 2>/dev/null | tr -d ' ')
             if [[ -n "$_pgid" && "$_pgid" != "1" ]]; then
@@ -549,7 +550,17 @@ while true; do
             fi
             kill -TERM "$_lock_pid" 2>/dev/null || true
             sleep 0.3
+            # SIGKILL anything still alive (e.g. tio in reconnect mode ignoring SIGTERM)
+            if [[ -d "/proc/$_lock_pid" ]]; then
+                [[ -n "$_pgid" && "$_pgid" != "1" ]] && \
+                    kill -KILL -- "-$_pgid" 2>/dev/null || true
+                kill -KILL "$_lock_pid" 2>/dev/null || true
+                sleep 0.1
+            fi
         fi
+        # Proactively remove the old session's socat PTY symlink so a surviving
+        # reconnect-mode tio can't grab the new session's PTY at the same path.
+        rm -f "/tmp/$(basename "${ROW_DEV[$choice]}")-${_lock_user:-$USER}-pty" 2>/dev/null || true
 
         # Step 1b: serial-agent daemon gets SIGTERM via 'serial-agent stop'
         # (proper cleanup: closes fd, removes pid file, restores tty state).
