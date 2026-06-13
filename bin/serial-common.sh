@@ -199,8 +199,7 @@ _agent_hostname() {
     local _sjson="/tmp/serial-agent/$1/status.json"
     [[ -f "$_sjson" ]] || return
     local _pt
-    _pt=$(grep -o '"prompt_text"[[:space:]]*:[[:space:]]*"[^"]*"' "$_sjson" 2>/dev/null \
-        | sed 's/.*"prompt_text"[[:space:]]*:[[:space:]]*"\([^"]*\)"/\1/')
+    _pt=$(awk -F'"' '/"prompt_text"/{print $4;exit}' "$_sjson" 2>/dev/null)
     [[ -n "$_pt" ]] && _extract_hostname "$_pt" "$2"
 }
 
@@ -231,12 +230,12 @@ _read_agent_tcp_via() {
 probe_tty() {
     local dev="$1" cfg_baud="${2:-${PROBE_BAUDS[0]}}"
 
-    local _devname; _devname=$(basename "$dev")
+    local _devname="${dev##*/}"
     local _lockfile="/tmp/serial-connect-locks/$_devname"
     local _agent_pidfile="/tmp/serial-agent/$_devname/daemon.pid"
     local _lock_alive=0 _agent_alive=0
     if [[ -f "$_lockfile" ]]; then
-        local _lock_pid; _lock_pid=$(awk 'NR==1' "$_lockfile" 2>/dev/null)
+        local _lock_pid; { read -r _lock_pid; } < "$_lockfile" 2>/dev/null
         if [[ -n "$_lock_pid" ]] && [[ -d "/proc/$_lock_pid" ]]; then
             _lock_alive=1
         else
@@ -273,7 +272,7 @@ probe_tty() {
         done
     fi
 
-    local _eff_ms="${_PROBE_TIMEOUTS[$(basename "$dev")]:-$PROBE_READ_MS}"
+    local _eff_ms="${_PROBE_TIMEOUTS[${dev##*/}]:-$PROBE_READ_MS}"
     local read_t drain_t
     read_t="$(( _eff_ms        / 1000 )).$(printf '%03d' $(( _eff_ms        % 1000 )))"
     drain_t="$(( PROBE_DRAIN_MS / 1000 )).$(printf '%03d' $(( PROBE_DRAIN_MS % 1000 )))"
@@ -344,7 +343,7 @@ save_cache() {
     : > "$CACHE_FILE"
     for i in "${!DEVS[@]}"; do
         local key="${VIDS[$i]}:${PIDS[$i]}:${SERS[$i]}:${IFNS[$i]}"
-        local result; result=$(cat "$probe_dir/$(basename "${DEVS[$i]}")" 2>/dev/null || echo "FAIL|")
+        local result; read -r result < "$probe_dir/${DEVS[$i]##*/}" 2>/dev/null || result="FAIL|"
         result="${result:-FAIL|}"  # empty = probe killed by watchdog; treat as FAIL
         local _st _bd _hn
         IFS='|' read -r _st _bd _hn <<< "$result"
@@ -364,7 +363,7 @@ load_cache() {
     done < "$CACHE_FILE" 2>/dev/null
     for i in "${!DEVS[@]}"; do
         local key="${VIDS[$i]}:${PIDS[$i]}:${SERS[$i]}:${IFNS[$i]}"
-        echo "${_lc[$key]:-DEAD|}" > "$probe_dir/$(basename "${DEVS[$i]}")"
+        echo "${_lc[$key]:-DEAD|}" > "$probe_dir/${DEVS[$i]##*/}"
     done
 }
 
@@ -437,7 +436,7 @@ run_probes() {
             wait -n 2>/dev/null; (( active-- )) || true
         fi
         ( probe_tty "${DEVS[$i]}" "${BAUDS[$i]}" \
-            > "$PROBE_DIR/$(basename "${DEVS[$i]}")" ) &
+            > "$PROBE_DIR/${DEVS[$i]##*/}" ) &
         pids+=($!); (( active++ )) || true
     done
     local _max_read=$PROBE_READ_MS _t
@@ -465,7 +464,7 @@ enumerate_devices() {
     local _etmp; _etmp=$(mktemp -d /tmp/serial-enum.XXXXXX)
     local -a _epids=()
     for dev in "${dev_list[@]}"; do
-        udevadm info -q property -n "$dev" > "$_etmp/$(basename "$dev")" 2>/dev/null &
+        udevadm info -q property -n "$dev" > "$_etmp/${dev##*/}" 2>/dev/null &
         _epids+=($!)
     done
     wait "${_epids[@]}" 2>/dev/null
@@ -480,7 +479,7 @@ enumerate_devices() {
                 ID_SERIAL_SHORT)      ser="$val" ;;
                 ID_USB_INTERFACE_NUM) ifn="$val" ;;
             esac
-        done < "$_etmp/$(basename "$dev")"
+        done < "$_etmp/${dev##*/}"
         local vp="${vid}:${pid}"
         DEVS[$idx]="$dev";  VIDS[$idx]="$vid";  PIDS[$idx]="$pid"
         SERS[$idx]="$ser";  IFNS[$idx]="$ifn";  IFSTRS[$idx]=""
@@ -530,8 +529,7 @@ build_board_ids() {
         if [[ -n "${CFG_LABEL[$ser]:-}" ]]; then
             BOARD_ID[$ser]="${CFG_LABEL[$ser]}"
         elif [[ -z "${BOARD_ID[$ser]+x}" ]]; then
-            IFS='|' read -r _r _b cap \
-                <<< "$(cat "$PROBE_DIR/$(basename "${DEVS[$i]}")" 2>/dev/null || echo 'FAIL||')"
+            IFS='|' read -r _r _b cap _ < "$PROBE_DIR/${DEVS[$i]##*/}" 2>/dev/null || { _r='FAIL'; cap=''; }
             [[ ( "$_r" == "LIVE" || "$_r" == "OPEN" ) && -n "$cap" ]] && BOARD_ID[$ser]="$cap"
         fi
     done
@@ -544,8 +542,7 @@ build_active_ser() {
     declare -gA _active_ser=()
     local i rs
     for i in "${!DEVS[@]}"; do
-        IFS='|' read -r rs _ _ \
-            <<< "$(cat "$PROBE_DIR/$(basename "${DEVS[$i]}")" 2>/dev/null || echo 'FAIL||')"
+        IFS='|' read -r rs _ _ < "$PROBE_DIR/${DEVS[$i]##*/}" 2>/dev/null || rs='FAIL'
         [[ "$rs" == "LIVE" || "$rs" == "OPEN" ]] && _active_ser[${SERS[$i]}]=1
     done
 }

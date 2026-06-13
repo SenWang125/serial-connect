@@ -161,7 +161,7 @@ launch() {
             rm -f "$_pty_link"
             socat pty,raw,echo=0,link="$_pty_link",wait-slave "tcp:$agent_tcp" 2>/dev/null &
             _socat_pid=$!
-            local _i; for _i in $(seq 40); do
+            local _i; for (( _i=0; _i<40; _i++ )); do
                 [[ -e "$_pty_link" ]] && break; sleep 0.05
             done
             if [[ -e "$_pty_link" ]]; then
@@ -238,7 +238,7 @@ if [[ "$cur_sig" != "$prev_sig" ]]; then
         load_cache "$PROBE_DIR"
         declare -a _new_idxs=()
         for i in "${!DEVS[@]}"; do
-            grep -qF "${VIDS[$i]}:${PIDS[$i]}:${SERS[$i]}" <<< "$prev_sig" || _new_idxs+=("$i")
+            [[ "$prev_sig" == *"${VIDS[$i]}:${PIDS[$i]}:${SERS[$i]}"* ]] || _new_idxs+=("$i")
         done
         (( ${#_new_idxs[@]} > 0 )) && run_probes "${_new_idxs[@]}"
     else
@@ -257,8 +257,7 @@ elif [[ -f "$CACHE_FILE" ]]; then
         if [[ "$_fl" =~ ^(/dev/tty[^:]+):[[:space:]]*(.*) ]]; then
             [[ -n "${BASH_REMATCH[2]//[[:space:]]/}" ]] && _fuser_held[${BASH_REMATCH[1]}]=1
         fi
-    done < <({ fuser /dev/ttyUSB* /dev/ttyACM* 2>&1
-                sudo -n fuser /dev/ttyUSB* /dev/ttyACM* 2>&1; } 2>/dev/null)
+    done < <(fuser /dev/ttyUSB* /dev/ttyACM* 2>&1 2>/dev/null)
 
     # Reconcile cached state with current fuser/lock status for all ports.
     # Any state + fuser held  → OPEN (catches stale DEAD/FAIL/LIVE entries).
@@ -266,18 +265,17 @@ elif [[ -f "$CACHE_FILE" ]]; then
     declare -a _stale_open_idxs=()
     declare -A _stale_open_set=()
     for i in "${!DEVS[@]}"; do
-        _pf="$PROBE_DIR/$(basename "${DEVS[$i]}")"
-        _r=$(cut -d'|' -f1 "$_pf" 2>/dev/null)
-        _baud=$(cut -d'|' -f2 "$_pf" 2>/dev/null)
-        _bid=$(cut -d'|' -f3 "$_pf" 2>/dev/null)
-        _lf="/tmp/serial-connect-locks/$(basename "${DEVS[$i]}")"
+        _dn="${DEVS[$i]##*/}"          # basename — zero forks
+        _pf="$PROBE_DIR/$_dn"
+        IFS='|' read -r _r _baud _bid _ < "$_pf" 2>/dev/null || { _r=''; _baud=''; _bid=''; }
+        _lf="$LOCK_DIR/$_dn"
         _lock_live=0
         if [[ -f "$_lf" ]]; then
-            _lpid=$(awk 'NR==1' "$_lf" 2>/dev/null)
+            { read -r _lpid; } < "$_lf" 2>/dev/null
             [[ -n "$_lpid" && -d "/proc/$_lpid" ]] && _lock_live=1 || rm -f "$_lf" 2>/dev/null || true
         fi
         if [[ -n "${_fuser_held[${DEVS[$i]}]+x}" ]] || (( _lock_live )); then
-            [[ -z "$_bid" ]] && _agent_hostname "$(basename "${DEVS[$i]}")" _bid
+            [[ -z "$_bid" ]] && _agent_hostname "$_dn" _bid
             printf 'OPEN|%s|%s\n' "${_baud:-${BAUDS[$i]}}" "$_bid" > "$_pf"
         elif [[ "$_r" == "OPEN" ]]; then
             _stale_open_idxs+=("$i")
@@ -289,16 +287,16 @@ elif [[ -f "$CACHE_FILE" ]]; then
     # _recog won't count them, then they fall into the single combined reprobe below.
     # Hostname is preserved so the scale-factor logic applies correctly.
     for i in "${_stale_open_idxs[@]}"; do
-        _pf="$PROBE_DIR/$(basename "${DEVS[$i]}")"
-        _cached_hn=$(cut -d'|' -f3 "$_pf" 2>/dev/null || echo "")
+        _pf="$PROBE_DIR/${DEVS[$i]##*/}"
+        IFS='|' read -r _ _ _cached_hn _ < "$_pf" 2>/dev/null || _cached_hn=""
         printf 'DEAD|%s|%s\n' "${BAUDS[$i]}" "$_cached_hn" > "$_pf"
-        _PROBE_TIMEOUTS["$(basename "${DEVS[$i]}")"]=$(( PROBE_READ_MS * PROBE_READ_SCALE ))
+        _PROBE_TIMEOUTS[${DEVS[$i]##*/}]=$(( PROBE_READ_MS * PROBE_READ_SCALE ))
     done
 
     declare -A _recog
     for i in "${!DEVS[@]}"; do
         ser="${SERS[$i]}"
-        result=$(cat "$PROBE_DIR/$(basename "${DEVS[$i]}")" 2>/dev/null || echo "")
+        read -r result < "$PROBE_DIR/${DEVS[$i]##*/}" 2>/dev/null || result=""
         [[ "$result" =~ ^(LIVE|OPEN)\| ]] && _recog[$ser]=1
         # REPROBE_DEAD=0: skip re-probing dead serials, but never skip stale-OPEN
         # ports — they must be re-probed regardless of their serial's other states.
@@ -316,9 +314,9 @@ elif [[ -f "$CACHE_FILE" ]]; then
     # configured baud — guards against false-positive baud detections.
     for i in "${!DEVS[@]}"; do
         [[ -n "${_recog[${SERS[$i]}]+x}" ]] || continue
-        _pf="$PROBE_DIR/$(basename "${DEVS[$i]}")"
-        _cr=$(cat "$_pf" 2>/dev/null || echo "")
-        if [[ "$_cr" =~ ^LIVE\|([0-9]+)\| && "${BASH_REMATCH[1]}" != "${BAUDS[$i]}" ]]; then
+        _pf="$PROBE_DIR/${DEVS[$i]##*/}"
+        IFS='|' read -r _cr_r _cr_b _ _ < "$_pf" 2>/dev/null || { _cr_r=''; _cr_b=''; }
+        if [[ "$_cr_r" == "LIVE" && -n "$_cr_b" && "$_cr_b" != "${BAUDS[$i]}" ]]; then
             _reprobe_idxs+=("$i")
         fi
     done
@@ -326,11 +324,10 @@ elif [[ -f "$CACHE_FILE" ]]; then
     # Scale timeout for ports with a cached hostname — they were alive before.
     if (( ${#_reprobe_idxs[@]} > 0 )); then
         for i in "${_reprobe_idxs[@]}"; do
-            [[ -n "${_PROBE_TIMEOUTS[$(basename "${DEVS[$i]}")]+x}" ]] && continue
-            _pf="$PROBE_DIR/$(basename "${DEVS[$i]}")"
-            IFS='|' read -r _ _ _hn _ < "$_pf" 2>/dev/null || true
-            [[ -n "$_hn" ]] && \
-                _PROBE_TIMEOUTS["$(basename "${DEVS[$i]}")"]=$(( PROBE_READ_MS * PROBE_READ_SCALE ))
+            _dn="${DEVS[$i]##*/}"
+            [[ -n "${_PROBE_TIMEOUTS[$_dn]+x}" ]] && continue
+            IFS='|' read -r _ _ _hn _ < "$PROBE_DIR/$_dn" 2>/dev/null || _hn=""
+            [[ -n "$_hn" ]] && _PROBE_TIMEOUTS[$_dn]=$(( PROBE_READ_MS * PROBE_READ_SCALE ))
         done
         run_probes "${_reprobe_idxs[@]}"
         _PROBE_TIMEOUTS=()
@@ -365,8 +362,8 @@ if [[ "${1:-}" == "--label" ]]; then
         # Check all ports of this device — use first LIVE/OPEN one for probed label
         for j in "${_disp_order[@]}"; do
             [[ "${SERS[$j]}" != "$ser" ]] && continue
-            IFS='|' read -r _rj _bj _idj \
-                <<< "$(cat "$PROBE_DIR/$(basename "${DEVS[$j]}")" 2>/dev/null || echo 'FAIL||')"
+            IFS='|' read -r _rj _bj _idj _ < "$PROBE_DIR/${DEVS[$j]##*/}" 2>/dev/null \
+                || { _rj='FAIL'; _bj=''; _idj=''; }
             [[ -z "$_rj" || "$_rj" == "DEAD" ]] && _rj="dead"
             if [[ "$_rj" == "LIVE" || "$_rj" == "OPEN" ]]; then
                 _r="$_rj"
@@ -441,12 +438,11 @@ declare -a ROW_DEV ROW_BAUD ROW_STATE
 declare -A ROW_BY_CHIPPORT   # "N-pM" → row number
 
 for i in "${_disp_order[@]}"; do
-    dev="${DEVS[$i]}"; devname=$(basename "$dev")
+    dev="${DEVS[$i]}"; devname="${dev##*/}"
     ser="${SERS[$i]}"; chip="${CHIPS[$i]}"; baud="${BAUDS[$i]}"
     [[ "$ser" != "$prev_ser" && "$prev_ser" != "__unset__" ]] && echo ""
     prev_ser="$ser"
-    IFS='|' read -r raw probe_baud _ \
-        <<< "$(cat "$PROBE_DIR/$devname" 2>/dev/null || echo 'FAIL||')"
+    IFS='|' read -r raw probe_baud _ < "$PROBE_DIR/$devname" 2>/dev/null || { raw='FAIL'; probe_baud=''; }
     [[ -z "$raw" || "$raw" == "DEAD" ]] && state="dead" || state="$raw"
     if [[ "$state" == "LIVE" && "$probe_baud" =~ ^[0-9]+$ ]]; then
         baud="$probe_baud"
@@ -502,8 +498,7 @@ while true; do
         _lf="/tmp/serial-connect-locks/$(basename "${ROW_DEV[$choice]}")"
         _lock_user=""; _lock_pid=""
         if [[ -f "$_lf" ]]; then
-            _lock_pid=$(awk 'NR==1' "$_lf" 2>/dev/null)
-            _lock_user=$(awk 'NR==2' "$_lf" 2>/dev/null)
+            { read -r _lock_pid; read -r _lock_user; } < "$_lf" 2>/dev/null
         fi
         echo -e "  ${CYAN}⊙${NC} ${ROW_DEV[$choice]} is currently held by:"
         if [[ -n "$_lock_user" ]]; then
@@ -543,7 +538,7 @@ while true; do
         # it, locking out the incoming session.  Killing the process group eliminates
         # the whole session (bash, tio, socat) in one shot before new socat is created.
         if [[ -n "$_lock_pid" && -d "/proc/$_lock_pid" ]]; then
-            _pgid=$(ps -o pgid= -p "$_lock_pid" 2>/dev/null | tr -d ' ')
+            read -ra _pstat < "/proc/$_lock_pid/stat" 2>/dev/null; _pgid="${_pstat[4]:-}"
             if [[ -n "$_pgid" && "$_pgid" != "1" ]]; then
                 kill -TERM -- "-$_pgid" 2>/dev/null || true
             fi
@@ -583,10 +578,9 @@ done
 sel_dev="${ROW_DEV[$choice]}"; sel_baud="${ROW_BAUD[$choice]}"
 
 # Real-time lock check — cache may be stale if another user connected since last probe
-_lf="/tmp/serial-connect-locks/$(basename "$sel_dev")"
+_lf="/tmp/serial-connect-locks/${sel_dev##*/}"
 if [[ -f "$_lf" ]]; then
-    _lpid=$(awk 'NR==1' "$_lf" 2>/dev/null)
-    _luser=$(awk 'NR==2' "$_lf" 2>/dev/null)
+    { read -r _lpid; read -r _luser; } < "$_lf" 2>/dev/null
     if [[ -d "/proc/$_lpid" && "$_luser" != "$USER" ]] && ! sudo -n true 2>/dev/null; then
         echo -e "\n  ${YELLOW}⚠${NC}  ${sel_dev} is now held by user '${_luser}'"
         _share_sock="/tmp/$(basename "$sel_dev")-serial.sock"
