@@ -243,7 +243,7 @@ probe_tty() {
         fi
     fi
     _agent_is_alive "$_devname" _agent_alive
-    if (( _agent_alive )); then
+    if (( _agent_alive && _lock_alive )); then
         local _hostname; _agent_hostname "$_devname" _hostname
         printf 'OPEN|%s|%s\n' "$cfg_baud" "$_hostname"
         return
