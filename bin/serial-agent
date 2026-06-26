@@ -842,16 +842,16 @@ class Daemon:
         # where holding the port would block other tools; set --idle-timeout N.
         on_demand = self.idle_timeout > 0 and not self._given_tcp
         _lf_path = Path('/tmp/serial-connect-locks') / Path(self.device).name
-        if not on_demand:
-            try:
-                _lf_path.parent.mkdir(mode=0o1777, exist_ok=True)
-                os.chmod(_lf_path.parent, 0o1777)
-                _lf_path.write_text(f'{os.getpid()}\n{os.environ.get("USER", "")}\n')
-                self._lock_file = _lf_path
-            except OSError:
-                self._lock_file = None
-        else:
+        # The lock file is managed exclusively by serial-connect (_lock_acquire /
+        # _lock_release) as a human-session signal.  The daemon must NOT write it
+        # in always-on mode: doing so makes the port permanently appear OPEN in
+        # serial-discover and serial-connect, preventing normal (non-force-close)
+        # connections even when no human session is active.  On-demand mode writes
+        # the lock only while physically holding the fd (relay client connected).
+        if on_demand:
             self._lock_file = None   # acquired/released dynamically with fd
+        else:
+            self._lock_file = None   # never written; serial-connect owns the lock
 
         if not self.fifo_file.exists():
             os.mkfifo(self.fifo_file)

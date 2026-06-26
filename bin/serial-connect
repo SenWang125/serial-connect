@@ -306,8 +306,26 @@ elif [[ -f "$CACHE_FILE" ]]; then
             [[ -n "$_lpid" && -d "/proc/$_lpid" ]] && _lock_live=1 || rm -f "$_lf" 2>/dev/null || true
         fi
         if [[ -n "${_fuser_held[${DEVS[$i]}]+x}" ]] || (( _lock_live )); then
-            [[ -z "$_bid" ]] && _agent_hostname "$_dn" _bid
-            printf 'OPEN|%s|%s\n' "${_baud:-${BAUDS[$i]}}" "$_bid" > "$_pf"
+            # Check if the only holder is the persistent-observer daemon (no human session).
+            # An always-on daemon always holds the fd, so fuser always finds it — but that
+            # must NOT make the port appear OPEN when no human is using it.
+            _da=0; _agent_is_alive "$_dn" _da
+            if (( _da && !_lock_live )); then
+                # Daemon holds device as observer, no human session: report board state.
+                local _sf="/tmp/serial-agent/$_dn/status.json"
+                local _ds='UNKNOWN'
+                [[ -f "$_sf" ]] && _ds=$(awk -F'"' '/"state"/{print $4;exit}' "$_sf" 2>/dev/null)
+                _agent_hostname "$_dn" _bid
+                case "${_ds:-}" in
+                    SHELL|RUNNING|UBOOT|LOGIN|PASSWORD|BOOTING)
+                        printf 'LIVE|%s|%s\n' "${_baud:-${BAUDS[$i]}}" "${_bid:-}" > "$_pf" ;;
+                    *)
+                        printf 'DEAD|%s|%s\n' "${_baud:-${BAUDS[$i]}}" "${_bid:-}" > "$_pf" ;;
+                esac
+            else
+                [[ -z "$_bid" ]] && _agent_hostname "$_dn" _bid
+                printf 'OPEN|%s|%s\n' "${_baud:-${BAUDS[$i]}}" "$_bid" > "$_pf"
+            fi
         elif [[ "$_r" == "OPEN" ]]; then
             _stale_open_idxs+=("$i")
             _stale_open_set[$i]=1

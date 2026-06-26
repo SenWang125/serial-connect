@@ -255,10 +255,31 @@ probe_tty() {
     fi
     _agent_is_alive "$_devname" _agent_alive
     if (( _agent_alive && _lock_alive )); then
+        # Human session active: serial-connect wrote the lock via _lock_acquire.
         local _hostname; _agent_hostname "$_devname" _hostname
         printf 'OPEN|%s|%s\n' "$cfg_baud" "$_hostname"
         return
     fi
+    if (( _agent_alive )); then
+        # Daemon is running as a persistent observer but no human session is active.
+        # Do NOT fall through to fuser: the always-on daemon permanently holds the
+        # physical fd, so fuser always finds it and would return OPEN even when no
+        # human is using the port, making the port permanently unconnectable without
+        # a force-close.  Instead, report the board's actual state from the daemon's
+        # last-known status so the port shows LIVE/DEAD and is directly connectable.
+        local _hostname; _agent_hostname "$_devname" _hostname
+        local _sf="/tmp/serial-agent/$_devname/status.json"
+        local _state='UNKNOWN'
+        [[ -f "$_sf" ]] && _state=$(awk -F'"' '/"state"/{print $4;exit}' "$_sf" 2>/dev/null)
+        case "${_state:-}" in
+            SHELL|RUNNING|UBOOT|LOGIN|PASSWORD|BOOTING)
+                printf 'LIVE|%s|%s\n' "$cfg_baud" "${_hostname:-}" ;;
+            *)
+                printf 'DEAD|%s|%s\n' "$cfg_baud" "${_hostname:-}" ;;
+        esac
+        return
+    fi
+    # No daemon running: fuser check (catches non-daemon holders), then direct probe.
     { timeout 2 fuser "$dev" &>/dev/null 2>&1 \
         || sudo -n timeout 2 fuser "$dev" &>/dev/null 2>&1 \
         || (( _lock_alive )); } \
