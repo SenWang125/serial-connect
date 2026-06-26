@@ -209,6 +209,8 @@ _agent_hostname() {
 _agent_is_alive() {
     printf -v "$2" '%s' '0'
     local _pf="/tmp/serial-agent/$1/daemon.pid"
+    # Fall back to real path if /tmp symlink is missing or stale.
+    [[ -f "$_pf" ]] || _pf="$HOME/var/serial-agent/$1/daemon.pid"
     [[ -f "$_pf" ]] || return
     local _pid; _pid=$(cat "$_pf" 2>/dev/null) || return
     [[ -n "$_pid" && -d "/proc/$_pid" ]] && printf -v "$2" '%s' '1'
@@ -217,9 +219,18 @@ _agent_is_alive() {
 # ── _read_agent_tcp_via ────────────────────────────────────────────────────────
 # Read the TCP relay address from serial-agent's status.json.
 # Usage: _read_agent_tcp_via STATUS_JSON OUTVAR  (sets OUTVAR to host:port or "")
+#
+# Prefers the 'relay' field (new daemons always set this to the built-in relay,
+# even when the backend is ser2net).  Falls back to 'via' for old daemons where
+# 'relay' is absent and 'via' held the relay address for the direct-device case.
 _read_agent_tcp_via() {
     printf -v "$2" '%s' ''
     [[ -f "$1" ]] || return
+    local _r; _r=$(awk -F'"' '/"relay"/{print $4;exit}' "$1" 2>/dev/null)
+    if [[ -n "$_r" && "$_r" != "null" ]]; then
+        printf -v "$2" '%s' "$_r"
+        return
+    fi
     local _v; _v=$(awk -F'"' '/"via"/{print $4;exit}' "$1" 2>/dev/null)
     [[ "$_v" == tcp:* ]] && printf -v "$2" '%s' "${_v#tcp:}"
 }
@@ -248,8 +259,8 @@ probe_tty() {
         printf 'OPEN|%s|%s\n' "$cfg_baud" "$_hostname"
         return
     fi
-    { fuser "$dev" &>/dev/null 2>&1 \
-        || sudo -n fuser "$dev" &>/dev/null 2>&1 \
+    { timeout 2 fuser "$dev" &>/dev/null 2>&1 \
+        || sudo -n timeout 2 fuser "$dev" &>/dev/null 2>&1 \
         || (( _lock_alive )); } \
         && { printf 'OPEN|%s|\n' "$cfg_baud"; return; }
 
@@ -343,8 +354,8 @@ save_cache() {
     : > "$CACHE_FILE"
     for i in "${!DEVS[@]}"; do
         local key="${VIDS[$i]}:${PIDS[$i]}:${SERS[$i]}:${IFNS[$i]}"
-        local result; read -r result < "$probe_dir/${DEVS[$i]##*/}" 2>/dev/null || result="FAIL|"
-        result="${result:-FAIL|}"  # empty = probe killed by watchdog; treat as FAIL
+        local result; read -r result < "$probe_dir/${DEVS[$i]##*/}" 2>/dev/null || result=""
+        result="${result:-DEAD|}"  # empty = probe killed by watchdog; treat as DEAD
         local _st _bd _hn
         IFS='|' read -r _st _bd _hn <<< "$result"
         if [[ -z "$_hn" && -n "${_prev_hn[$key]:-}" ]]; then
@@ -481,6 +492,13 @@ enumerate_devices() {
             esac
         done < "$_etmp/${dev##*/}"
         local vp="${vid}:${pid}"
+        # Bash 5.2 rejects empty string as an associative-array subscript
+        # ("bad array subscript").  Devices like CH340 have no ID_SERIAL_SHORT,
+        # leaving $ser empty.  Use the device basename as a synthetic serial so
+        # CFG_LABEL[$ser] / BOARD_ID[$ser] always have a non-empty key.
+        # The synthetic key is session-stable but not reboot-stable — these
+        # devices can't be stably identified without a real serial# anyway.
+        [[ -z "$ser" ]] && ser="${dev##*/}"
         DEVS[$idx]="$dev";  VIDS[$idx]="$vid";  PIDS[$idx]="$pid"
         SERS[$idx]="$ser";  IFNS[$idx]="$ifn";  IFSTRS[$idx]=""
         CHIPS[$idx]="${CHIP_NAMES[$vp]:-${CHIP_WILDCARD[${vp%%:*}]:-$vp}}"

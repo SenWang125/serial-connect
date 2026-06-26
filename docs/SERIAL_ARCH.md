@@ -21,10 +21,11 @@ serial-discover  ─────────────────────
 
 serial-connect  ────────────────────────────────────────────────────────────► human terminal (tio)
   • interactive menu with live probe
-  • cache: /tmp/serial-connect.{sig,cache} — avoids reprobing on each run
+  • cache: /tmp/serial-connect-USER.{sig,cache} — avoids reprobing on each run
   • selective re-probe: only unrecognized boards checked each run
-  • auto-starts serial-agent if not running → socat PTY bridge to built-in relay
-  • auto-detects relay/ser2net TCP (reads serial-agent status.json) → socat bridge
+  • auto-starts serial-agent --idle-timeout 0 (always-on) if not running
+  • connects tio via socat PTY bridge to daemon's built-in relay
+  • daemon PERSISTS after serial-connect exits — not stopped on session end
   • HUPCL cleared before probe + sudo -n fuser for root-owned sessions
 
 tio.sh [N|/dev/ttyXXX] [baud]  ────────────────────────────────────────────► tmux session
@@ -32,10 +33,11 @@ tio.sh [N|/dev/ttyXXX] [baud]  ────────────────�
   • tio with unix socket: /tmp/ttyUSBx.sock  ← socat can share it
 
 serial-agent built-in TCP relay  (automatic, no configuration needed)
-  • daemon binds ephemeral 127.0.0.1 port on startup
+  • daemon binds 127.0.0.1 port on startup (RELAY_BASE_PORT range if set, else ephemeral)
   • fans bytes to all TCP clients (full stream to each)
-  • status.json reports via: "tcp:127.0.0.1:PORT" — serial-connect auto-detects
+  • status.json 'relay' field: "host:port" — serial-connect reads this to locate the relay
   • serial-connect bridges to tio via socat PTY (tio v2.7 has no tcp: device support)
+  • multiple socat clients can share the relay simultaneously (read-only observation)
 
 ser2net  (optional, for multi-user / network access)
   • holds physical serial port exclusively, fans to TCP clients
@@ -149,15 +151,31 @@ serial-agent send/run/health...
 
 ## Coexistence (tio + serial-agent)
 
-**Default — built-in relay + socat PTY bridge (requires socat):**
+**Design principle: daemon = always-on observer; tio = transparent window.**
+
+The daemon holds the physical port continuously (always-on mode, `--idle-timeout 0`).
+tio connects via a socat PTY bridge to the daemon's built-in TCP relay.  The daemon
+runs before tio opens and after tio exits — it is never stopped by serial-connect.
+
 ```
-board → /dev/ttyUSB1 ← serial-agent daemon (TCP relay 127.0.0.1:PORT)
-                              ├─→ socat PTY /tmp/ttyUSB1-pty    (tio opens this)
-                              └─→ any other TCP client           (full stream)
+board → /dev/ttyUSB1 ← serial-agent daemon (always-on, holds fd)
+                              │ TCP relay 127.0.0.1:PORT
+                              ├─→ socat PTY /tmp/ttyUSB1-USER-PID-pty  (tio opens this)
+                              └─→ any other TCP client (read-only observer)
 ```
-serial-connect auto-starts serial-agent, then uses socat to create a PTY that
-bridges to the relay.  tio opens the PTY as a regular device.  tio v2.7 has no
-native tcp: device support — the PTY bridge is required for coexistence.
+
+**Startup probe:** When the daemon first opens the physical port, it sends a bare CR
+0.5 s after connection if no output has been received.  This wakes an idle board from
+UNKNOWN → SHELL before the human even connects.  The probe is NOT suppressed by an
+active human session — a single CR is harmless and necessary to bootstrap state.
+
+**Session lifecycle:**
+1. serial-connect checks for daemon; if absent, starts one (`--idle-timeout 0`)
+2. Daemon opens physical port immediately; startup probe fires within 0.5 s
+3. serial-connect starts socat → PTY appears → tio opens it → human session active
+4. human_session file written; heartbeat refreshes it every 60 s
+5. On exit: heartbeat killed → socat killed → lock/human_session released → **daemon left running**
+6. Next serial-connect session: daemon already running, state already known — instant connect
 
 **Optional — ser2net (multi-user / network access):**
 ```
@@ -178,7 +196,8 @@ Install: `sudo cp /tmp/ser2net.yaml /etc/ser2net.yaml && sudo systemctl restart 
 | Terminal line wrapping | Board's shell has narrow default terminal | Use `--no-wrap` flag OR `connect --setup-terminal` (runs `stty cols 220`) |
 | `--exit-code` with `exit` cmd | `exit` kills shell before EXITCODE echo can run | Use `run DEVICE script.sh` instead |
 | Stale daemons after crash | D-state processes can't be SIGKILL'd quickly | `serial-agent stop DEVICE` now uses fuser to kill all holders |
-| UBOOT/PANIC detection untested | No live board in final test session | Regex added; state machine logic is correct |
+| Devices without USB serial# | Bash 5.2 rejects empty string as array subscript | Synthetic key derived from device basename (e.g. `ttyUSB24`) |
+| Old daemon (--idle-timeout 10) | Daemon started before always-on fix | `serial-agent stop DEVICE && serial-agent start DEVICE --idle-timeout 0` |
 
 ---
 
@@ -186,15 +205,15 @@ Install: `sudo cp /tmp/ser2net.yaml /etc/ser2net.yaml && sudo systemctl restart 
 
 | File | Role | Modified by |
 |------|------|-------------|
-| `~/.config/serial-boards.conf` | Board labels + baud overrides | User / `auto-label` |
-| `~/bin/serial-discover` | Port discovery + probing | Never auto-modified |
-| `~/bin/serial-connect` | Human interactive terminal launcher | Never auto-modified |
-| `~/bin/tio.sh` | Tmux+tio session launcher | Never auto-modified |
-| `~/bin/serial-agent` | Agent daemon + CLI | Never auto-modified |
-| `~/var/serial-agent/*/` | Runtime state (buf, status, events) | serial-agent daemon |
+| `/etc/serial-boards.conf` | System conf: chip table + probe settings + board labels | Admin / `sudo` |
+| `~/.config/serial-connect/boards.conf` | Per-user label overrides (shadows system conf key-by-key) | User / `auto-label` / `--label` |
+| `/usr/local/share/serial-connect/serial-*` | Installed scripts (global) | `sudo cp` |
+| `~/bin/serial-*.old` | Local development copies (not active) | Manual edit |
+| `~/var/serial-agent/*/` | Runtime state (buf, status, events, human_session) | serial-agent daemon / serial-connect |
 | `/tmp/serial-agent` | Symlink → ~/var/serial-agent | `serial-agent start` |
-| `/tmp/serial-connect.*` | Probe cache | `serial-connect` |
+| `/tmp/serial-connect-USER.{sig,cache}` | Per-user probe cache | `serial-connect` |
+| `/tmp/serial-connect-locks/DEVNAME` | Active session lock (PID + USER) | serial-connect `_lock_acquire` |
 
 ---
 
-*Last updated from chat history: 2026-05-10*
+*Last updated: 2026-06-25 — always-on daemon design, bash 5.2 empty-serial fix*

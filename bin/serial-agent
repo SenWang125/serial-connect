@@ -258,7 +258,10 @@ from threading import Thread, Event, Lock
 _SCRIPT_DIR = Path(__file__).resolve().parent
 _REAL_BASE = Path.home() / 'var' / 'serial-agent'
 _TMP_LINK  = Path('/tmp/serial-agent')
-AGENT_BASE = Path(os.environ.get('SERIAL_AGENT_DIR', str(_REAL_BASE)))
+# SERIAL_AGENT_DIR overrides the state directory (used by 'serial-agent test'
+# to redirect state to a temp dir so tests don't pollute ~/var/serial-agent).
+AGENT_BASE = Path(os.environ.get('SERIAL_AGENT_DIR',
+                  os.environ.get('SERIAL_AGENT_BASE', str(_REAL_BASE))))
 
 def _resolve_board_cfg() -> Path:
     """Return the writable label config. Matches serial-common.sh two-layer model:
@@ -434,7 +437,7 @@ class Daemon:
 
     def __init__(self, device, tcp, baud, lines, idle_timeout=0):
         self.device       = device
-        self.tcp          = tcp
+        self.tcp          = None   # relay address; set by _start_relay_if_direct
         self.baud         = baud
         self.maxlines     = lines
         self.idle_timeout = idle_timeout   # auto-stop when no relay clients for this many seconds (0=never)
@@ -665,7 +668,9 @@ class Daemon:
             'pid':             os.getpid(),
             'device':          self.device,
             'baud':            self.baud,
-            'via':             f'tcp:{self.tcp[0]}:{self.tcp[1]}' if self.tcp else 'direct',
+            'via':             (f'tcp:{self._given_tcp[0]}:{self._given_tcp[1]}'
+                               if self._given_tcp else 'direct'),
+            'relay':           (f'{self.tcp[0]}:{self.tcp[1]}' if self.tcp else None),
             'buf_file':        str(self.buf_file),
             'buf_lines':       len(self.buf_lines),
         }
@@ -701,16 +706,14 @@ class Daemon:
                 time.sleep(0.1)
 
     def _start_relay_if_direct(self):
-        """Bind a loopback TCP relay so tio can share the port without byte-splitting.
+        """Bind a loopback TCP relay so tio/socat can share the port.
 
-        When no external ser2net TCP is configured the daemon holds the physical
-        serial port directly.  This method starts a lightweight TCP listener on
-        an ephemeral loopback port, fans all incoming serial bytes to every
-        connected TCP client, and forwards client writes back to the device.
-        status.json is updated so serial-connect auto-routes tio to this port.
+        Always started, even when ser2net is the backend (_given_tcp set).
+        The relay is the client-facing endpoint: serial-connect/socat always
+        connect here.  This prevents socat from connecting directly to the
+        ser2net port, which would trigger ser2net kickolduser and kick the
+        daemon's own connection off.
         """
-        if self._given_tcp:
-            return
         srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         base = _relay_base_port()
@@ -723,7 +726,13 @@ class Daemon:
         else:
             srv.bind(('127.0.0.1', 0))
         port = srv.getsockname()[1]
-        self._t_last_client = now()   # start idle timer from relay creation
+        # Only start idle timer at relay creation for on-demand mode (direct device).
+        # For ser2net always-on mode (_given_tcp set), leave _t_last_client at 0.0
+        # so the always-on idle check never fires until an actual relay client has
+        # connected and disconnected — preventing the daemon from auto-stopping when
+        # nobody has ever used the relay.
+        if not self._given_tcp:
+            self._t_last_client = now()
         srv.listen(8)
         self.tcp = ('127.0.0.1', port)
         self._write_status()
@@ -793,10 +802,14 @@ class Daemon:
         self.pid_file.write_text(str(os.getpid()))
         self._write_status()
 
-        # on-demand: only hold the physical port while a relay client is connected.
-        # The lock file is also only written while the fd is held — the port appears
-        # free (not OPEN) to serial-connect/discover when no tio session is active.
-        # Always-on (idle_timeout=0 or external TCP): hold fd and lock continuously.
+        # Always-on (idle_timeout=0) vs on-demand (idle_timeout>0) modes.
+        # Always-on: hold physical fd + lock file continuously.  Port always shows
+        # OPEN in serial-discover; startup probe fires at t=0.5s; _send_raw works
+        # immediately because _fd is never None.  serial-connect uses this mode.
+        # On-demand: release fd when no relay client is connected.  _send_raw is a
+        # silent no-op while parked (_fd=None), which causes send() callers to
+        # time out with no error.  Only useful for short-lived automation sessions
+        # where holding the port would block other tools; set --idle-timeout N.
         on_demand = self.idle_timeout > 0 and not self._given_tcp
         _lf_path = Path('/tmp/serial-connect-locks') / Path(self.device).name
         if not on_demand:
@@ -822,7 +835,8 @@ class Daemon:
             # On-demand: park until a relay client connects.
             if on_demand and not self._relay_clients:
                 if (self._t_last_client > 0
-                        and now() - self._t_last_client > self.idle_timeout):
+                        and now() - self._t_last_client > self.idle_timeout
+                        and not _human_session_active(self.device)):
                     print(f'[serial-agent] idle {self.idle_timeout}s — auto-stopping', flush=True)
                     self._stop.set()
                     break
@@ -846,7 +860,7 @@ class Daemon:
                 t_connected = now()
                 _probe_sent = False
                 print(f'[serial-agent] {self.device} connected '
-                      f'via {"tcp" if self.tcp else "direct"}', flush=True)
+                      f'via {"ser2net" if self._given_tcp else "direct"}', flush=True)
                 while not self._stop.is_set():
                     # On-demand: release device when all relay clients have left.
                     if on_demand and not self._relay_clients:
@@ -861,10 +875,41 @@ class Daemon:
                                 continue   # spurious wakeup — no data yet
                             raise
                         if not data:
+                            # EOF — device or TCP peer closed the connection.
+                            # Without a sleep here the outer loop spins at full speed
+                            # re-connecting and immediately getting EOF again.
+                            if not _clients_gone and not self._stop.is_set():
+                                print(f'[serial-agent] {self.device} disconnected (EOF) '
+                                      f'— retry in {backoff}s', flush=True)
+                                if self.state != 'DEAD':
+                                    _prev = self._prev_state
+                                    self.state = 'DEAD'
+                                    self._prev_state = 'DEAD'
+                                    self._write_status()
+                                    _entry = f'[{ts()}] {_prev} → DEAD  (eof)'
+                                    try:
+                                        _ex = (self.events_file.read_text().splitlines()
+                                               if self.events_file.exists() else [])
+                                        _ex.append(_entry)
+                                        if len(_ex) > MAX_EVENTS:
+                                            _ex = _ex[-MAX_EVENTS:]
+                                        _etmp = self.events_file.with_suffix('.tmp')
+                                        _etmp.write_text('\n'.join(_ex) + '\n')
+                                        _etmp.rename(self.events_file)
+                                    except OSError:
+                                        pass
+                                time.sleep(backoff)
+                                backoff = min(backoff * 2, 30)
                             break
                         self._append(data)
                     else:
-                        # Startup probe.
+                        # Startup probe: one bare CR sent 0.5 s after connect if the
+                        # board has been silent.  Wakes an idle board at a shell prompt
+                        # so state transitions UNKNOWN → SHELL without user input.
+                        # The probe is intentionally NOT suppressed by an active human
+                        # session — a single CR is harmless and necessary for state
+                        # bootstrap.  serial-connect starts the daemon BEFORE writing
+                        # human_session (via _lock_acquire), so the probe fires first.
                         if (not _probe_sent and self.state == 'UNKNOWN'
                                 and not self.t_output
                                 and now() - t_connected > 0.5):
@@ -872,20 +917,51 @@ class Daemon:
                             _probe_sent = True
                         if self.t_output and now() - self.t_output > DEAD_AFTER:
                             if self.state != 'DEAD':
+                                _prev = self._prev_state
                                 self.state = 'DEAD'
+                                self._prev_state = 'DEAD'
                                 self._write_status()
+                                # Write to events.log so _wait_state can detect DEAD
+                                # via inotifywait — without this, DEAD is only in
+                                # status.json and _wait_state's loop never sees it.
+                                _entry = f'[{ts()}] {_prev} → DEAD'
+                                try:
+                                    _existing = (self.events_file.read_text().splitlines()
+                                                 if self.events_file.exists() else [])
+                                    _existing.append(_entry)
+                                    if len(_existing) > MAX_EVENTS:
+                                        _existing = _existing[-MAX_EVENTS:]
+                                    _etmp = self.events_file.with_suffix('.tmp')
+                                    _etmp.write_text('\n'.join(_existing) + '\n')
+                                    _etmp.rename(self.events_file)
+                                except OSError:
+                                    pass
                         # Always-on idle-stop (on-demand uses the outer-loop check).
                         if (not on_demand and self.idle_timeout > 0
                                 and not self._relay_clients
                                 and self._t_last_client > 0
-                                and now() - self._t_last_client > self.idle_timeout):
+                                and now() - self._t_last_client > self.idle_timeout
+                                and not _human_session_active(self.device)):
                             print(f'[serial-agent] idle {self.idle_timeout}s — auto-stopping', flush=True)
                             self._stop.set()
             except (ConnectionRefusedError, OSError) as e:
                 if not _clients_gone:
                     print(f'[serial-agent] connect error: {e} — retry in {backoff}s', flush=True)
+                    _prev = self._prev_state
                     self.state = 'DEAD'
+                    self._prev_state = 'DEAD'
                     self._write_status()
+                    _entry = f'[{ts()}] {_prev} → DEAD  (connect error)'
+                    try:
+                        _ex = (self.events_file.read_text().splitlines()
+                               if self.events_file.exists() else [])
+                        _ex.append(_entry)
+                        if len(_ex) > MAX_EVENTS: _ex = _ex[-MAX_EVENTS:]
+                        _etmp = self.events_file.with_suffix('.tmp')
+                        _etmp.write_text('\n'.join(_ex) + '\n')
+                        _etmp.rename(self.events_file)
+                    except OSError:
+                        pass
                     time.sleep(backoff)
                     backoff = min(backoff * 2, 30)
             finally:
@@ -1009,6 +1085,53 @@ def _wait_pattern(device, pattern, timeout, show=False, baseline_offset=None):
     return False
 
 
+def _human_session_active(device: str) -> bool:
+    """Return True if a human serial-connect/tio session is active for this device.
+
+    Reads ~/var/serial-agent/<devname>/human_session (written by serial-connect
+    _lock_acquire). Format: line 1 = PID, line 2 = Unix epoch float.
+    Returns False and removes the file if PID is dead or epoch is >300s old.
+    """
+    hf = devdir(device) / 'human_session'
+    if not hf.exists():
+        return False
+    try:
+        lines = hf.read_text().strip().splitlines()
+        if len(lines) < 2:
+            hf.unlink(missing_ok=True)
+            return False
+        pid   = int(lines[0])
+        epoch = float(lines[1])
+        try:
+            os.kill(pid, 0)
+        except OSError:
+            hf.unlink(missing_ok=True)
+            return False
+        if time.time() - epoch > 300:
+            hf.unlink(missing_ok=True)
+            return False
+        return True
+    except (ValueError, OSError):
+        hf.unlink(missing_ok=True)
+        return False
+
+
+def _log_op(device: str, op: str, **kwargs):
+    """Append one JSON entry to ops.log (ring-capped at 500 lines)."""
+    log_file = devdir(device) / 'ops.log'
+    entry = json.dumps({'ts': ts(), 'op': op, 'pid': os.getpid(), **kwargs})
+    try:
+        existing = log_file.read_text().splitlines() if log_file.exists() else []
+        existing.append(entry)
+        if len(existing) > 500:
+            existing = existing[-500:]
+        _tmp = log_file.with_suffix('.tmp')
+        _tmp.write_text('\n'.join(existing) + '\n')
+        _tmp.rename(log_file)
+    except OSError:
+        pass
+
+
 def _daemon_running(device: str) -> bool:
     """Return True if a daemon process for this device is alive.
 
@@ -1085,6 +1208,16 @@ def cmd_start(args):
     if os.fork():
         os._exit(0)
 
+    # Redirect fds 0/1/2 so any inherited pipe write-ends (e.g. from
+    # subprocess.run(capture_output=True)) are released.  Without this,
+    # subprocess.run blocks waiting for EOF on stdout even after the
+    # parent has exited, because the grandchild still holds fd=1 open
+    # via sys.__stdout__ (Python keeps the original TextIOWrapper alive).
+    null_fd = os.open('/dev/null', os.O_RDONLY)
+    os.dup2(null_fd, 0); os.close(null_fd)
+    log_fd = os.open(str(ddir / 'daemon.log'), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+    os.dup2(log_fd, 1); os.dup2(log_fd, 2); os.close(log_fd)
+    # Reassign Python file objects to match the new fds.
     sys.stdin  = open('/dev/null', 'r')
     sys.stdout = open(ddir / 'daemon.log', 'a', buffering=1)
     sys.stderr = sys.stdout
@@ -1102,7 +1235,16 @@ def cmd_stop(args):
 
     Also SIGTERMs any other processes still holding the device (stale
     restarts or orphaned sessions caught by fuser).
+
+    Refuses to stop if a human tio session is active unless --force is given.
+    serial-connect removes the human_session file before calling stop on exit,
+    so normal cleanup always proceeds; only external/accidental stops are blocked.
     """
+    if _human_session_active(args.device) and not getattr(args, 'force', False):
+        print(f'human session active for {args.device} — refusing stop '
+              f'(use --force to override or wait for tio to exit)',
+              file=sys.stderr)
+        sys.exit(1)
     pf = devdir(args.device) / 'daemon.pid'
     killed = []
     if pf.exists():
@@ -1182,24 +1324,28 @@ def cmd_alive(args):
     if state == 'SHELL':
         ago = s.get('last_prompt_ago')
         if ago is not None and ago < args.timeout:
+            _log_op(args.device, 'alive', result='ALIVE', state='SHELL')
             print(f'ALIVE  state=SHELL  prompt {ago:.0f}s ago'); sys.exit(0)
 
     # RUNNING = board is alive, just busy — don't probe (would interrupt command!)
     if state == 'RUNNING':
         ago = s.get('last_output_ago')
         if ago is not None and ago < args.timeout:
+            _log_op(args.device, 'alive', result='ALIVE', state='RUNNING')
             print(f'ALIVE  state=RUNNING  output {ago:.1f}s ago'); sys.exit(0)
 
     # Any recent output = alive (covers BOOTING, LOGIN, etc.)
     ago = s.get('last_output_ago')
     if ago is not None and ago < 2.0:
+        _log_op(args.device, 'alive', result='ALIVE', state=state)
         print(f'ALIVE  state={state}  output {ago:.1f}s ago'); sys.exit(0)
 
     # UBOOT = board is alive at U-Boot prompt
     if state == 'UBOOT':
+        _log_op(args.device, 'alive', result='ALIVE', state='UBOOT')
         print(f'ALIVE  state=UBOOT'); sys.exit(0)
 
-    # Slow path: probe with CR
+    # Slow path: probe with CR — skip if a human tio session is active
     bf = devdir(args.device) / 'buf.log'
     if _daemon_running(args.device):
         fifo = devdir(args.device) / 'input.fifo'
@@ -1219,9 +1365,11 @@ def cmd_alive(args):
                 s2 = json.loads(sf.read_text())
                 st2 = s2.get('state', '')
                 if st2 in ('SHELL', 'RUNNING', 'LOGIN', 'PASSWORD'):
+                    _log_op(args.device, 'alive', result='ALIVE', state=st2)
                     print(f'ALIVE  state={st2}  (probe response)'); sys.exit(0)
                 prev = bf.stat().st_size
 
+    _log_op(args.device, 'alive', result='DEAD_OR_UNKNOWN', state=state)
     print(f'DEAD_OR_UNKNOWN  state={state}'); sys.exit(1)
 
 
@@ -1393,13 +1541,19 @@ def _send_impl(args):
         output, exit_code = _clean_output(new_lines, cmd.strip())  # use actual sent cmd for echo detection
         sf = devdir(args.device) / 'status.json'
         state = json.loads(sf.read_text()).get('state', '?') if sf.exists() else '?'
-        return {
+        result = {
             'output':     output,
             'state':      state,
             'elapsed_ms': elapsed_ms,
             'exit_code':  exit_code,
             'timed_out':  not ok,
         }
+        _log_op(args.device, 'send', cmd=cmd.strip(), timeout=args.timeout,
+                elapsed_ms=elapsed_ms, state=state,
+                exit_code=exit_code, timed_out=not ok)
+        return result
+    _log_op(args.device, 'send', cmd=cmd.strip(), timeout=args.timeout,
+            elapsed_ms=elapsed_ms, timed_out=not ok)
     return {'timed_out': not ok}
 
 
@@ -1560,6 +1714,15 @@ def _wait_state(device, state_csv, timeout, print_output=True):
             interval = 0.05 if (time.time() - t_start) < 2.0 else 0.2
             time.sleep(interval)
 
+        # Always check status.json on each wakeup — catches states set directly
+        # in run() (e.g. DEAD from silence timeout) that don't produce an
+        # events.log line before Fix 1 was applied, and as a safety net after.
+        if sf.exists():
+            cur = json.loads(sf.read_text()).get('state', '')
+            if cur in targets:
+                if print_output: print(f'REACHED  state={cur}  (via status.json)')
+                return True
+
         if not ef.exists(): continue
         sz = ef.stat().st_size
         if sz > baseline:
@@ -1611,8 +1774,13 @@ def cmd_tail(args):
     for l in lines[-20:]:
         print(RE_TIMESTAMP.sub('', l) if args.no_timestamps else l)
     offset = bf.stat().st_size
+    deadline = time.time() + args.timeout if args.timeout > 0 else None
     try:
         while True:
+            if deadline and time.time() >= deadline:
+                break
+            if not _daemon_running(args.device):
+                break
             time.sleep(0.1)
             sz = bf.stat().st_size if bf.exists() else 0
             if sz > offset:
@@ -1661,10 +1829,13 @@ def cmd_connect(args):
     device = d['device']
     ensure_symlink()
 
-    # Start daemon if not running
+    # Start daemon in always-on mode (--idle-timeout 0).  On-demand mode would
+    # leave the daemon parked with _fd=None, making _send_raw a silent no-op —
+    # any subsequent 'send' call would time out with no error message.
     if not _daemon_running(device):
         tcp = find_ser2net_port(device)
-        cmd = [sys.argv[0], 'start', device, '--baud', str(d['baud'])]
+        cmd = [sys.argv[0], 'start', device, '--baud', str(d['baud']),
+               '--idle-timeout', '0']
         if tcp: cmd += ['--tcp', tcp]
         try:
             subprocess.run(cmd, check=True)
@@ -1708,6 +1879,10 @@ def cmd_connect(args):
                 wait=r'[\$#>]\s*$', timeout=5,
                 json=True, capture=False, exit_code=False, all=False, no_wrap=False))
 
+    _sf_log = devdir(device) / 'status.json'
+    _st_log = json.loads(_sf_log.read_text()).get('state', '?') if _sf_log.exists() else '?'
+    _log_op(device, 'connect', board=d.get('label') or d.get('hostname', ''),
+            state=_st_log)
     if args.json:
         sf = devdir(device) / 'status.json'
         info = {'device': device, 'label': d['label'], 'hostname': d['hostname'],
@@ -1856,6 +2031,15 @@ def cmd_reboot(args):
     """
     device = args.device
 
+    _log_op(device, 'reboot', cmd=args.cmd)
+
+    # Record wall time before sending reboot.  After the board comes back we
+    # verify the shell prompt timestamp is NEWER than this — if it's older the
+    # board never actually rebooted (command was ignored or came back instantly
+    # and hit the _wait_state fast path with the pre-reboot SHELL state).
+    t_reboot_sent = time.time()
+    sf = devdir(device) / 'status.json'
+
     # Send the reboot command — don't wait for prompt (shell dies immediately)
     if _daemon_running(device):
         fifo = devdir(device) / 'input.fifo'
@@ -1872,13 +2056,32 @@ def cmd_reboot(args):
     if not args.quiet:
         print(f'Rebooting {device}...')
 
-    # Wait for board to go down (DEAD or BOOTING)
-    _wait_state(device, 'DEAD,BOOTING', 30)
+    # Wait for board to go down (DEAD or BOOTING).
+    # DEAD is now written to events.log so _wait_state can detect it via inotify.
+    went_down = _wait_state(device, 'DEAD,BOOTING', 30)
+    if not went_down:
+        # Board did not go down within 30s.  Check if it's still at SHELL —
+        # the reboot command may have been ignored.
+        cur = json.loads(sf.read_text()).get('state', '') if sf.exists() else ''
+        if cur in ('SHELL', 'RUNNING'):
+            print(f'WARNING: board still at {cur} after 30s — reboot may not have executed',
+                  file=sys.stderr)
 
     # Wait for board to come back
     target = 'SHELL,LOGIN,UBOOT' if not args.no_login else 'SHELL,UBOOT'
     if not _wait_state(device, target, args.timeout):
         sys.exit(1)  # _wait_state already printed DAEMON_DIED or TIMEOUT
+
+    # Verify this is a NEW shell, not the pre-reboot one.
+    # last_prompt_ago = seconds since last prompt; approx_prompt_wall = when it happened.
+    # If that wall time is before t_reboot_sent, this is the old pre-reboot shell.
+    if sf.exists() and not args.quiet:
+        prompt_ago = json.loads(sf.read_text()).get('last_prompt_ago')
+        if prompt_ago is not None:
+            approx_prompt_wall = time.time() - prompt_ago
+            if approx_prompt_wall < t_reboot_sent - 1.0:
+                print('WARNING: shell prompt predates reboot command — '
+                      'board may not have rebooted', file=sys.stderr)
 
     # Auto-login if board is at LOGIN prompt
     sf = devdir(device) / 'status.json'
@@ -2056,6 +2259,10 @@ def cmd_upload(args):
     if not args.quiet:
         print(f'Uploading {host_path.name} ({size} bytes) → {board_path}')
 
+    if _human_session_active(device) and not args.quiet:
+        print(f'NOTE: human tio session active — upload bytes will appear in the terminal',
+              file=sys.stderr)
+
     # Ensure destination directory exists
     _do_send(device, f'mkdir -p "$(dirname \'{board_path}\')"', timeout=5)
 
@@ -2070,7 +2277,11 @@ def cmd_upload(args):
     for i, chunk in enumerate(chunks, 1):
         if not args.quiet and (i % 50 == 0 or i == total):
             print(f'  {i}/{total} chunks ({i*100//total}%)', flush=True)
-        _do_send(device, f'printf "%s" "{chunk}" >> {tmp}', timeout=5)
+        r = _do_send(device, f'printf "%s" "{chunk}" >> {tmp}', timeout=5)
+        if r and r.get('timed_out'):
+            print(f'Upload timed out at chunk {i}/{total}', file=sys.stderr)
+            _do_send(device, f'rm -f {tmp}', timeout=5)
+            sys.exit(1)
 
     # Decode and verify
     result = _do_send(device,
@@ -2126,16 +2337,35 @@ def cmd_run(args):
             print(f'Board stuck in RUNNING state on {device}', file=sys.stderr); sys.exit(1)
     # DEAD is ok if board had a shell prompt before (just quiet) — let the timeout decide
 
-    # Encode and transfer script
+    if _human_session_active(device):
+        print(f'NOTE: human tio session active — script bytes will appear in the terminal',
+              file=sys.stderr)
+
+    # Encode and transfer script in 72-char chunks (same approach as cmd_upload).
+    # A single printf of the full base64 risks exceeding serial input buffer limits
+    # for larger scripts. Chunked transfer is reliable at any script size.
     b64 = base64.b64encode(script.encode()).decode('ascii')
-    tmp = '/tmp/_sa_run.sh'
-    _do_send(device, f'printf "%s" "{b64}" | base64 -d > {tmp} && chmod +x {tmp}', timeout=10)
+    tmp = f'/tmp/_sa_run_{os.getpid()}.sh'   # PID-scoped to avoid parallel collisions
+    b64tmp = f'/tmp/_sa_run_{os.getpid()}.b64'
+    _do_send(device, f'printf "" > {b64tmp}', timeout=5)
+    CHUNK = 72
+    chunks = [b64[i:i+CHUNK] for i in range(0, len(b64), CHUNK)]
+    for chunk in chunks:
+        r = _do_send(device, f'printf "%s" "{chunk}" >> {b64tmp}', timeout=5)
+        if r and r.get('timed_out'):
+            print(f'Script upload timed out during transfer', file=sys.stderr)
+            _do_send(device, f'rm -f {b64tmp}', timeout=5)
+            sys.exit(1)
+    r = _do_send(device, f'base64 -d {b64tmp} > {tmp} && chmod +x {tmp} && rm {b64tmp}',
+                 timeout=10)
+    if not r or r.get('timed_out'):
+        print(f'Script decode failed on board', file=sys.stderr); sys.exit(1)
 
     # Execute and capture (set wide terminal so script output doesn't wrap)
     result = _do_send(device,
-        f'stty cols 220 rows 50 2>/dev/null; {tmp}; echo "{EXITCODE_TAG}:$?"; rm -f {tmp}',
+        f'stty cols 220 rows 50 2>/dev/null; {tmp}; _rc=$?; rm -f {tmp}; echo "{EXITCODE_TAG}:$_rc"',
         wait=rf'{EXITCODE_TAG}:\d+|[\$#>]\s*$',
-        timeout=args.timeout, no_wrap=False)
+        timeout=args.timeout, no_wrap=getattr(args, 'no_wrap', False))
 
     if result:
         # Parse exit code from output
@@ -2331,6 +2561,31 @@ def cmd_list(args):
         print(f'{name:<14} {_state_fmt(state)} {via:<28} {buf_lines:>5}  {D}{prompt}{N}')
 
 
+def cmd_ops(args):
+    """Print recent operations from ops.log for a device.
+
+    Each line is a JSON record: {ts, op, pid, ...command-specific fields}.
+    Human-readable by default; --json prints raw JSON lines.
+    """
+    log_file = devdir(args.device) / 'ops.log'
+    if not log_file.exists():
+        print('No operations logged yet.')
+        return
+    lines = log_file.read_text().splitlines()
+    tail = lines[-args.lines:]
+    if args.json:
+        print('\n'.join(tail))
+        return
+    for raw in tail:
+        try:
+            e = json.loads(raw)
+            fields = ' '.join(f'{k}={v}' for k, v in e.items()
+                              if k not in ('ts', 'op', 'pid'))
+            print(f'[{e.get("ts","")}] {e.get("op","?"):12s}  {fields}')
+        except (json.JSONDecodeError, KeyError):
+            print(raw)
+
+
 def cmd_attach(args):
     """Launch the configured terminal directly on a daemon's device.
     Shorthand for: serial-connect /dev/DEVICE  (bypasses the menu)"""
@@ -2341,6 +2596,220 @@ def cmd_attach(args):
     os.execv(sc, [sc, args.device])
 
 
+def cmd_test(args):
+    """Self-test using a virtual pty pair (no real hardware needed).
+
+    Creates a socat loopback (two connected PTYs), runs a daemon on one end,
+    injects board output into the other end, and validates:
+      1. daemon starts and holds the port
+      2. startup probe fires (CR sent to board within 2s)
+      3. injected shell prompt → state SHELL
+      4. send() delivers command and captures output
+      5. relay TCP client connects and receives data
+      6. human_session stops cmd_stop; --force overrides it
+      7. daemon exits cleanly (pid file removed)
+
+    Requires: socat
+    """
+    import shutil, socket, subprocess, tempfile, threading
+
+    verbose = args.verbose
+    passed = 0
+    failed = 0
+
+    def ok(msg):
+        nonlocal passed; passed += 1
+        print(f'  \033[32m✓\033[0m  {msg}')
+
+    def fail(msg, detail=''):
+        nonlocal failed; failed += 1
+        s = f'  \033[31m✗\033[0m  {msg}'
+        if detail: s += f'\n     {detail}'
+        print(s)
+
+    def check(cond, msg, detail=''):
+        if cond: ok(msg)
+        else:    fail(msg, detail)
+
+    if not shutil.which('socat'):
+        print('serial-agent test requires socat (sudo apt install socat)', file=sys.stderr)
+        sys.exit(1)
+
+    print(f'\nserial-agent self-test\n{"─"*40}')
+
+    # Create a temp dir for the virtual device + daemon state
+    with tempfile.TemporaryDirectory(prefix='sa-test-') as td:
+        td = Path(td)
+        pty_a = td / 'pty-a'   # daemon connects here
+        pty_b = td / 'pty-b'   # test harness writes here (simulates board)
+
+        # socat loopback: two connected PTYs
+        socat_proc = subprocess.Popen(
+            ['socat',
+             f'pty,raw,echo=0,link={pty_a}',
+             f'pty,raw,echo=0,link={pty_b}'],
+            stderr=subprocess.DEVNULL)
+        # wait for both PTYs to appear
+        deadline = time.time() + 3
+        while time.time() < deadline:
+            if pty_a.exists() and pty_b.exists():
+                break
+            time.sleep(0.05)
+        check(pty_a.exists() and pty_b.exists(),
+              'socat virtual pty pair created')
+        if not pty_a.exists():
+            socat_proc.terminate(); return
+
+        vdev = str(pty_a)
+        env = os.environ.copy()
+        env['SERIAL_AGENT_BASE'] = str(td / 'state')
+
+        # ── Test 1: daemon starts ─────────────────────────────────────────
+        # Use DEVNULL (not PIPE/capture_output) so subprocess.run returns
+        # promptly.  The daemon double-forks and detaches, but inherited pipe
+        # write-ends can cause subprocess.run to block waiting for EOF.
+        r = subprocess.run(
+            [sys.argv[0], 'start', vdev, '--baud', '115200', '--idle-timeout', '0'],
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, env=env)
+        if verbose and r.stderr: print(f'     start stderr: {r.stderr.strip()}')
+        pid_file = Path(env['SERIAL_AGENT_BASE']) / Path(vdev).name / 'daemon.pid'
+        # Give daemon up to 2s to write pid file
+        deadline = time.time() + 2
+        while time.time() < deadline and not pid_file.exists():
+            time.sleep(0.05)
+        daemon_pid = None
+        try:
+            daemon_pid = int(pid_file.read_text().strip())
+            os.kill(daemon_pid, 0)
+            ok(f'daemon started (PID {daemon_pid})')
+        except Exception as e:
+            fail('daemon did not start', str(e))
+            socat_proc.terminate(); return
+
+        # ── Test 2: startup probe (CR sent to board within 2s) ────────────
+        # Open pty_b in non-blocking mode, wait for the CR byte
+        fd_b = os.open(str(pty_b), os.O_RDWR | os.O_NONBLOCK)
+        probe_received = False
+        deadline = time.time() + 2
+        while time.time() < deadline:
+            try:
+                data = os.read(fd_b, 64)
+                if b'\r' in data:
+                    probe_received = True
+                    break
+            except OSError:
+                time.sleep(0.05)
+        check(probe_received, 'startup probe CR received at board within 2s')
+
+        # ── Test 3: shell prompt → state SHELL ───────────────────────────
+        # Inject a shell prompt into pty_b so daemon sees it
+        os.write(fd_b, b'\r\nroot@testboard:~# ')
+        deadline = time.time() + 2
+        sf = Path(env['SERIAL_AGENT_BASE']) / Path(vdev).name / 'status.json'
+        shell_state = False
+        while time.time() < deadline:
+            try:
+                s = json.loads(sf.read_text())
+                if s.get('state') == 'SHELL':
+                    shell_state = True; break
+            except Exception:
+                pass
+            time.sleep(0.05)
+        check(shell_state, 'injected prompt → state SHELL',
+              'check daemon log for details' if not shell_state else '')
+
+        # ── Test 4: send() delivers command, output captured ──────────────
+        # We can't do a full round-trip without an interactive shell, but we
+        # can verify the command bytes reach the board side.
+        recv_buf = []
+        def _read_board():
+            while True:
+                try:
+                    d = os.read(fd_b, 256)
+                    recv_buf.append(d)
+                except OSError:
+                    time.sleep(0.02)
+        t = threading.Thread(target=_read_board, daemon=True); t.start()
+
+        # Write a command to the FIFO directly
+        fifo = Path(env['SERIAL_AGENT_BASE']) / Path(vdev).name / 'input.fifo'
+        cmd_bytes = b'echo hello\n'
+        sent = False
+        for _ in range(20):
+            try:
+                ffd = os.open(str(fifo), os.O_WRONLY | os.O_NONBLOCK)
+                os.write(ffd, cmd_bytes); os.close(ffd)
+                sent = True; break
+            except OSError:
+                time.sleep(0.05)
+        # Give the thread time to receive it
+        time.sleep(0.3)
+        board_saw_cmd = any(b'echo hello' in b for b in recv_buf)
+        check(sent and board_saw_cmd,
+              'FIFO send reaches board side',
+              f'sent={sent} board_saw={board_saw_cmd}')
+
+        # ── Test 5: relay TCP client receives data ─────────────────────────
+        relay_ok = False
+        try:
+            s2 = json.loads(sf.read_text())
+            relay_addr = s2.get('relay', '')
+            if relay_addr:
+                host, port = relay_addr.split(':')
+                sock = socket.socket()
+                sock.settimeout(2)
+                sock.connect((host, int(port)))
+                # Inject data at board side; client should receive it
+                os.write(fd_b, b'relay-test-data\r\n')
+                time.sleep(0.2)
+                sock.settimeout(0.5)
+                try:
+                    chunk = sock.recv(256)
+                    relay_ok = b'relay-test-data' in chunk
+                except socket.timeout:
+                    pass
+                sock.close()
+        except Exception as e:
+            if verbose: print(f'     relay error: {e}')
+        check(relay_ok, 'relay TCP client receives board data')
+
+        # ── Test 6: human_session blocks cmd_stop; --force overrides ──────
+        hs = Path(env['SERIAL_AGENT_BASE']) / Path(vdev).name / 'human_session'
+        hs.write_text(f'{os.getpid()}\n{time.time()}\n')
+
+        # stop without --force should refuse
+        r = subprocess.run(
+            [sys.argv[0], 'stop', vdev],
+            capture_output=True, text=True, env=env)
+        stop_refused = r.returncode != 0 and 'human session' in r.stderr
+        check(stop_refused, 'cmd_stop refused while human_session active',
+              r.stderr.strip() if not stop_refused else '')
+
+        # stop --force should succeed
+        r = subprocess.run(
+            [sys.argv[0], 'stop', '--force', vdev],
+            capture_output=True, text=True, env=env)
+        check(r.returncode == 0, 'cmd_stop --force succeeds',
+              r.stderr.strip() if r.returncode != 0 else '')
+
+        # ── Test 7: daemon exits cleanly (pid file removed) ───────────────
+        time.sleep(0.5)
+        pid_gone = not pid_file.exists() or not os.path.exists(f'/proc/{daemon_pid}')
+        check(pid_gone, 'daemon exited cleanly (pid file removed)')
+
+        os.close(fd_b)
+        socat_proc.terminate()
+        socat_proc.wait()
+
+    total = passed + failed
+    print(f'\n{"─"*40}')
+    if failed == 0:
+        print(f'\033[32mAll {total} tests passed.\033[0m\n')
+    else:
+        print(f'\033[31m{failed}/{total} tests FAILED.\033[0m\n')
+        sys.exit(1)
+
+
 def cmd_clean(args):
     import shutil
     if args.device:
@@ -2348,6 +2817,14 @@ def cmd_clean(args):
         if re.match(r'^\d+$', device): device = f'/dev/ttyUSB{device}'
         ddir = AGENT_BASE / devname(device)
         if ddir.exists():
+            pf = ddir / 'daemon.pid'
+            if pf.exists():
+                try:
+                    os.kill(int(pf.read_text().strip()), 0)
+                    print(f'Daemon is running for {device} — stop it first (serial-agent stop {device})',
+                          file=sys.stderr); sys.exit(1)
+                except (OSError, ValueError):
+                    pass
             shutil.rmtree(ddir); print(f'Cleaned {ddir}')
         else:
             print(f'Nothing to clean for {device}')
@@ -2386,12 +2863,14 @@ def main():
     sp.add_argument('--tcp',  metavar='HOST:PORT')
     sp.add_argument('--baud', type=int, default=115200)
     sp.add_argument('--lines',type=int, default=DEFAULT_LINES)
-    sp.add_argument('--idle-timeout', type=int, default=0, dest='idle_timeout',
+    sp.add_argument('--idle-timeout', type=int, default=60, dest='idle_timeout',
                     metavar='SECS',
-                    help='Auto-stop after SECS idle seconds with no relay clients (0=never). '
-                         'Pass 120 when auto-starting from serial-connect.')
+                    help='Auto-stop after SECS idle seconds with no relay clients (0=never, default=60). '
+                         'serial-connect and connect pass 0 for persistent monitoring.')
 
     sp = sub.add_parser('stop');   dev(sp); sp.set_defaults(func=cmd_stop)
+    sp.add_argument('--force', action='store_true',
+                    help='Stop even if a human tio session is active')
     sp = sub.add_parser('status'); dev(sp); sp.set_defaults(func=cmd_status)
     sp = sub.add_parser('path');   dev(sp); sp.set_defaults(func=cmd_path)
 
@@ -2421,6 +2900,8 @@ def main():
 
     sp = sub.add_parser('tail'); dev(sp); sp.set_defaults(func=cmd_tail)
     sp.add_argument('--no-timestamps', action='store_true')
+    sp.add_argument('--timeout', type=float, default=0,
+                    metavar='SECS', help='Exit after SECS seconds (0=no limit)')
 
     # ── Sending ────────────────────────────────────────────────────────────────
     sp = sub.add_parser('send',
@@ -2542,8 +3023,19 @@ def main():
     sp = sub.add_parser('attach', help='Launch terminal directly on daemon device (bypasses menu)')
     dev(sp); sp.set_defaults(func=cmd_attach)
 
+    sp = sub.add_parser('test',
+        help='Self-test using a virtual pty pair (no real hardware needed)')
+    sp.set_defaults(func=cmd_test)
+    sp.add_argument('--verbose', '-v', action='store_true',
+                    help='Show extra output (daemon stdout, relay details)')
+
     sp = sub.add_parser('clean'); sp.set_defaults(func=cmd_clean)
     sp.add_argument('device', nargs='?', default=None)
+
+    sp = sub.add_parser('ops', help='Print recent operations from ops.log')
+    dev(sp); sp.set_defaults(func=cmd_ops)
+    sp.add_argument('--lines', type=int, default=20, help='Number of entries (default 20)')
+    sp.add_argument('--json', action='store_true', help='Raw JSON output')
 
     args = p.parse_args()
     if hasattr(args, 'device') and args.device:
@@ -2551,6 +3043,9 @@ def main():
             args.device = f'/dev/ttyUSB{args.device}'
         elif re.match(r'^tty\w+$', args.device):
             args.device = f'/dev/{args.device}'
+    _max_t = int(os.environ.get('SERIAL_AGENT_MAX_TIMEOUT', '0') or '0')
+    if _max_t > 0 and hasattr(args, 'timeout'):
+        args.timeout = min(args.timeout, float(_max_t))
     args.func(args)
 
 

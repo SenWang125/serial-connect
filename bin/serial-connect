@@ -115,13 +115,23 @@ _lock_acquire() {
     local dev="$1"
     mkdir -p "$LOCK_DIR" && chmod 1777 "$LOCK_DIR" 2>/dev/null || true
     printf '%s\n%s\n' "$$" "$USER" > "$LOCK_DIR/$(basename "$dev")" 2>/dev/null || true
+    local _sa_dir="$HOME/var/serial-agent/$(basename "$dev")"
+    if [[ -d "$_sa_dir" ]]; then
+        printf '%s\n%s\n' "$$" "$(date +%s)" > "$_sa_dir/human_session" 2>/dev/null || true
+    fi
 }
 
 _lock_release() {
     local dev="$1"
     local lockfile="$LOCK_DIR/$(basename "$dev")"
-    local lock_pid; lock_pid=$(awk 'NR==1' "$lockfile" 2>/dev/null)
-    [[ "$lock_pid" == "$$" ]] && rm -f "$lockfile"
+    local lock_pid; lock_pid=$(awk 'NR==1' "$lockfile" 2>/dev/null) || true
+    [[ "$lock_pid" == "$$" ]] && rm -f "$lockfile" || true
+    local _sa_dir="$HOME/var/serial-agent/$(basename "$dev")"
+    local _hs="$_sa_dir/human_session"
+    if [[ -f "$_hs" ]]; then
+        local _mp; _mp=$(awk 'NR==1' "$_hs" 2>/dev/null)
+        [[ "$_mp" == "$$" ]] && rm -f "$_hs" || true
+    fi
 }
 
 # ── launch ─────────────────────────────────────────────────────────────────────
@@ -131,22 +141,24 @@ launch() {
     local _devname; _devname=$(basename "$dev")
     local agent_status="${HOME}/var/serial-agent/$_devname/status.json"
     [[ ! -f "$agent_status" ]] && agent_status="/tmp/serial-agent/$_devname/status.json"
-    local _agent_live _agent_autostarted=0
+    local _agent_live
     _agent_is_alive "$_devname" _agent_live
     (( _agent_live )) && _read_agent_tcp_via "$agent_status" agent_tcp
-    # If serial-agent is available but not running, auto-start it so it can monitor
-    # the session (buf.log, state machine) while tio holds the human terminal.
-    # Track auto-start: we stop the daemon on exit so the port goes free again.
+    # If serial-agent is available but not running, auto-start it as a persistent
+    # always-on daemon (--idle-timeout 0).  The daemon keeps running after
+    # serial-connect exits so agents can monitor the board between sessions.
     if (( !_agent_live )) && command -v serial-agent &>/dev/null; then  # tio only: relies on socat PTY bridge
         echo -e "  ${DIM}auto-starting serial-agent for $(basename "$dev") ...${NC}"
-        serial-agent start "$dev" --baud "$baud" --idle-timeout 10 > /dev/null 2>&1 || true
+        serial-agent start "$dev" --baud "$baud" --idle-timeout 0 > /dev/null 2>&1 || true
         _read_agent_tcp_via "$agent_status" agent_tcp
-        _agent_autostarted=1
     fi
 
     command -v tio &>/dev/null || { echo "tio not found: sudo apt install tio" >&2; exit 1; }
-    local sock="/tmp/$(basename "$dev")-serial.sock"
-    rm -f "$sock" 2>/dev/null || true   # remove stale socket left by a killed previous session
+    # Socket path is PID-unique so a second serial-connect session cannot
+    # clobber this session's tio sharing socket.  tio creates the socket on
+    # startup and removes it on clean exit; stale sockets are visible in the
+    # "Share: socat - UNIX-CONNECT:..." hint line.
+    local sock="/tmp/$(basename "$dev")-${USER}-$$-serial.sock"
     local tio_target="$dev"
     local _socat_pid="" _pty_link=""
 
@@ -157,7 +169,10 @@ launch() {
         if command -v socat &>/dev/null; then
             local _relay_label="ser2net"
             [[ "$agent_tcp" == 127.0.0.1:* ]] && _relay_label="built-in relay"
-            _pty_link="/tmp/${_devname}-${USER}-pty"
+            # Include the bash PID ($$) to make the path unique per session.
+            # Without this, a second serial-connect session would rm -f the first
+            # session's PTY symlink, disconnecting the running tio instance.
+            _pty_link="/tmp/${_devname}-${USER}-$$-pty"
             rm -f "$_pty_link"
             socat pty,raw,echo=0,link="$_pty_link",wait-slave "tcp:$agent_tcp" 2>/dev/null &
             _socat_pid=$!
@@ -184,22 +199,38 @@ launch() {
     echo -e "\n${GREEN}→${NC} tio $tio_target @ $(baud_display "$baud")  ${DIM}(Ctrl-T Q to quit)${NC}"
     echo -e "  ${DIM}Share: socat - UNIX-CONNECT:$sock${NC}\n"
     _lock_acquire "$dev"
-    # INT/TERM trap for Ctrl-C — locals are in scope when signal fires mid-session.
+    # Heartbeat: refresh human_session every 60s — it expires at 300s, after which
+    # the daemon stops suppressing automation probes and may auto-stop mid-session.
+    local _heartbeat_pid=""
+    local _sa_hb_dir="$HOME/var/serial-agent/$(basename "$dev")"
+    ( while kill -0 $$ 2>/dev/null; do
+          sleep 60
+          [[ -d "$_sa_hb_dir" ]] && printf '%s\n%s\n' "$$" "$(date +%s)" \
+              > "$_sa_hb_dir/human_session" 2>/dev/null || true
+      done ) &
+    _heartbeat_pid=$!
+    # Signal trap for Ctrl-C / SIGTERM / SIGHUP — runs with locals still in scope.
     # EXIT trap is intentionally NOT set: it fires after launch() returns (when locals
     # are already out of scope), so cleanup would silently no-op.  Inline cleanup below
-    # handles the normal exit path where locals are still accessible.
-    trap '_lock_release "$dev"
-          [[ -n "$_socat_pid" ]] && { kill "$_socat_pid" 2>/dev/null; rm -f "$_pty_link"; }
-          (( _agent_autostarted )) && serial-agent stop "$dev" > /dev/null 2>&1 || true' \
+    # handles the normal tio exit path where locals are accessible.
+    # Cleanup order: heartbeat first (stops human_session refresh), then socat
+    # (disconnects relay client), then socket, then lock.  The daemon is NOT stopped —
+    # it is a persistent observer and must survive session boundaries.
+    trap '[[ -n "$_heartbeat_pid" ]] && kill "$_heartbeat_pid" 2>/dev/null
+          [[ -n "$_socat_pid" ]] && { kill "$_socat_pid" 2>/dev/null; wait "$_socat_pid" 2>/dev/null; rm -f "$_pty_link"; }
+          rm -f "$sock" 2>/dev/null || true
+          _lock_release "$dev"' \
         INT TERM HUP
     tio -b "$baud" -S "unix:$sock" "$tio_target"
     local _tio_exit=$?
-    # Inline cleanup — runs on normal tio exit with locals still in scope.
-    trap - INT TERM
+    # Inline cleanup — normal tio exit path.  Clear all three signals (INT TERM HUP)
+    # so a late signal can't double-fire the cleanup after we've already run it.
+    trap - INT TERM HUP
     stty sane 2>/dev/null || true
     printf '\033[0m\033[?7h' 2>/dev/null || true
+    [[ -n "$_heartbeat_pid" ]] && kill "$_heartbeat_pid" 2>/dev/null
     [[ -n "$_socat_pid" ]] && { kill "$_socat_pid" 2>/dev/null; wait "$_socat_pid" 2>/dev/null; rm -f "$_pty_link"; }
-    (( _agent_autostarted )) && serial-agent stop "$dev" > /dev/null 2>&1 || true
+    rm -f "$sock" 2>/dev/null || true
     _lock_release "$dev"
     if (( _tio_exit != 0 )) && [[ "$tio_target" == "$dev" ]]; then
         echo -e "\n${YELLOW}⚠${NC}  $dev is in use by another process."
@@ -408,14 +439,29 @@ if [[ "${1:-}" == "--label" ]]; then
     exit 0
 fi
 
-# ── Dynamic column widths ─────────────────────────────────────────────────────
-_build_column_widths 5   # 5 = row-number column width
+# ── Dynamic column widths (single pass) ───────────────────────────────────────
+dev_w=6; chip_w=6; board_w=6
+for i in "${!DEVS[@]}"; do
+    dn=$(basename "${DEVS[$i]}")
+    (( ${#dn}        > dev_w  )) && dev_w=${#dn}
+    (( ${#CHIPS[$i]} > chip_w )) && chip_w=${#CHIPS[$i]}
+    ser="${SERS[$i]}"
+    if [[ -n "${BOARD_ID[$ser]+x}" ]]; then
+        (( ${#BOARD_ID[$ser]} > board_w )) && board_w=${#BOARD_ID[$ser]}
+    else
+        ser_disp="${ser}"; (( ${#ser} > 12 )) && ser_disp="${ser:0:10}"
+        fb=$(( ${#CHIPS[$i]} + 1 + ${#ser_disp} ))
+        (( fb > board_w )) && board_w=$fb
+    fi
+done
+(( dev_w++ )); (( chip_w++ )); (( board_w++ ))
+rule_w=$(( 2 + 1 + 5 + dev_w + 2 + 6 + 4 + board_w + 2 + chip_w + 2 + 5 + 13 ))
 
 # ── Menu ───────────────────────────────────────────────────────────────────────
 echo -e "${BOLD}Select serial port:${NC}\n"
 printf "  ${BOLD}%-1s  %-4s  %-${dev_w}s  %-6s    %-${board_w}s  %-${chip_w}s  %-5s  %s${NC}\n" \
     "·" "  #" "Port" "Status" "Board" "Chip" "P#" "Baud"
-_print_rule
+printf '─%.0s' $(seq 1 "$rule_w"); echo
 
 display_order
 row=1; prev_ser="__unset__"
@@ -440,7 +486,15 @@ for i in "${_disp_order[@]}"; do
         dead) sym=" ";             dc="$DIM"; sc="$DIM";    pc="$DIM" ;;
         FAIL) sym="${RED}✗${NC}";  dc="$DIM"; sc="${RED}";   pc="$DIM" ;;
     esac
-    _render_board_chip "$ser" "$chip" "$board_w" "$chip_w"
+    board_name="${BOARD_ID[$ser]:-}"
+    [[ -z "$board_name" ]] && { ser_disp="${ser}"; (( ${#ser} > 12 )) && ser_disp="${ser:0:10}"; board_name="${chip}-${ser_disp}"; }
+    if [[ -n "${_active_ser[$ser]+x}" ]]; then
+        board_col=$(printf "%-${board_w}s" "$board_name")
+        chip_col=$(printf "%-${chip_w}s" "$chip")
+    else
+        board_col="${DIM}$(printf "%-${board_w}s" "$board_name")${NC}"
+        chip_col="${DIM}$(printf "%-${chip_w}s" "$chip")${NC}"
+    fi
     baud_col=""; [[ "$state" == "LIVE" || "$state" == "OPEN" ]] && baud_col=$(baud_display "$baud")
     printf "  %b  %b%3d)${NC}  %b%-${dev_w}s${NC}  %b%-6s${NC}    %s  %s  %b%-5s${NC}  %s\n" \
         "$sym" "$BOLD" "$row" "$dc" "$devname" "$sc" "$state" \
@@ -493,10 +547,11 @@ while true; do
         fi
         if (( !_can_kill )); then
             echo -e "  ${YELLOW}⚠${NC}  Held by user '${_lock_user}'"
-            _share_sock="/tmp/$(basename "${ROW_DEV[$choice]}")-serial.sock"
-            if [[ -S "$_share_sock" ]]; then
-                echo -e "  Observe (read-only):  ${DIM}socat - UNIX-CONNECT:${_share_sock}${NC}"
-            fi
+            # Socket paths are PID-unique; glob for any live socket owned by the holder.
+            for _share_sock in /tmp/"$(basename "${ROW_DEV[$choice]}")-${_lock_user}"-*-serial.sock; do
+                [[ -S "$_share_sock" ]] && \
+                    echo -e "  Observe (read-only):  ${DIM}socat - UNIX-CONNECT:${_share_sock}${NC}"
+            done
             echo -e "  Take over (admin):    ${DIM}sudo fuser -k ${ROW_DEV[$choice]}${NC}\n"
             continue
         fi
@@ -523,28 +578,26 @@ while true; do
             sleep 0.3
         fi
 
-        # Step 1b: serial-agent daemon gets SIGTERM via 'serial-agent stop'
-        # (proper cleanup: closes fd, removes pid file, restores tty state).
+        # Daemon is a persistent observer — do NOT stop it.  Just clean up
+        # the stale lock and human_session so the daemon is no longer blocked.
+        rm -f "$LOCK_DIR/$(basename "${ROW_DEV[$choice]}")" 2>/dev/null || true
+        rm -f "$HOME/var/serial-agent/$(basename "${ROW_DEV[$choice]}")/human_session" 2>/dev/null || true
+
+        # Kill non-daemon processes holding the device (fallback: direct-tio
+        # path when socat is unavailable).  Skip if daemon owns the port.
         _sa_pf="${HOME}/var/serial-agent/$(basename "${ROW_DEV[$choice]}")/daemon.pid"
         [[ ! -f "$_sa_pf" ]] && _sa_pf="/tmp/serial-agent/$(basename "${ROW_DEV[$choice]}")/daemon.pid"
-        if [[ -f "$_sa_pf" ]] && kill -0 "$(cat "$_sa_pf" 2>/dev/null)" 2>/dev/null \
-                && command -v serial-agent &>/dev/null; then
-            serial-agent stop "${ROW_DEV[$choice]}" 2>/dev/null || true
-        fi
-
-        # Step 2: SIGTERM all remaining holders (tio, ser2net, etc.)
-        # giving them a chance to restore their own terminal settings.
-        $_fuser_pfx -TERM "${ROW_DEV[$choice]}" 2>/dev/null || true
-
-        # Step 3: wait up to 0.5s for graceful exit
-        for _gi in 1 2 3 4 5; do
-            $_fuser_pfx "${ROW_DEV[$choice]}" &>/dev/null 2>&1 || break
+        _daemon_alive=0
+        [[ -f "$_sa_pf" ]] && kill -0 "$(cat "$_sa_pf" 2>/dev/null)" 2>/dev/null && _daemon_alive=1
+        if (( !_daemon_alive )); then
+            $_fuser_pfx -TERM "${ROW_DEV[$choice]}" 2>/dev/null || true
+            for _gi in 1 2 3 4 5; do
+                $_fuser_pfx "${ROW_DEV[$choice]}" &>/dev/null 2>&1 || break
+                sleep 0.1
+            done
+            $_fuser_pfx -k "${ROW_DEV[$choice]}" 2>/dev/null || true
             sleep 0.1
-        done
-
-        # Step 4: SIGKILL anything still holding on
-        $_fuser_pfx -k "${ROW_DEV[$choice]}" 2>/dev/null || true
-        sleep 0.1
+        fi
         stty sane 2>/dev/null || true
         printf '\033[0m\033[?7h' 2>/dev/null || true  # reset terminal attributes + re-enable line wrap
         echo -e "  ${GREEN}Session closed.${NC}\n"
@@ -558,13 +611,26 @@ sel_dev="${ROW_DEV[$choice]}"; sel_baud="${ROW_BAUD[$choice]}"
 _lf="/tmp/serial-connect-locks/${sel_dev##*/}"
 if [[ -f "$_lf" ]]; then
     { read -r _lpid; read -r _luser; } < "$_lf" 2>/dev/null
-    if [[ -d "/proc/$_lpid" && "$_luser" != "$USER" ]] && ! sudo -n true 2>/dev/null; then
-        echo -e "\n  ${YELLOW}⚠${NC}  ${sel_dev} is now held by user '${_luser}'"
-        _share_sock="/tmp/$(basename "$sel_dev")-serial.sock"
-        [[ -S "$_share_sock" ]] && \
-            echo -e "  Observe (read-only):  ${DIM}socat - UNIX-CONNECT:${_share_sock}${NC}"
-        echo -e "  Take over (admin):    ${DIM}sudo fuser -k $sel_dev${NC}\n"
-        exit 1
+    if [[ -d "/proc/$_lpid" ]]; then
+        if [[ "$_luser" == "$USER" ]]; then
+            # Same user already has a session.  Socket paths are PID-unique
+            # (/tmp/DEVNAME-USER-PID-serial.sock) so we glob for any live socket.
+            echo -e "\n  ${YELLOW}⚠${NC}  You already have an active session on ${sel_dev} (PID ${_lpid})"
+            for _share_sock in /tmp/"$(basename "$sel_dev")"-"${USER}"-*-serial.sock; do
+                [[ -S "$_share_sock" ]] && \
+                    echo -e "  Observe (read-only):  ${DIM}socat - UNIX-CONNECT:${_share_sock}${NC}"
+            done
+            read -rp "  Open a second session anyway? [y/N]: " _sc_confirm || { printf "\n"; exit 0; }
+            [[ "${_sc_confirm,,}" == "y" ]] || { echo "Aborted."; exit 0; }
+        elif ! sudo -n true 2>/dev/null; then
+            echo -e "\n  ${YELLOW}⚠${NC}  ${sel_dev} is now held by user '${_luser}'"
+            for _share_sock in /tmp/"$(basename "$sel_dev")"-"${_luser}"-*-serial.sock; do
+                [[ -S "$_share_sock" ]] && \
+                    echo -e "  Observe (read-only):  ${DIM}socat - UNIX-CONNECT:${_share_sock}${NC}"
+            done
+            echo -e "  Take over (admin):    ${DIM}sudo fuser -k $sel_dev${NC}\n"
+            exit 1
+        fi
     fi
 fi
 
