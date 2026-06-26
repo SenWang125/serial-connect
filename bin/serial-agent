@@ -331,33 +331,63 @@ def _clean_output(raw_lines: list, sent_cmd: str = '') -> tuple:
     lines = [_strip_ansi(l) for l in lines]
     lines = [l.replace('\r', '') for l in lines]   # remove all CRs (mid-line wrapping)
 
-    # Remove command echo. Two forms:
-    #   1. "prompt + command" on one line (board echoes with prompt visible)
-    #   2. Bare command lines (may wrap across multiple lines at terminal width)
+    # Remove command echo. Three forms handled:
+    #   1a. "prompt + command" on one line (board echoes with prompt, short cmd)
+    #   1b. Wrapped: "prompt + start_of_cmd" then bare continuation lines
+    #       (board's terminal is narrow, so long cmds wrap at terminal width)
+    #   2.  Bare command lines only (no prompt — some board configs)
+    # Note: --no-wrap sets COLUMNS=32767 env var for the executed command's
+    # output, but the terminal echo of typed characters still wraps at the
+    # board's tty cols setting.  Form 1b handles that wrapping.
     cmd_stripped = sent_cmd.strip()
     if cmd_stripped and lines:
-        # Form 1: first line is "prompt + command" — ends with the command
         first = lines[0].strip()
         if first.endswith(cmd_stripped) and len(first) > len(cmd_stripped):
+            # Form 1a: entire command fits on one line after the prompt
             lines = lines[1:]
         else:
-            # Form 2: bare command, possibly wrapped across lines
-            consumed = ''
+            # Form 1b: check if first line starts with "prompt + beginning of cmd"
+            # by finding the longest suffix of first that is a prefix of cmd_stripped
             skip = 0
-            for line in lines:
-                chunk = line.strip()
-                if not chunk:
-                    break
-                test = consumed + chunk
-                if cmd_stripped.startswith(test):
-                    consumed = test
-                    skip += 1
+            matched = False
+            for cut in range(len(first) + 1):
+                tail = first[cut:]
+                if tail and cmd_stripped.startswith(tail):
+                    # first[cut:] is the start of the command echo
+                    consumed = tail
+                    skip = 1
                     if consumed == cmd_stripped:
+                        matched = True
                         break
-                elif cmd_stripped.startswith(consumed) and len(consumed) < len(cmd_stripped):
+                    # Consume continuation lines until command is fully assembled
+                    for line in lines[1:]:
+                        chunk = line.strip()
+                        if not chunk:
+                            break
+                        test = consumed + chunk
+                        if test == cmd_stripped:
+                            skip += 1; consumed = test; matched = True; break
+                        elif cmd_stripped.startswith(test):
+                            skip += 1; consumed = test
+                        else:
+                            break
                     break
-                else:
-                    break
+            if not matched:
+                # Form 2: bare command, possibly wrapped, no prompt prefix
+                consumed = ''
+                skip = 0
+                for line in lines:
+                    chunk = line.strip()
+                    if not chunk:
+                        break
+                    test = consumed + chunk
+                    if cmd_stripped.startswith(test):
+                        consumed = test
+                        skip += 1
+                        if consumed == cmd_stripped:
+                            break
+                    else:
+                        break
             lines = lines[skip:]
 
     # Extract exit code if present
@@ -1047,6 +1077,7 @@ def _wait_pattern(device, pattern, timeout, show=False, baseline_offset=None):
     dies mid-wait, returns False immediately rather than burning the timeout.
     """
     bf = devdir(device) / 'buf.log'
+    sf = devdir(device) / 'status.json'
     pat = re.compile(pattern)
     deadline = time.time() + timeout
     t_start = time.time()
@@ -1059,6 +1090,23 @@ def _wait_pattern(device, pattern, timeout, show=False, baseline_offset=None):
 
         interval = 0.05 if (time.time() - t_start) < 1.0 else 0.2
         time.sleep(interval)
+
+        # ── Fast path: check status.json for a fresh SHELL state ───────────
+        # Shell prompts don't end with \n so _append holds them in _partial
+        # (never written to buf.log).  _update_state() still detects SHELL
+        # via the raw text and updates status.json, so we check here too.
+        # Guard: last_prompt_ago must be < elapsed so we match the prompt
+        # from THIS command, not a pre-existing SHELL from before the send.
+        if pat.pattern == r'[\$#>]\s*$' or 'SHELL' in pattern.upper():
+            try:
+                s = json.loads(sf.read_text())
+                if s.get('state') == 'SHELL':
+                    lpa = s.get('last_prompt_ago')
+                    elapsed = time.time() - t_start
+                    if lpa is not None and lpa < elapsed:
+                        return True
+            except (OSError, ValueError, KeyError):
+                pass
 
         if not bf.exists():
             continue
