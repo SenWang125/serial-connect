@@ -166,28 +166,33 @@ launch() {
         # tio v2.7 does not support tcp:host:port as a device target.
         # Bridge via socat: serial-agent holds the physical port through its TCP relay;
         # socat allocates a PTY and forwards it to the relay so tio can open a real device.
-        if command -v socat &>/dev/null; then
-            local _relay_label="ser2net"
-            [[ "$agent_tcp" == 127.0.0.1:* ]] && _relay_label="built-in relay"
-            # Include the bash PID ($$) to make the path unique per session.
-            # Without this, a second serial-connect session would rm -f the first
-            # session's PTY symlink, disconnecting the running tio instance.
-            _pty_link="/tmp/${_devname}-${USER}-$$-pty"
-            rm -f "$_pty_link"
-            socat pty,raw,echo=0,link="$_pty_link",wait-slave "tcp:$agent_tcp" 2>/dev/null &
-            _socat_pid=$!
-            local _i; for (( _i=0; _i<40; _i++ )); do
-                [[ -e "$_pty_link" ]] && break; sleep 0.05
-            done
-            if [[ -e "$_pty_link" ]]; then
-                echo -e "  ${DIM}serial-agent via ${_relay_label} → socat PTY — full stream to both${NC}"
-                tio_target="$_pty_link"
-            else
-                kill "$_socat_pid" 2>/dev/null; _socat_pid=""; _pty_link=""
-                echo -e "  ${YELLOW}⚠${NC}  socat PTY bridge failed — connecting tio directly"
-            fi
+        if ! command -v socat &>/dev/null; then
+            # Daemon owns the device — tio cannot open it directly without byte-splitting.
+            echo -e "  ${RED}✗${NC}  socat is required when serial-agent is running.  sudo apt install socat" >&2
+            return 1
+        fi
+        local _relay_label="ser2net"
+        [[ "$agent_tcp" == 127.0.0.1:* ]] && _relay_label="built-in relay"
+        # Include the bash PID ($$) to make the path unique per session.
+        # Without this, a second serial-connect session would rm -f the first
+        # session's PTY symlink, disconnecting the running tio instance.
+        _pty_link="/tmp/${_devname}-${USER}-$$-pty"
+        rm -f "$_pty_link"
+        socat pty,raw,echo=0,link="$_pty_link",wait-slave "tcp:$agent_tcp" 2>/dev/null &
+        _socat_pid=$!
+        local _i; for (( _i=0; _i<40; _i++ )); do
+            [[ -e "$_pty_link" ]] && break; sleep 0.05
+        done
+        if [[ -e "$_pty_link" ]]; then
+            echo -e "  ${DIM}serial-agent via ${_relay_label} → socat PTY — full stream to both${NC}"
+            tio_target="$_pty_link"
         else
-            echo -e "  ${YELLOW}⚠${NC}  install socat for relay coexistence — connecting tio directly"
+            kill "$_socat_pid" 2>/dev/null; _socat_pid=""; _pty_link=""
+            # Daemon owns the device — connecting tio directly would split bytes with
+            # the daemon.  Refuse rather than silently corrupt the session.
+            echo -e "  ${RED}✗${NC}  socat PTY bridge failed — cannot connect tio directly (serial-agent owns the port)." >&2
+            echo -e "  Check relay is reachable: nc -z ${agent_tcp//:/ }" >&2
+            return 1
         fi
     fi
 
@@ -210,9 +215,6 @@ launch() {
       done ) &
     _heartbeat_pid=$!
     # Signal trap for Ctrl-C / SIGTERM / SIGHUP — runs with locals still in scope.
-    # EXIT trap is intentionally NOT set: it fires after launch() returns (when locals
-    # are already out of scope), so cleanup would silently no-op.  Inline cleanup below
-    # handles the normal tio exit path where locals are accessible.
     # Cleanup order: heartbeat first (stops human_session refresh), then socat
     # (disconnects relay client), then socket, then lock.  The daemon is NOT stopped —
     # it is a persistent observer and must survive session boundaries.

@@ -1024,17 +1024,29 @@ class Daemon:
 # Utilities
 # ══════════════════════════════════════════════════════════════════════════════
 def _relay_base_port() -> int:
-    """Return RELAY_BASE_PORT from serial-boards.conf, or 0 (ephemeral) if unset."""
-    try:
-        for line in _boards_conf().read_text().splitlines():
-            line = line.split('#')[0].strip()
-            if line.upper().startswith('RELAY_BASE_PORT'):
-                _, _, val = line.partition('=')
-                port = int(val.strip())
-                if 1024 <= port <= 64999:
-                    return port
-    except Exception:
-        pass
+    """Return RELAY_BASE_PORT from serial-boards.conf, or 0 (ephemeral) if unset.
+
+    Mirrors serial-common.sh two-layer config model: for a global install
+    (/usr/... or /opt/...) the system config /etc/serial-boards.conf is read
+    first (it holds the canonical RELAY_BASE_PORT); the user config can override.
+    Previously this only read the user config, so RELAY_BASE_PORT in
+    /etc/serial-boards.conf was silently ignored and every daemon got a random
+    ephemeral port — causing relay disconnects whenever the daemon restarted.
+    """
+    confs: list = [_resolve_board_cfg()]
+    if str(_SCRIPT_DIR).startswith(('/usr/', '/opt/')):
+        confs.insert(0, Path('/etc/serial-boards.conf'))
+    for cfg in confs:
+        try:
+            for line in cfg.read_text().splitlines():
+                line = line.split('#')[0].strip()
+                if line.upper().startswith('RELAY_BASE_PORT'):
+                    _, _, val = line.partition('=')
+                    port = int(val.strip())
+                    if 1024 <= port <= 64999:
+                        return port
+        except Exception:
+            continue
     return 0
 
 
