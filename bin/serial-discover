@@ -16,6 +16,7 @@ source "$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)/serial-co
 load_config
 enumerate_devices
 port_indices
+cleanup_stale_daemon_dirs
 
 PROBE_DIR=$(mktemp -d /tmp/serial-probe.XXXXXX)
 trap 'rm -rf "$PROBE_DIR"' EXIT

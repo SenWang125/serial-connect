@@ -56,6 +56,12 @@ RELAY_BASE_PORT=0   # 0 = OS-assigned ephemeral; set in serial-boards.conf to us
 # Populated by callers before run_probes; inherited by subshells.
 declare -A _PROBE_TIMEOUTS=()
 
+# Daemon states that mean "board is alive" for display purposes. Single
+# source of truth — probe_tty() and serial-connect's reconciliation block
+# both call _state_is_live() instead of keeping their own copy of this list.
+DAEMON_LIVE_STATES=" SHELL RUNNING UBOOT LOGIN PASSWORD BOOTING IDLE "
+_state_is_live() { [[ "$DAEMON_LIVE_STATES" == *" $1 "* ]]; }
+
 # ── parse_baud ─────────────────────────────────────────────────────────────────
 # Convert human-readable baud string to integer: 1.5M→1500000, 115.2K→115200
 parse_baud() {
@@ -271,12 +277,11 @@ probe_tty() {
         local _sf="/tmp/serial-agent/$_devname/status.json"
         local _state='UNKNOWN'
         [[ -f "$_sf" ]] && _state=$(awk -F'"' '/"state"/{print $4;exit}' "$_sf" 2>/dev/null)
-        case "${_state:-}" in
-            SHELL|RUNNING|UBOOT|LOGIN|PASSWORD|BOOTING)
-                printf 'LIVE|%s|%s\n' "$cfg_baud" "${_hostname:-}" ;;
-            *)
-                printf 'DEAD|%s|%s\n' "$cfg_baud" "${_hostname:-}" ;;
-        esac
+        if _state_is_live "${_state:-}"; then
+            printf 'LIVE|%s|%s\n' "$cfg_baud" "${_hostname:-}"
+        else
+            printf 'DEAD|%s|%s\n' "$cfg_baud" "${_hostname:-}"
+        fi
         return
     fi
     # No daemon running: fuser check (catches non-daemon holders), then direct probe.
@@ -325,25 +330,35 @@ probe_tty() {
     fi
 
     local detected="" captured=""
+    local _first_baud="${try_bauds[0]}"
     for baud in "${try_bauds[@]}"; do
-        if (( !skip_stty )); then
-            stty -F "$dev" "$baud" raw -echo -crtscts min 0 time 1 2>/dev/null
-            IFS= read -t "$drain_t" -r -d '' -n 1024 -u $fd _drain 2>/dev/null || true
-        fi
-        printf '\r' >&$fd
-        local raw=""
-        IFS= read -t "$read_t" -r -d '' -n 200 -u $fd raw 2>/dev/null
-        local clean; clean=$(printf '%s' "$raw" \
-            | sed 's/\x1b\[[0-9;]*[mGKJHFABCDfsuhlrn]//g' \
-            | tr -dc '[:print:][:space:]' | tr -s '[:space:]' ' ' \
-            | sed 's/^ //; s/ $//')
-        local raw_len="${#raw}" clean_len="${#clean}"
-        # ttyUSB: wrong baud → ~30% printable by chance; require ≥80% to reject false positives.
-        # ttyACM: single baud only, no false-positive risk; require ≥40%.
-        local threshold=80; (( skip_stty )) && threshold=40
-        if (( clean_len >= 4 && raw_len > 0 && clean_len * 100 >= raw_len * threshold )); then
-            detected="$baud"; captured="$clean"; break
-        fi
+        # The expected baud gets a second attempt on a miss — a single \r +
+        # 100ms read is prone to timing false negatives on a genuinely-alive
+        # board. Other bauds (JTAG/debug sweep) are never going to answer
+        # anyway, so they keep the original single-shot behavior.
+        local _tries=1
+        [[ "$baud" == "$_first_baud" ]] && _tries=2
+        local _try
+        for (( _try=1; _try<=_tries; _try++ )); do
+            if (( !skip_stty )); then
+                stty -F "$dev" "$baud" raw -echo -crtscts min 0 time 1 2>/dev/null
+                IFS= read -t "$drain_t" -r -d '' -n 1024 -u $fd _drain 2>/dev/null || true
+            fi
+            printf '\r' >&$fd
+            local raw=""
+            IFS= read -t "$read_t" -r -d '' -n 200 -u $fd raw 2>/dev/null
+            local clean; clean=$(printf '%s' "$raw" \
+                | sed 's/\x1b\[[0-9;]*[mGKJHFABCDfsuhlrn]//g' \
+                | tr -dc '[:print:][:space:]' | tr -s '[:space:]' ' ' \
+                | sed 's/^ //; s/ $//')
+            local raw_len="${#raw}" clean_len="${#clean}"
+            # ttyUSB: wrong baud → ~30% printable by chance; require ≥80% to reject false positives.
+            # ttyACM: single baud only, no false-positive risk; require ≥40%.
+            local threshold=80; (( skip_stty )) && threshold=40
+            if (( clean_len >= 4 && raw_len > 0 && clean_len * 100 >= raw_len * threshold )); then
+                detected="$baud"; captured="$clean"; break 2
+            fi
+        done
     done
 
     [[ -n "$saved" ]] && stty -F "$dev" "$saved" 2>/dev/null
@@ -355,6 +370,46 @@ probe_tty() {
     local id; _extract_hostname "$captured" id
     # No fallback to raw captured text — garbage output leaves the board unlabelled.
     printf 'LIVE|%s|%s\n' "$detected" "$id"
+}
+
+# ── cleanup_stale_daemon_dirs ────────────────────────────────────────────────────
+# Remove ~/var/serial-agent/<dev>/ directories left behind by daemons that
+# exited (crash or `serial-agent stop`) without cleaning up after themselves.
+# Called once per serial-discover/serial-connect invocation, never per-port.
+# Never touches anything outside ~/var/serial-agent, and re-checks liveness
+# immediately before removal to close the race with a daemon mid-startup.
+cleanup_stale_daemon_dirs() {
+    local _base="$HOME/var/serial-agent"
+    [[ -d "$_base" ]] || return 0
+    local _dir _dn _pf _pid _lf _lpid _newest _cleaned=0
+    for _dir in "$_base"/*/; do
+        [[ -d "$_dir" ]] || continue
+        _dn="$(basename "$_dir")"
+        _pf="$_dir/daemon.pid"
+        if [[ -f "$_pf" ]]; then
+            { read -r _pid; } < "$_pf" 2>/dev/null
+            [[ -n "$_pid" && -d "/proc/$_pid" ]] && continue
+        fi
+        _lf="/tmp/serial-connect-locks/$_dn"
+        if [[ -f "$_lf" ]]; then
+            { read -r _lpid; } < "$_lf" 2>/dev/null
+            [[ -n "$_lpid" && -d "/proc/$_lpid" ]] && continue
+        fi
+        _newest=$(find "$_dir" -type f -printf '%T@\n' 2>/dev/null | sort -n | tail -1)
+        [[ -n "$_newest" ]] || continue
+        (( $(date +%s) - ${_newest%.*} < 300 )) && continue
+        # Re-check immediately before rm — closes the startup race window.
+        if [[ -f "$_pf" ]]; then
+            { read -r _pid; } < "$_pf" 2>/dev/null
+            [[ -n "$_pid" && -d "/proc/$_pid" ]] && continue
+        fi
+        if [[ -f "$_lf" ]]; then
+            { read -r _lpid; } < "$_lf" 2>/dev/null
+            [[ -n "$_lpid" && -d "/proc/$_lpid" ]] && continue
+        fi
+        rm -rf "$_dir" 2>/dev/null && (( _cleaned++ )) || true
+    done
+    (( _cleaned > 0 )) && echo "Cleaned up $_cleaned stale daemon dir(s)"
 }
 
 # ── cache helpers ─────────────────────────────────────────────────────────────

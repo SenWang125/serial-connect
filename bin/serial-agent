@@ -279,7 +279,8 @@ def _resolve_board_cfg() -> Path:
 # ── Tunables ───────────────────────────────────────────────────────────────────
 DEFAULT_LINES = 500      # buf.log ring buffer depth (lines)
 MAX_EVENTS    = 200      # events.log rotation threshold
-DEAD_AFTER    = 30.0     # seconds of silence before state → DEAD
+DEAD_AFTER    = 30.0     # seconds of silence before state → IDLE (EOF/connect-error still → DEAD)
+IDLE_PROBE_INTERVAL = 15.0  # seconds of silence before sending a keepalive CR (must be < DEAD_AFTER)
 RUNNING_AFTER = 3.0      # seconds of output without a prompt → state = RUNNING
 EXITCODE_TAG  = 'SERIAL_EXITCODE'  # sentinel prefix injected by --exit-code
 
@@ -612,7 +613,7 @@ class Daemon:
             self.prompt_text = last.strip()
         elif RE_BOOT.search(clean[-300:]):
             self.state = 'BOOTING'
-        # (DEAD is detected only via the idle-timeout in run(), not here, since
+        # (IDLE is detected only via the idle-timeout in run(), not here, since
         # _update_state is only called when data arrives — t_output was just set.)
         elif (self.t_output > self.t_prompt
               and t - self.t_output > 0.2
@@ -889,6 +890,7 @@ class Daemon:
                 backoff = 1.0
                 t_connected = now()
                 _probe_sent = False
+                _t_last_idle_probe = t_connected
                 print(f'[serial-agent] {self.device} connected '
                       f'via {"ser2net" if self._given_tcp else "direct"}', flush=True)
                 while not self._stop.is_set():
@@ -945,16 +947,31 @@ class Daemon:
                                 and now() - t_connected > 0.5):
                             self._send_raw(b'\r')
                             _probe_sent = True
+                        # Idle keepalive: a board sitting quietly at a live prompt is
+                        # not dead, it's just quiet.  Nudge it so a genuinely alive
+                        # board's echo refreshes t_output before DEAD_AFTER elapses.
+                        # Gated on t_output (not on our own probe) so a truly
+                        # unresponsive board still reaches IDLE — sending a probe must
+                        # never by itself mask a real silence timeout.  Suppressed
+                        # during an active human session — a stray CR mid-keystroke
+                        # could execute a partial command (same reasoning as the
+                        # idle-auto-stop checks).
+                        if (self.state in ('SHELL', 'UBOOT')
+                                and now() - self.t_output > IDLE_PROBE_INTERVAL
+                                and now() - _t_last_idle_probe > IDLE_PROBE_INTERVAL
+                                and not _human_session_active(self.device)):
+                            self._send_raw(b'\r')
+                            _t_last_idle_probe = now()
                         if self.t_output and now() - self.t_output > DEAD_AFTER:
-                            if self.state != 'DEAD':
+                            if self.state != 'IDLE':
                                 _prev = self._prev_state
-                                self.state = 'DEAD'
-                                self._prev_state = 'DEAD'
+                                self.state = 'IDLE'
+                                self._prev_state = 'IDLE'
                                 self._write_status()
-                                # Write to events.log so _wait_state can detect DEAD
-                                # via inotifywait — without this, DEAD is only in
+                                # Write to events.log so _wait_state can detect IDLE
+                                # via inotifywait — without this, IDLE is only in
                                 # status.json and _wait_state's loop never sees it.
-                                _entry = f'[{ts()}] {_prev} → DEAD'
+                                _entry = f'[{ts()}] {_prev} → IDLE  (silence)'
                                 try:
                                     _existing = (self.events_file.read_text().splitlines()
                                                  if self.events_file.exists() else [])
@@ -1910,7 +1927,7 @@ def cmd_connect(args):
         # Directly write CR to fifo so wait_state below sees the prompt transition.
         sf2 = devdir(device) / 'status.json'
         cur2 = json.loads(sf2.read_text()).get('state', '') if sf2.exists() else ''
-        if cur2 in ('DEAD', 'UNKNOWN'):
+        if cur2 in ('DEAD', 'UNKNOWN', 'IDLE'):
             fifo2 = devdir(device) / 'input.fifo'
             if fifo2.exists():
                 try:

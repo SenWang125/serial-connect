@@ -244,6 +244,7 @@ launch() {
 load_config
 enumerate_devices
 port_indices
+cleanup_stale_daemon_dirs
 
 # ── Direct-device mode ────────────────────────────────────────────────────────
 if [[ -n "${1:-}" && "${1:-}" != "--label" ]]; then
@@ -318,12 +319,11 @@ elif [[ -f "$CACHE_FILE" ]]; then
                 local _ds='UNKNOWN'
                 [[ -f "$_sf" ]] && _ds=$(awk -F'"' '/"state"/{print $4;exit}' "$_sf" 2>/dev/null)
                 _agent_hostname "$_dn" _bid
-                case "${_ds:-}" in
-                    SHELL|RUNNING|UBOOT|LOGIN|PASSWORD|BOOTING)
-                        printf 'LIVE|%s|%s\n' "${_baud:-${BAUDS[$i]}}" "${_bid:-}" > "$_pf" ;;
-                    *)
-                        printf 'DEAD|%s|%s\n' "${_baud:-${BAUDS[$i]}}" "${_bid:-}" > "$_pf" ;;
-                esac
+                if _state_is_live "${_ds:-}"; then
+                    printf 'LIVE|%s|%s\n' "${_baud:-${BAUDS[$i]}}" "${_bid:-}" > "$_pf"
+                else
+                    printf 'DEAD|%s|%s\n' "${_baud:-${BAUDS[$i]}}" "${_bid:-}" > "$_pf"
+                fi
             else
                 [[ -z "$_bid" ]] && _agent_hostname "$_dn" _bid
                 printf 'OPEN|%s|%s\n' "${_baud:-${BAUDS[$i]}}" "$_bid" > "$_pf"
