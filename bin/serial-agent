@@ -704,9 +704,22 @@ class Daemon:
             'relay':           (f'{self.tcp[0]}:{self.tcp[1]}' if self.tcp else None),
             'buf_file':        str(self.buf_file),
             'buf_lines':       len(self.buf_lines),
+            'idle_timeout':    self.idle_timeout,
+            # Whether the daemon currently holds the port.  In on-demand mode
+            # (idle_timeout > 0) it parks with no fd between relay clients, and
+            # writes to input.fifo are silently discarded; send() uses this to
+            # explain a timeout instead of just reporting "timed out".
+            'port_held':       self._sock is not None or self._fd is not None,
         }
+        # Write atomically (tmp + rename, same dir so the rename is atomic).
+        # status.json is rewritten on every state change and every received
+        # byte, while ~30 call sites read it with a bare json.loads().  A
+        # plain write_text() truncates first, so any concurrent reader can
+        # observe a partial file and die on JSONDecodeError.
+        _stmp = self.status_file.with_suffix('.json.tmp')
         try:
-            self.status_file.write_text(json.dumps(s, indent=2))
+            _stmp.write_text(json.dumps(s, indent=2))
+            _stmp.rename(self.status_file)
         except OSError:
             pass
 
@@ -893,6 +906,10 @@ class Daemon:
                 _t_last_idle_probe = t_connected
                 print(f'[serial-agent] {self.device} connected '
                       f'via {"ser2net" if self._given_tcp else "direct"}', flush=True)
+                # Refresh status so port_held reflects the now-open port.  Without
+                # this the field keeps the value it had at daemon startup (False)
+                # until the board happens to send a byte.
+                self._write_status()
                 while not self._stop.is_set():
                     # On-demand: release device when all relay clients have left.
                     if on_demand and not self._relay_clients:
@@ -1020,6 +1037,9 @@ class Daemon:
                     try: os.close(self._fd)
                     except: pass
                     self._fd = None
+                # Port is gone — record that before parking or reconnecting, so
+                # port_held never advertises a port the daemon no longer holds.
+                self._write_status()
                 if on_demand:
                     # Release lock file — port is no longer held by this daemon.
                     if self._lock_file is not None:
@@ -1223,10 +1243,21 @@ def _daemon_running(device: str) -> bool:
     if not pf.exists():
         return False
     try:
-        os.kill(int(pf.read_text().strip()), 0)
-        return True
+        pid = int(pf.read_text().strip())
+        os.kill(pid, 0)
     except (OSError, ValueError):
         return False
+    # kill(pid, 0) only proves *some* signalable process owns this PID.  After
+    # a daemon dies its PID is eventually recycled, and a hit on an unrelated
+    # process made 'start' report "ALREADY daemon PID ..." for a daemon that
+    # was long gone — leaving the device unusable until the pid file was
+    # removed by hand.  Confirm the PID really is a serial-agent before
+    # trusting it.  If /proc is unavailable, fall back to the kill(0) result.
+    try:
+        cmdline = Path(f'/proc/{pid}/cmdline').read_bytes()
+    except OSError:
+        return not Path('/proc').is_dir()
+    return b'serial-agent' in cmdline
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1607,6 +1638,20 @@ def _send_impl(args):
     ok = _wait_pattern(args.device, wait_pat, args.timeout,
                        show=show, baseline_offset=baseline_offset)
     elapsed_ms = int((time.time() - t0) * 1000)
+
+    if not ok:
+        # An on-demand daemon parks with no fd between relay clients and
+        # silently discards fifo writes, so every send just times out with no
+        # indication of why.  Say so instead of letting the caller guess.
+        try:
+            _st = json.loads((devdir(args.device) / 'status.json').read_text())
+        except (OSError, ValueError):
+            _st = {}
+        if _st.get('idle_timeout', 0) > 0 and not _st.get('port_held', True):
+            print(f'{args.device}: daemon is parked in on-demand mode '
+                  f'(--idle-timeout {_st["idle_timeout"]}) and is not holding the '
+                  f'port, so the command was discarded. Restart the daemon with '
+                  f'--idle-timeout 0 for automation use.', file=sys.stderr)
 
     if args.json or args.capture or args.exit_code:
         new_lines = []
@@ -2940,10 +2985,12 @@ def main():
     sp.add_argument('--tcp',  metavar='HOST:PORT')
     sp.add_argument('--baud', type=int, default=115200)
     sp.add_argument('--lines',type=int, default=DEFAULT_LINES)
-    sp.add_argument('--idle-timeout', type=int, default=60, dest='idle_timeout',
+    sp.add_argument('--idle-timeout', type=int, default=0, dest='idle_timeout',
                     metavar='SECS',
-                    help='Auto-stop after SECS idle seconds with no relay clients (0=never, default=60). '
-                         'serial-connect and connect pass 0 for persistent monitoring.')
+                    help='Auto-stop after SECS idle seconds with no relay clients (0=never, default). '
+                         'A non-zero value selects on-demand mode: the daemon only holds the '
+                         'port while a relay client is connected, so send/read do not work '
+                         'between connections. Use it only when another tool needs the port.')
 
     sp = sub.add_parser('stop');   dev(sp); sp.set_defaults(func=cmd_stop)
     sp.add_argument('--force', action='store_true',
