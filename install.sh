@@ -332,29 +332,55 @@ fi
 # ── Restart running serial-agent daemons ──────────────────────────────────────
 _agent_bin="$INSTALL_DIR/serial-agent"
 if [[ -x "$_agent_bin" ]]; then
+    # Emit the daemon's real device path, taken from status.json.  The state
+    # directory is named after the basename only, so rebuilding the path as
+    # /dev/<dirname> was wrong for any device not directly under /dev — a
+    # daemon on /dev/pts/3 came back as /dev/3, and 'start /dev/3' then
+    # happily spawned a daemon for a device that does not exist.
     _running=$(python3 -c "
-import os, pathlib
+import json, os, pathlib
 base = pathlib.Path.home() / 'var' / 'serial-agent'
 if base.exists():
     for d in sorted(base.iterdir()):
         pf = d / 'daemon.pid'
-        if pf.exists():
-            try:
-                pid = int(pf.read_text().strip())
-                os.kill(pid, 0)
-                print(d.name)
-            except: pass
+        if not pf.exists():
+            continue
+        try:
+            pid = int(pf.read_text().strip())
+            os.kill(pid, 0)
+        except (OSError, ValueError):
+            continue
+        # Confirm the pid is really a serial-agent (pids get recycled).
+        try:
+            if b'serial-agent' not in pathlib.Path(f'/proc/{pid}/cmdline').read_bytes():
+                continue
+        except OSError:
+            pass
+        dev = None
+        try:
+            dev = json.loads((d / 'status.json').read_text()).get('device')
+        except (OSError, ValueError):
+            pass
+        print(dev or f'/dev/{d.name}')
 " 2>/dev/null || true)
     if [[ -n "$_running" ]]; then
         echo ""
         bold "Restarting running daemons to pick up new code..."
         echo ""
         while IFS= read -r _dev; do
-            if "$_agent_bin" stop "/dev/$_dev" &>/dev/null \
-               && "$_agent_bin" start "/dev/$_dev" &>/dev/null; then
-                green "  ✓ restarted /dev/$_dev"
+            [[ -n "$_dev" ]] || continue
+            # Don't resurrect a daemon for a device that has since gone away
+            # (unplugged adapter, closed pty) — 'start' would sit there
+            # retrying forever against a path that does not exist.
+            if [[ ! -e "$_dev" ]]; then
+                yellow "  ⚠ skipped $_dev — device no longer present"
+                continue
+            fi
+            if "$_agent_bin" stop "$_dev" &>/dev/null \
+               && "$_agent_bin" start "$_dev" &>/dev/null; then
+                green "  ✓ restarted $_dev"
             else
-                yellow "  ⚠ could not restart /dev/$_dev — restart manually: serial-agent stop/start /dev/$_dev"
+                yellow "  ⚠ could not restart $_dev — restart manually: serial-agent stop/start $_dev"
             fi
         done <<< "$_running"
     fi
