@@ -186,6 +186,10 @@ FILE LAYOUT  ~/var/serial-agent/<devname>/
                  prompt_text, pid, device, baud, via, buf_file, buf_lines.
                  Consumers should read this; never poll buf.log directly.
 
+  stream.log   — Append-only copy of every captured line (rotates at 8 MB
+                 to stream.log.1). Use THIS for tail -f/-F followers: buf.log
+                 is rewritten via tmp+rename on every chunk, so its inode
+                 changes constantly and tail followers silently detach.
   buf.log      — Ring buffer of the last N lines (default 500) from the
                  board. Each line is prepended with a [HH:MM:SS.mmm]
                  timestamp. Partial lines are buffered across os.read()
@@ -478,8 +482,21 @@ class Daemon:
         self.fifo_file   = self.ddir / 'input.fifo'
         self.pid_file    = self.ddir / 'daemon.pid'
         self.events_file = self.ddir / 'events.log'
+        # Follower-friendly append-only stream (see _append): buf.log is a
+        # ring rewritten by tmp+rename, so its inode changes on EVERY chunk
+        # and tail -f/-F followers silently detach after the first byte.
+        self.stream_file = self.ddir / 'stream.log'
 
         self.buf_lines: list = []
+        # Preload the ring from a previous daemon's buf.log so a restart
+        # doesn't wipe recent board history (it used to start empty and
+        # immediately overwrite the file).
+        try:
+            if self.buf_file.exists():
+                self.buf_lines = self.buf_file.read_text(
+                    errors='replace').splitlines()[-lines:]
+        except OSError:
+            pass
         self._partial    = ''   # incomplete line between reads
         self.state        = 'UNKNOWN'
         self._prev_state  = 'UNKNOWN'
@@ -675,16 +692,31 @@ class Daemon:
             parts = parts[:-1]
         else:
             self._partial = ''
+        new_entries = []
         for raw in parts:
             line = raw.strip('\r')
             if line:
-                self.buf_lines.append(f'[{ts()}] {line}')
+                new_entries.append(f'[{ts()}] {line}')
+        self.buf_lines.extend(new_entries)
         if len(self.buf_lines) > self.maxlines:
             self.buf_lines = self.buf_lines[-self.maxlines:]
         try:
             _btmp = self.buf_file.with_suffix('.tmp')
             _btmp.write_text('\n'.join(self.buf_lines) + '\n')
             _btmp.rename(self.buf_file)
+        except OSError:
+            pass
+        # Append the same lines to stream.log (append mode: inode is stable,
+        # so tail -f works). Rotate at 8 MB to stream.log.1 — a follower
+        # using tail -F survives the rotation.
+        try:
+            if new_entries:
+                if (self.stream_file.exists()
+                        and self.stream_file.stat().st_size > 8 * 1024 * 1024):
+                    self.stream_file.rename(
+                        self.stream_file.with_suffix('.log.1'))
+                with open(self.stream_file, 'a') as _sf:
+                    _sf.write('\n'.join(new_entries) + '\n')
         except OSError:
             pass
         self._write_status()
@@ -1294,8 +1326,11 @@ def cmd_start(args):
         else:
             print(f"ALREADY  daemon running for {args.device}")
         return
-    # Remove ALL transient files so old daemon can't steal commands or data
-    for stale in ('buf.log', 'status.json', 'daemon.pid', 'input.fifo', 'events.log'):
+    # Remove CONTROL files so an old daemon can't steal commands. buf.log is
+    # deliberately kept: it is pure output history, the new daemon preloads it
+    # into its ring so board context survives restarts (it used to be wiped,
+    # which destroyed history at every restart and broke debugging sessions).
+    for stale in ('status.json', 'daemon.pid', 'input.fifo', 'events.log'):
         (ddir / stale).unlink(missing_ok=True)
 
     pid = os.fork()
@@ -1306,7 +1341,7 @@ def cmd_start(args):
             s = json.loads(sf.read_text())
             print(f"daemon PID {s['pid']}  {args.device}  via {s['via']}")
             print(f"  buf:  {s['buf_file']}")
-            print(f"  tail: tail -f {s['buf_file']}")
+            print(f"  tail: tail -F {Path(s['buf_file']).parent / 'stream.log'}")
         else:
             print(f"daemon failed to start — check {ddir}/daemon.log", file=sys.stderr)
             sys.exit(1)
