@@ -1542,6 +1542,29 @@ def cmd_read(args):
     print('\n'.join(tail))
 
 
+def _maybe_auto_login(args):
+    """If --login was given and the console is at LOGIN/PASSWORD (or went
+    quiet there), run the standard login flow first. Board-agnostic: uses
+    cmd_login's existing credential handling (default root, no password)."""
+    if not getattr(args, 'login', False):
+        return
+    try:
+        st = json.loads((devdir(args.device) / 'status.json').read_text())
+    except (OSError, ValueError):
+        return
+    cst = st.get('state', '')
+    if cst in ('LOGIN', 'PASSWORD', 'BOOTING') or \
+       (cst == 'QUIET' and st.get('quiet_from') in ('LOGIN', 'PASSWORD')):
+        ns = argparse.Namespace(device=args.device,
+                                user=getattr(args, 'user', 'root'),
+                                password=getattr(args, 'password', None),
+                                timeout=90)
+        try:
+            cmd_login(ns)
+        except SystemExit:
+            pass
+
+
 def cmd_send(args):
     """Send a command to the board and optionally capture structured output.
 
@@ -1562,6 +1585,8 @@ def cmd_send(args):
 
     Exit code: 0 = completed (pattern matched), 1 = timed out or failed.
     """
+    _maybe_auto_login(args)
+
     # ── Fan-out: send to ALL running daemons ──────────────────────────────────
     if args.all:
         targets = []
@@ -1593,6 +1618,22 @@ def cmd_send(args):
                 if isinstance(r, dict):
                     print(r.get('output', ''))
         sys.exit(0 if all(not r.get('timed_out') for r in results.values() if isinstance(r, dict)) else 1)
+
+    # Interior newlines cannot be sent as one shell command: each line is
+    # typed separately, so heredocs/defs land on the continuation prompt and
+    # wedge the session (board-agnostic TTY reality, seen repeatedly in the
+    # field). Delegate transparently to the base64 'run' path, which executes
+    # the block as one script. --no-wait keeps raw behavior (caller explicitly
+    # wants keystrokes, e.g. answering an interactive prompt).
+    if '\n' in args.command.strip() and getattr(args, 'wait', True) is not None:
+        print(f'{args.device}: multi-line command — running via script transfer '
+              f"(same as 'serial-agent run')", file=sys.stderr)
+        ns = argparse.Namespace(
+            device=args.device, script=args.command,
+            timeout=(args.timeout if args.timeout else 60.0),
+            json=args.json, capture=args.capture,
+            no_wrap=getattr(args, 'no_wrap', False))
+        return cmd_run(ns)
 
     result = _send_impl(args)
     if result is None:
@@ -1666,7 +1707,14 @@ def _send_impl(args):
     try:
         _stj = json.loads((devdir(args.device) / 'status.json').read_text())
         _cst = _stj.get('state', '')
-        if _cst in ('LOGIN', 'PASSWORD') and (' ' in cmd or ';' in cmd):
+        if _cst == 'UBOOT' or (_cst == 'QUIET' and _stj.get('quiet_from') == 'UBOOT'):
+            # ANY input during the autoboot countdown stops autoboot; at the
+            # U-Boot prompt shell commands are misparsed as U-Boot commands.
+            # Warn (still send — deliberate U-Boot interaction is legitimate).
+            print(f"{args.device}: console is in U-Boot — input interrupts "
+                  f"autoboot / runs as a U-Boot command, not a shell command. "
+                  f"Send 'boot' to resume Linux.", file=sys.stderr)
+        elif _cst in ('LOGIN', 'PASSWORD') and (' ' in cmd or ';' in cmd):
             print(f"{args.device}: console is at a {_cst} prompt — this command "
                   f"will be typed as a username, not executed. Log in first "
                   f"(serial-agent send DEVICE root).", file=sys.stderr)
@@ -2513,6 +2561,7 @@ def cmd_run(args):
     """
     import base64
     device = args.device
+    _maybe_auto_login(args)
 
     # Read script
     script_src = args.script
@@ -3112,6 +3161,8 @@ def main():
     sp = sub.add_parser('send',
         help='Send command; --json for structured output, --capture for clean stdout')
     dev(sp); sp.set_defaults(func=cmd_send)
+    sp.add_argument('--login', action='store_true',
+                    help='Auto-login first if console is at a login prompt')
     sp.add_argument('command')
     sp.add_argument('--wait', metavar='PATTERN', default=r'[\$#>]\s*$',
                     help='Wait for regex after sending (default: shell prompt)')
@@ -3209,6 +3260,8 @@ def main():
     sp.add_argument('--json',     action='store_true')
     sp.add_argument('--capture',  action='store_true')
     sp.add_argument('--no-wrap',  action='store_true')
+    sp.add_argument('--login', action='store_true',
+                    help='Auto-login first if console is at a login prompt')
 
     sp = sub.add_parser('health',
         help='Board health snapshot: state, memory, load, kernel version')
