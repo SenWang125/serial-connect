@@ -52,6 +52,8 @@ STATE MACHINE
   PASSWORD   Waiting for password             Send password; wait for SHELL
   BOOTING    Kernel/init messages             Wait for SHELL (10-60s typical)
   DEAD       No output for >30s              ✗ Board off or hung
+  QUIET      Console silent >30s              Daemon healthy, port held; state
+                                              before silence shown as QUIET<-X
   UNKNOWN    Daemon just started              Run alive or connect
 
   Status JSON fields:
@@ -470,6 +472,8 @@ class Daemon:
       - Watch events.log for state transitions (via CLI 'wait-state').
     """
 
+    quiet_from = ''
+
     def __init__(self, device, tcp, baud, lines, idle_timeout=0):
         self.device       = device
         self.tcp          = None   # relay address; set by _start_relay_if_direct
@@ -724,6 +728,7 @@ class Daemon:
     def _write_status(self):
         t = now()
         s = {
+            'quiet_from': self.quiet_from,
             'state':           self.state,
             'last_output_ago': round(t - self.t_output, 1) if self.t_output else None,
             'last_prompt_ago': round(t - self.t_prompt, 1) if self.t_prompt else None,
@@ -1012,15 +1017,21 @@ class Daemon:
                             self._send_raw(b'\r')
                             _t_last_idle_probe = now()
                         if self.t_output and now() - self.t_output > DEAD_AFTER:
-                            if self.state != 'IDLE':
+                            # QUIET = console silent >30s; the daemon is HEALTHY and
+                            # (in always-on mode) still holds the port.  This used to
+                            # be named IDLE, colliding with the historical parked-
+                            # daemon trap — operators force-restarted healthy daemons
+                            # every time they saw it.
+                            if self.state != 'QUIET':
                                 _prev = self._prev_state
-                                self.state = 'IDLE'
-                                self._prev_state = 'IDLE'
+                                self.quiet_from = _prev
+                                self.state = 'QUIET'
+                                self._prev_state = 'QUIET'
                                 self._write_status()
                                 # Write to events.log so _wait_state can detect IDLE
                                 # via inotifywait — without this, IDLE is only in
                                 # status.json and _wait_state's loop never sees it.
-                                _entry = f'[{ts()}] {_prev} → IDLE  (silence)'
+                                _entry = f'[{ts()}] {_prev} → QUIET  (console silent)'
                                 try:
                                     _existing = (self.events_file.read_text().splitlines()
                                                  if self.events_file.exists() else [])
@@ -1157,7 +1168,9 @@ def _wait_pattern(device, pattern, timeout, show=False, baseline_offset=None):
     Daemon liveness is checked at the top of each iteration. If the daemon
     dies mid-wait, returns False immediately rather than burning the timeout.
     """
-    bf = devdir(device) / 'buf.log'
+    bf = devdir(device) / 'stream.log'
+    if not bf.exists():
+        bf = devdir(device) / 'buf.log'   # pre-stream.log daemon
     sf = devdir(device) / 'status.json'
     pat = re.compile(pattern)
     deadline = time.time() + timeout
@@ -1192,6 +1205,8 @@ def _wait_pattern(device, pattern, timeout, show=False, baseline_offset=None):
         if not bf.exists():
             continue
         sz = bf.stat().st_size
+        if sz < baseline:
+            baseline = 0     # stream.log rotated (8 MB) — re-anchor
         if sz <= baseline:
             continue
 
@@ -1625,7 +1640,14 @@ def _send_impl(args):
     if not _daemon_running(args.device):
         print(f'no daemon for {args.device}', file=sys.stderr); sys.exit(1)
 
-    bf = devdir(args.device) / 'buf.log'
+    # Capture source is stream.log (append-only, stable inode) — byte offsets
+    # into it stay valid across the send window.  buf.log is a bounded ring
+    # that drops lines from the FRONT, so an offset snapped before the command
+    # pointed mid-stream after any rotation: that was the long-standing
+    # '--json output truncated at the front' bug.
+    bf = devdir(args.device) / 'stream.log'
+    if not bf.exists():
+        bf = devdir(args.device) / 'buf.log'   # pre-stream.log daemon
     t0 = time.time()
     # Snap to last newline so we never read a partial timestamped line
     if bf.exists():
@@ -1637,6 +1659,23 @@ def _send_impl(args):
         baseline_offset = 0
 
     cmd = args.command.rstrip('\n')
+    # Guard: a shell-looking command sent while the console sits at a login/
+    # password prompt is typed into getty as a username — it never executes and
+    # the operator only sees a mysterious timeout (three times in one night).
+    # Warn loudly; still send (a bare word like 'root' IS the login flow).
+    try:
+        _stj = json.loads((devdir(args.device) / 'status.json').read_text())
+        _cst = _stj.get('state', '')
+        if _cst in ('LOGIN', 'PASSWORD') and (' ' in cmd or ';' in cmd):
+            print(f"{args.device}: console is at a {_cst} prompt — this command "
+                  f"will be typed as a username, not executed. Log in first "
+                  f"(serial-agent send DEVICE root).", file=sys.stderr)
+        elif _cst == 'QUIET' and _stj.get('quiet_from') in ('LOGIN', 'PASSWORD') \
+                and (' ' in cmd or ';' in cmd):
+            print(f"{args.device}: console went quiet at a {_stj['quiet_from']} "
+                  f"prompt — log in first.", file=sys.stderr)
+    except (OSError, ValueError):
+        pass
     if getattr(args, 'no_wrap', False):
         # Prevent board terminal from wrapping long output lines
         cmd = f'COLUMNS=32767 LINES=200 {cmd}'
@@ -1691,8 +1730,10 @@ def _send_impl(args):
     if args.json or args.capture or args.exit_code:
         new_lines = []
         if bf.exists():
+            _sz = bf.stat().st_size
+            _base = baseline_offset if _sz >= baseline_offset else 0
             with open(bf, 'rb') as f:
-                f.seek(baseline_offset)
+                f.seek(_base)
                 raw = f.read().decode('utf-8', errors='replace')
             new_lines = raw.splitlines()
         output, exit_code = _clean_output(new_lines, cmd.strip())  # use actual sent cmd for echo detection
@@ -1911,6 +1952,9 @@ def cmd_wait_state(args):
 
     See also: wait-alive (shorthand for SHELL,LOGIN,PASSWORD).
     """
+    # compat: IDLE was renamed QUIET; accept both
+    if getattr(args, 'state', None):
+        args.state = args.state.replace('IDLE', 'QUIET').replace('QUIETQUIET', 'QUIET')
     ok = _wait_state(args.device, args.state, args.timeout)
     sys.exit(0 if ok else 1)
 
@@ -2007,7 +2051,7 @@ def cmd_connect(args):
         # Directly write CR to fifo so wait_state below sees the prompt transition.
         sf2 = devdir(device) / 'status.json'
         cur2 = json.loads(sf2.read_text()).get('state', '') if sf2.exists() else ''
-        if cur2 in ('DEAD', 'UNKNOWN', 'IDLE'):
+        if cur2 in ('DEAD', 'UNKNOWN', 'IDLE', 'QUIET'):
             fifo2 = devdir(device) / 'input.fifo'
             if fifo2.exists():
                 try:
@@ -2696,6 +2740,8 @@ def cmd_list(args):
             try:
                 s = json.loads(sf.read_text())
                 state = s.get('state','?'); via = s.get('via','?')
+                if state == 'QUIET' and s.get('quiet_from'):
+                    state = f"QUIET\u2190{s['quiet_from']}"
                 buf_lines = s.get('buf_lines', 0); prompt = s.get('prompt_text','')
             except Exception: pass
         rows.append((ddir.name, state, via, buf_lines, prompt))
