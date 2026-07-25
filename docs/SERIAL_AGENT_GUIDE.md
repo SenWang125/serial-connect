@@ -125,12 +125,44 @@ esac
 
 ## 4. Event-Driven Waiting (zero-poll, instant notification)
 
+### `watch` — real-time push (PREFER THIS over send-then-sleep)
+
+`watch` subscribes to the daemon's **`output.fifo`** push channel, so it returns
+the *instant* a pattern appears — the read blocks in the kernel until the next
+serial byte arrives (measured ~0.2 ms inject→match, vs the 50–200 ms floor of the
+file-polling path). `--send` fires a command **after** the read side is already
+open, so no early output is lost. This is the one-shot replacement for the
+`send X; sleep N; read` anti-pattern.
+
+```bash
+# Fused send + wait-for-result in ONE call (no blind sleep):
+serial-agent watch "$DEV" --send 'modprobe snd_soc_foo' \
+  --until 'card0|Error|FAIL' --timeout 20
+# → {"matched":"u0","output":"...","elapsed_ms":840}   (exit 0 match / 1 timeout)
+
+# Named outcomes (matched KEY is reported), e.g. a reboot safety net:
+serial-agent watch "$DEV" --send 'reboot' \
+  --on READY='~#' --on PANIC='Kernel panic' --on UBOOT='=>' \
+  --timeout 120
+
+# Live human-friendly stream (the raw push channel, cat-able):
+cat ~/var/serial-agent/$(basename "$DEV")/output.fifo
+
+# NOTE: output.fifo is single-consumer (a second reader steals bytes). For shared
+# observation use tio / the TCP relay. One `watch` per device at a time.
+```
+
+### `expect` / `wait-state` — file-polling fallback
+
+Use when you did NOT pre-open a watch (matching output already on the console),
+or on a daemon too old to have `output.fifo`. Reads `stream.log`; event-driven if
+`inotifywait` is installed (`sudo pacman -S inotify-tools`), else polls 50–200 ms.
+
 ```bash
 # Wait for board to reach SHELL after a reboot
 serial-agent wait-state "$DEV" SHELL,LOGIN --timeout 120
-# Uses inotifywait if available → 0ms latency (no spinning)
 
-# Wait for multiple outcomes (reboot safety net)
+# Wait for multiple outcomes against output already flowing
 serial-agent send "$DEV" "reboot" --no-wait
 result=$(serial-agent expect "$DEV" \
   --on "READY=~#" \
@@ -251,7 +283,10 @@ serial-agent send "$DEV" "rmmod $MODNAME" --json --exit-code --timeout 5
 
 | Operation | Typical latency | Notes |
 |-----------|----------------|-------|
+| `watch` (inject→match) | **~0.2ms** | push via output.fifo, kernel-blocking read |
 | `send --json` (live board) | ~50ms | Board responds to CR immediately |
+| `expect`/`wait-state` (inotify) | ~0-5ms | event-driven if `inotify-tools` installed |
+| `expect`/`wait-state` (no inotify) | 50-200ms | file-polling fallback — install inotify-tools |
 | `wait-state` (board at SHELL) | ~0ms | inotifywait, event-driven |
 | `wait-state` (board booting) | boot time | TI AM62x: ~30-60s |
 | `alive` (SHELL state, recent) | ~0ms | Reads cached status, no serial I/O |
@@ -300,6 +335,8 @@ serial-agent events "$DEV"                             # state transitions
 serial-agent list                              # what daemons are running?
 serial-agent connect --board "$BOARD" --wait-shell  # connect to a board
 serial-agent send "$DEV" "CMD" --json          # run command, get JSON
+serial-agent watch "$DEV" --send 'CMD' --until 'DONE|FAIL' --timeout 20  # push: fused send+wait, ~0.2ms match
+cat ~/var/serial-agent/$(basename "$DEV")/output.fifo   # live raw stream (single consumer)
 serial-agent run "$DEV" script.sh --json       # run script, get JSON
 serial-agent reboot "$DEV" --setup-terminal   # reboot and come back
 serial-agent upload "$DEV" file.ko /tmp/      # transfer file

@@ -209,6 +209,14 @@ FILE LAYOUT  ~/var/serial-agent/<devname>/
                  The FIFO is created once at daemon start and persists until
                  the next start (cleared by cmd_start to prevent stale data).
 
+  output.fifo  — Push channel (reverse of input.fifo). _append() mirrors every
+                 raw serial chunk into it so a 'watch' consumer gets results with
+                 no polling latency (~0.2ms). The daemon opens the write end
+                 O_WRONLY|O_NONBLOCK lazily (ENXIO while no reader) and DROPS on a
+                 full pipe (EAGAIN) rather than block — the serial reader must
+                 never wait on it. Single-consumer (a 2nd reader steals bytes);
+                 for shared observation use the TCP relay / tio instead.
+
   daemon.log   — stdout/stderr of the daemon process (append mode).
                  Contains connect/disconnect events and error messages.
 
@@ -490,6 +498,9 @@ class Daemon:
         # ring rewritten by tmp+rename, so its inode changes on EVERY chunk
         # and tail -f/-F followers silently detach after the first byte.
         self.stream_file = self.ddir / 'stream.log'
+        # Push channel for 'watch': subscribers open output.fifo O_RDONLY and the
+        # daemon mirrors every raw serial chunk into it — best-effort, non-blocking.
+        self.output_fifo = self.ddir / 'output.fifo'
 
         self.buf_lines: list = []
         # Preload the ring from a previous daemon's buf.log so a restart
@@ -514,6 +525,8 @@ class Daemon:
         self._relay_clients: list = []
         self._relay_lock     = Lock()
         self._t_last_client  = 0.0   # monotonic time of last relay client connect/disconnect
+        self._out_fd         = None  # lazily-opened O_WRONLY|O_NONBLOCK to output_fifo
+        self._out_next_try   = 0.0   # monotonic gate on reopen attempts while no reader
 
     def _connect(self):
         """Open the serial device or TCP connection and configure terminal settings.
@@ -683,6 +696,10 @@ class Daemon:
                         self._relay_clients.remove(c)
                     except ValueError:
                         pass
+        # Mirror the raw chunk to output.fifo for any 'watch' subscriber. Kept
+        # best-effort + non-blocking so a slow/absent reader can never stall the
+        # serial reader (a stalled reader here would drop board output).
+        self._push_output(data)
         text = data.decode('utf-8', errors='replace')
         self.t_output = now()
         self._update_state(text)
@@ -725,6 +742,38 @@ class Daemon:
             pass
         self._write_status()
 
+    def _push_output(self, data: bytes):
+        """Best-effort, non-blocking mirror of a raw serial chunk to output.fifo.
+
+        A 'watch' consumer opens output.fifo O_RDONLY. We open the write end
+        O_WRONLY|O_NONBLOCK lazily: it raises ENXIO while no reader is attached,
+        so when nobody is watching this costs at most one failed syscall every
+        0.5s. On a full pipe (slow reader) os.write raises EAGAIN and we DROP the
+        chunk rather than block — the serial reader must never wait on a pipe. On
+        EPIPE (reader gone) we close and re-arm.
+        """
+        if self._out_fd is None:
+            t = time.monotonic()
+            if t < self._out_next_try:
+                return
+            self._out_next_try = t + 0.5
+            try:
+                self._out_fd = os.open(str(self.output_fifo),
+                                       os.O_WRONLY | os.O_NONBLOCK)
+            except OSError:
+                self._out_fd = None      # ENXIO: no reader attached yet
+                return
+        try:
+            os.write(self._out_fd, data)
+        except BlockingIOError:
+            pass                          # EAGAIN: pipe full — drop, never block
+        except OSError:
+            try:
+                os.close(self._out_fd)
+            except OSError:
+                pass
+            self._out_fd = None           # EPIPE: reader gone — re-arm
+
     def _write_status(self):
         t = now()
         s = {
@@ -740,6 +789,7 @@ class Daemon:
                                if self._given_tcp else 'direct'),
             'relay':           (f'{self.tcp[0]}:{self.tcp[1]}' if self.tcp else None),
             'buf_file':        str(self.buf_file),
+            'output_fifo':     str(self.output_fifo),
             'buf_lines':       len(self.buf_lines),
             'idle_timeout':    self.idle_timeout,
             # Whether the daemon currently holds the port.  In on-demand mode
@@ -906,6 +956,8 @@ class Daemon:
 
         if not self.fifo_file.exists():
             os.mkfifo(self.fifo_file)
+        if not self.output_fifo.exists():
+            os.mkfifo(self.output_fifo)
         signal.signal(signal.SIGTERM, lambda *_: self._stop.set())
         signal.signal(signal.SIGINT,  lambda *_: self._stop.set())
         Thread(target=self._writer, daemon=True).start()
@@ -1345,7 +1397,7 @@ def cmd_start(args):
     # deliberately kept: it is pure output history, the new daemon preloads it
     # into its ring so board context survives restarts (it used to be wiped,
     # which destroyed history at every restart and broke debugging sessions).
-    for stale in ('status.json', 'daemon.pid', 'input.fifo', 'events.log'):
+    for stale in ('status.json', 'daemon.pid', 'input.fifo', 'output.fifo', 'events.log'):
         (ddir / stale).unlink(missing_ok=True)
 
     pid = os.fork()
@@ -1803,9 +1855,118 @@ def _send_impl(args):
     return {'timed_out': not ok}
 
 
+def cmd_watch(args):
+    """Real-time push read: return the instant a pattern appears on the console.
+
+    Reads the daemon's output.fifo, so there is NO polling latency — the read
+    blocks in the kernel until the next serial byte arrives (vs expect/wait,
+    which poll a file at 50-200ms unless inotify is installed). Optionally sends
+    a command first (--send) with the read side already open, so no early output
+    is missed. This is the fused, zero-latency replacement for the
+    'send X; sleep N; read' pattern.
+
+    Patterns:  --until REGEX (repeatable)  and/or  --on KEY=REGEX (repeatable).
+               Any match returns immediately.
+    Output:    JSON {"matched": KEY|null, "output": str, "elapsed_ms": int
+                     [, "timed_out": true]}.  --until patterns key as u0,u1,...
+    Exit:      0 on match, 1 on timeout, 2 on usage/daemon error.
+    """
+    import select as _select
+    dev = args.device
+    if not _daemon_running(dev):
+        print(f'no daemon for {dev}', file=sys.stderr); sys.exit(2)
+    fifo = devdir(dev) / 'output.fifo'
+    if not fifo.exists():
+        print(f'no output.fifo for {dev} — daemon predates the push channel; '
+              f'restart it (serial-agent stop {dev} && serial-agent start {dev} '
+              f'--idle-timeout 0)', file=sys.stderr); sys.exit(2)
+
+    patterns = {}
+    for p in (args.on or []):
+        if '=' not in p:
+            print(f'Bad --on format (use KEY=REGEX): {p}', file=sys.stderr); sys.exit(2)
+        k, rx = p.split('=', 1); patterns[k] = re.compile(rx)
+    for i, rx in enumerate(args.until or []):
+        patterns[f'u{i}'] = re.compile(rx)
+    if not patterns:
+        print('watch needs at least one --until REGEX or --on KEY=REGEX',
+              file=sys.stderr); sys.exit(2)
+
+    # Open the read end FIRST (non-blocking) so the daemon can attach its write
+    # end and nothing emitted by --send is missed. Snapshot stream.log's end as
+    # a backstop for the rare bytes dropped under backpressure.
+    rfd = os.open(str(fifo), os.O_RDONLY | os.O_NONBLOCK)
+    sf_stream = devdir(dev) / 'stream.log'
+    stream_base = sf_stream.stat().st_size if sf_stream.exists() else 0
+
+    t0 = time.time()
+    if getattr(args, 'send', None):
+        iff = devdir(dev) / 'input.fifo'
+        cb = (args.send.rstrip('\n') + '\n').encode()
+        for _ in range(20):
+            try:
+                wfd = os.open(str(iff), os.O_WRONLY | os.O_NONBLOCK)
+                try: os.write(wfd, cb)
+                finally: os.close(wfd)
+                break
+            except OSError:
+                time.sleep(0.1)
+
+    deadline = t0 + args.timeout
+    acc = ''
+    matched = None
+    while time.time() < deadline and matched is None:
+        r, _, _ = _select.select([rfd], [], [], max(0.02, deadline - time.time()))
+        if not r:
+            continue
+        try:
+            chunk = os.read(rfd, 4096)
+        except BlockingIOError:
+            continue
+        except OSError:
+            break
+        if not chunk:
+            time.sleep(0.02)     # writer end momentarily closed; keep waiting
+            continue
+        acc += _strip_ansi(chunk.decode('utf-8', errors='replace'))
+        for k, pat in patterns.items():
+            if pat.search(acc):
+                matched = k; break
+    os.close(rfd)
+
+    # Backstop: reconcile against stream.log for anything dropped under pressure.
+    if matched is None and sf_stream.exists():
+        try:
+            with open(sf_stream, 'rb') as f:
+                f.seek(stream_base)
+                tail = f.read().decode('utf-8', errors='replace')
+            merged = acc + _strip_ansi(tail)
+            for k, pat in patterns.items():
+                if pat.search(merged):
+                    matched = k; acc = merged; break
+        except OSError:
+            pass
+
+    out_text, _ = _clean_output(acc.splitlines())
+    res = {'matched': matched, 'output': out_text,
+           'elapsed_ms': int((time.time() - t0) * 1000)}
+    if matched is None:
+        res['timed_out'] = True
+    print(json.dumps(res))
+    _log_op(dev, 'watch', matched=matched, elapsed_ms=res['elapsed_ms'],
+            timed_out=matched is None)
+    sys.exit(0 if matched is not None else 1)
+
+
 def cmd_expect(args):
     """Wait for first of multiple patterns. Returns JSON with matched key and output."""
-    bf = devdir(args.device) / 'buf.log'
+    # Read stream.log (append-only, stable inode) not buf.log: buf.log is a
+    # bounded ring rewritten by tmp+rename, so a fast/large burst can scroll past
+    # its 500-line cap between polls and be missed (the front-truncation class
+    # already fixed for send/_send_impl). stream.log preserves the full window.
+    bf = devdir(args.device) / 'stream.log'
+    if not bf.exists():
+        bf = devdir(args.device) / 'buf.log'
     if bf.exists():
         with open(bf, 'rb') as _f:
             _raw = _f.read()
@@ -3025,7 +3186,64 @@ def cmd_test(args):
             if verbose: print(f'     relay error: {e}')
         check(relay_ok, 'relay TCP client receives board data')
 
-        # ── Test 6: human_session blocks cmd_stop; --force overrides ──────
+        # ── Test 6: output.fifo exists and is a real FIFO ─────────────────
+        import stat as _stat
+        ofifo = Path(env['SERIAL_AGENT_BASE']) / Path(vdev).name / 'output.fifo'
+        fifo_is_fifo = ofifo.exists() and _stat.S_ISFIFO(ofifo.stat().st_mode)
+        check(fifo_is_fifo, 'output.fifo created as a FIFO')
+
+        # ── Test 7: watch returns the instant a pattern matches (push) ────
+        if fifo_is_fifo:
+            wp = subprocess.Popen(
+                [sys.argv[0], 'watch', vdev, '--until', 'PONGTOKEN', '--timeout', '5'],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
+            time.sleep(0.4)   # let watch open the fifo + daemon attach write end
+            os.write(fd_b, b'\r\nsome noise line\r\nPONGTOKEN is here\r\n')
+            try:
+                w_out, w_err = wp.communicate(timeout=6)
+            except subprocess.TimeoutExpired:
+                wp.kill(); w_out, w_err = wp.communicate()
+            watch_ok = False
+            try:
+                wj = json.loads(w_out.strip().splitlines()[-1])
+                watch_ok = wj.get('matched') is not None
+            except Exception:
+                pass
+            check(watch_ok, 'watch returns on pattern match (push channel)',
+                  f'rc={wp.returncode} out={w_out!r} err={w_err!r}' if not watch_ok else '')
+        else:
+            fail('watch returns on pattern match (push channel)', 'no output.fifo')
+
+        # ── Test 8: fused send+watch round-trip (--send then --until) ─────
+        if fifo_is_fifo:
+            del recv_buf[:]   # reuse Test 4's board-side reader
+            wp = subprocess.Popen(
+                [sys.argv[0], 'watch', vdev, '--send', 'PINGCMD',
+                 '--until', 'PONGTOKEN', '--timeout', '5'],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
+            # when the daemon forwards PINGCMD to the board side, reply
+            _dl = time.time() + 3; replied = False
+            while time.time() < _dl:
+                if any(b'PINGCMD' in b for b in recv_buf):
+                    os.write(fd_b, b'\r\nPONGTOKEN ok\r\n'); replied = True; break
+                time.sleep(0.02)
+            try:
+                w_out, w_err = wp.communicate(timeout=6)
+            except subprocess.TimeoutExpired:
+                wp.kill(); w_out, w_err = wp.communicate()
+            fused_ok = False
+            try:
+                wj = json.loads(w_out.strip().splitlines()[-1])
+                fused_ok = wj.get('matched') is not None
+            except Exception:
+                pass
+            check(replied and fused_ok, 'fused send+watch round-trip',
+                  f'replied={replied} out={w_out!r} err={w_err!r}'
+                  if not (replied and fused_ok) else '')
+        else:
+            fail('fused send+watch round-trip', 'no output.fifo')
+
+        # ── Test 9: human_session blocks cmd_stop; --force overrides ──────
         hs = Path(env['SERIAL_AGENT_BASE']) / Path(vdev).name / 'human_session'
         hs.write_text(f'{os.getpid()}\n{time.time()}\n')
 
@@ -3186,6 +3404,19 @@ def main():
     sp.add_argument('--on', action='append', metavar='KEY=REGEX', required=True,
                     help='Pattern to watch for, e.g. --on READY="~#" --on PANIC="Kernel panic"')
     sp.add_argument('--timeout', type=float, default=60.0)
+
+    sp = sub.add_parser('watch',
+        help='Real-time push read: return the instant a pattern matches (no polling). '
+             'Optionally --send a command first. JSON {"matched","output","elapsed_ms"}')
+    dev(sp); sp.set_defaults(func=cmd_watch)
+    sp.add_argument('--until', action='append', metavar='REGEX',
+                    help='Pattern to stop on (repeatable); any match returns. Keyed u0,u1,...')
+    sp.add_argument('--on', action='append', metavar='KEY=REGEX',
+                    help='Named pattern (repeatable); the matched KEY is reported')
+    sp.add_argument('--send', metavar='CMD',
+                    help='Command to send after the read side is open (no early output missed)')
+    sp.add_argument('--timeout', type=float, default=30.0)
+    sp.add_argument('--json', action='store_true', help='(output is JSON regardless)')
 
     sp = sub.add_parser('wait'); dev(sp); sp.set_defaults(func=cmd_wait)
     sp.add_argument('pattern')

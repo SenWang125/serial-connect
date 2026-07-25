@@ -52,10 +52,14 @@ serial-agent daemon ────────────────────
   • input FIFO: /dev/ttyUSBx write path → daemon reads → sends to serial
   • TIOCSWINSZ: sets 220×50 terminal size to prevent board line-wrapping
   • HUPCL cleared: prevents DTR deassert killing board sessions
+  • output FIFO: mirrors every raw serial chunk (drop-safe, O_WRONLY|O_NONBLOCK)
+    → `watch` consumers get push results with no polling latency (~0.2ms)
 
 serial-agent CLI  ←──────────────────────────────────────────────────────── agent / scripts
   • reads from ~/var/serial-agent/ files (no serial port access)
-  • writes commands to FIFO (non-blocking O_NONBLOCK with retry)
+  • writes commands to input.fifo (non-blocking O_NONBLOCK with retry)
+  • `watch`: reads output.fifo (kernel-blocking), matches regex, returns on hit;
+    --send fires the command with the read side already open (no early loss)
 ```
 
 ---
@@ -74,6 +78,11 @@ serial-agent CLI  ←───────────────────�
     status.json                     Current state machine snapshot
     events.log                      State transitions (capped 200 lines)
     input.fifo                      Write commands here → daemon sends to board
+    output.fifo                     Push channel: daemon mirrors every raw serial
+                                    chunk here; `watch` (or `cat`) reads it for
+                                    real-time (~0.2ms) results. Single-consumer,
+                                    drop-safe (non-blocking write, never stalls
+                                    the serial reader).
 
 /tmp/serial-agent  →  ~/var/serial-agent   symlink (auto-created, clears on reboot)
 /tmp/serial-connect.{sig,cache}            serial-connect probe cache (session-scoped)
@@ -210,10 +219,12 @@ Install: `sudo cp /tmp/ser2net.yaml /etc/ser2net.yaml && sudo systemctl restart 
 | `/usr/local/share/serial-connect/serial-*` | Installed scripts (global) | `sudo cp` |
 | `~/bin/serial-*.old` | Local development copies (not active) | Manual edit |
 | `~/var/serial-agent/*/` | Runtime state (buf, status, events, human_session) | serial-agent daemon / serial-connect |
+| `~/var/serial-agent/*/output.fifo` | Push channel for `watch` (real-time results); single-consumer, drop-safe | serial-agent daemon (write) / `watch`,`cat` (read) |
 | `/tmp/serial-agent` | Symlink → ~/var/serial-agent | `serial-agent start` |
 | `/tmp/serial-connect-USER.{sig,cache}` | Per-user probe cache | `serial-connect` |
 | `/tmp/serial-connect-locks/DEVNAME` | Active session lock (PID + USER) | serial-connect `_lock_acquire` |
 
 ---
 
-*Last updated: 2026-06-25 — always-on daemon design, bash 5.2 empty-serial fix*
+*Last updated: 2026-07-25 — output.fifo push channel + `watch` command (real-time,
+~0.2ms results); `expect` reads stream.log (ring-truncation fix)*
