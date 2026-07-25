@@ -526,7 +526,6 @@ class Daemon:
         self._relay_lock     = Lock()
         self._t_last_client  = 0.0   # monotonic time of last relay client connect/disconnect
         self._out_fd         = None  # lazily-opened O_WRONLY|O_NONBLOCK to output_fifo
-        self._out_next_try   = 0.0   # monotonic gate on reopen attempts while no reader
 
     def _connect(self):
         """Open the serial device or TCP connection and configure terminal settings.
@@ -746,33 +745,36 @@ class Daemon:
         """Best-effort, non-blocking mirror of a raw serial chunk to output.fifo.
 
         A 'watch' consumer opens output.fifo O_RDONLY. We open the write end
-        O_WRONLY|O_NONBLOCK lazily: it raises ENXIO while no reader is attached,
-        so when nobody is watching this costs at most one failed syscall every
-        0.5s. On a full pipe (slow reader) os.write raises EAGAIN and we DROP the
-        chunk rather than block — the serial reader must never wait on a pipe. On
-        EPIPE (reader gone) we close and re-arm.
+        O_WRONLY|O_NONBLOCK lazily (raises ENXIO while no reader is attached — one
+        cheap failed syscall per chunk when nobody is watching). On a full pipe
+        (slow reader) os.write raises EAGAIN and we DROP the chunk rather than
+        block — the serial reader must never wait on a pipe.
+
+        On EPIPE the previous reader is gone. We hold the write fd open across
+        chunks for speed, so when a NEW watcher attaches the first chunk hits the
+        stale fd; we must close, reopen, and rewrite THAT chunk in the same call —
+        otherwise the first chunk after a reconnect is lost, starving the new
+        watcher until its stream.log backstop fires (~10s instead of ~0.2ms; this
+        was intermittent and only surfaced on real hardware).
         """
-        if self._out_fd is None:
-            t = time.monotonic()
-            if t < self._out_next_try:
-                return
-            self._out_next_try = t + 0.5
+        for _ in range(2):
+            if self._out_fd is None:
+                try:
+                    self._out_fd = os.open(str(self.output_fifo),
+                                           os.O_WRONLY | os.O_NONBLOCK)
+                except OSError:
+                    return                # ENXIO: no reader attached
             try:
-                self._out_fd = os.open(str(self.output_fifo),
-                                       os.O_WRONLY | os.O_NONBLOCK)
-            except OSError:
-                self._out_fd = None      # ENXIO: no reader attached yet
+                os.write(self._out_fd, data)
                 return
-        try:
-            os.write(self._out_fd, data)
-        except BlockingIOError:
-            pass                          # EAGAIN: pipe full — drop, never block
-        except OSError:
-            try:
-                os.close(self._out_fd)
-            except OSError:
-                pass
-            self._out_fd = None           # EPIPE: reader gone — re-arm
+            except BlockingIOError:
+                return                    # EAGAIN: pipe full — drop, never block
+            except OSError:               # EPIPE: reader changed — reopen & retry
+                try:
+                    os.close(self._out_fd)
+                except OSError:
+                    pass
+                self._out_fd = None
 
     def _write_status(self):
         t = now()
@@ -3243,7 +3245,36 @@ def cmd_test(args):
         else:
             fail('fused send+watch round-trip', 'no output.fifo')
 
-        # ── Test 9: human_session blocks cmd_stop; --force overrides ──────
+        # ── Test 9: back-to-back watch — 2nd matches via PUSH, not backstop ──
+        # Regression: a stale write-fd from the 1st watcher must not eat the 1st
+        # chunk the 2nd watcher needs (that stalled it to the ~10s stream.log
+        # backstop — caught on real hardware). A push match returns in ms.
+        if fifo_is_fifo:
+            w1 = subprocess.Popen(
+                [sys.argv[0], 'watch', vdev, '--until', 'RECON_A', '--timeout', '5'],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, text=True, env=env)
+            time.sleep(0.3); os.write(fd_b, b'\r\nRECON_A here\r\n')
+            try: w1.communicate(timeout=6)
+            except subprocess.TimeoutExpired: w1.kill(); w1.communicate()
+            w2 = subprocess.Popen(
+                [sys.argv[0], 'watch', vdev, '--until', 'RECON_B', '--timeout', '5'],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
+            time.sleep(0.3); os.write(fd_b, b'\r\nRECON_B here\r\n')
+            try: r_out, r_err = w2.communicate(timeout=6)
+            except subprocess.TimeoutExpired: w2.kill(); r_out, r_err = w2.communicate()
+            recon_ok = False; r_ms = None
+            try:
+                rj = json.loads(r_out.strip().splitlines()[-1])
+                r_ms = rj.get('elapsed_ms')
+                recon_ok = rj.get('matched') is not None and r_ms is not None and r_ms < 2500
+            except Exception:
+                pass
+            check(recon_ok, 'back-to-back watch matches via push (no backstop stall)',
+                  f'elapsed_ms={r_ms} (>=2500 = fell to stream.log backstop)' if not recon_ok else '')
+        else:
+            fail('back-to-back watch matches via push (no backstop stall)', 'no output.fifo')
+
+        # ── Test 10: human_session blocks cmd_stop; --force overrides ──────
         hs = Path(env['SERIAL_AGENT_BASE']) / Path(vdev).name / 'human_session'
         hs.write_text(f'{os.getpid()}\n{time.time()}\n')
 
