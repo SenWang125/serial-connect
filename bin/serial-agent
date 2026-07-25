@@ -1185,7 +1185,9 @@ def _relay_base_port() -> int:
 
 
 def find_ser2net_port(device: str):
-    for cfg in ('/etc/ser2net.yaml', '/etc/ser2net.conf'):
+    # SERIAL_SER2NET_CONF overrides the config path (non-root installs, testing).
+    _envc = os.environ.get('SERIAL_SER2NET_CONF')
+    for cfg in ([_envc] if _envc else ['/etc/ser2net.yaml', '/etc/ser2net.conf']):
         try:
             text = Path(cfg).read_text()
         except OSError:
@@ -1401,6 +1403,19 @@ def cmd_start(args):
     # which destroyed history at every restart and broke debugging sessions).
     for stale in ('status.json', 'daemon.pid', 'input.fifo', 'output.fifo', 'events.log'):
         (ddir / stale).unlink(missing_ok=True)
+
+    # Fully leverage ser2net when available: if it is configured for this device
+    # (and neither --tcp nor --no-ser2net was given), route through it — network /
+    # multi-host fan-out that survives daemon restarts. Config-based, like the
+    # detection connect/discover already do; if ser2net isn't actually up the
+    # daemon's reconnect loop backs off exactly as it would for an explicit --tcp.
+    # Direct + built-in relay stays the fallback when no ser2net config exists.
+    if tcp is None and not getattr(args, 'no_ser2net', False):
+        _s2 = find_ser2net_port(args.device)
+        if _s2:
+            _h, _p = _s2.rsplit(':', 1)
+            tcp = (_h, int(_p))
+            print(f"ser2net configured for {args.device} at {_s2} — routing through it")
 
     pid = os.fork()
     if pid:
@@ -3302,6 +3317,85 @@ def cmd_test(args):
         socat_proc.terminate()
         socat_proc.wait()
 
+    # ── ser2net mode: auto-detect + socket data path + watch over TCP ──────────
+    print(f'\nser2net mode\n{"─"*40}')
+    with tempfile.TemporaryDirectory(prefix='sa-s2n-') as td2:
+        td2 = Path(td2)
+        board_pty = td2 / 'boardpty'          # the "board" serial side
+        port = 37651
+        vdev2 = '/dev/fake_s2n_dev'
+        s2conf = td2 / 'ser2net.yaml'
+        s2conf.write_text(
+            "connection: &con\n"
+            f"    accepter: tcp,{port}\n"
+            f"    connector: serialdev,{vdev2},115200n81,local\n")
+        # fake ser2net: PTY (board) opened first so it exists before the daemon
+        # connects; TCP-LISTEN is where the daemon attaches.
+        s2proc = subprocess.Popen(
+            ['socat', f'PTY,link={board_pty},raw,echo=0',
+             f'TCP-LISTEN:{port},reuseaddr'], stderr=subprocess.DEVNULL)
+        deadline = time.time() + 3
+        while time.time() < deadline and not board_pty.exists():
+            time.sleep(0.05)
+        check(board_pty.exists(), 'fake ser2net (socat TCP-LISTEN↔PTY) created')
+
+        env2 = os.environ.copy()
+        env2['SERIAL_AGENT_BASE']   = str(td2 / 'state')
+        env2['SERIAL_SER2NET_CONF'] = str(s2conf)
+        r = subprocess.run([sys.argv[0], 'start', vdev2, '--idle-timeout', '0'],
+                           stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                           text=True, env=env2)
+        auto = 'routing through it' in r.stdout
+        check(auto, 'start auto-detected ser2net from config',
+              f'stdout={r.stdout!r}' if not auto else '')
+
+        sf2 = Path(env2['SERIAL_AGENT_BASE']) / Path(vdev2).name / 'status.json'
+        via_tcp = False
+        deadline = time.time() + 3
+        while time.time() < deadline:
+            try:
+                if json.loads(sf2.read_text()).get('via', '').startswith('tcp:'):
+                    via_tcp = True; break
+            except Exception:
+                pass
+            time.sleep(0.05)
+        check(via_tcp, 'daemon connected via ser2net TCP (via=tcp:...)')
+
+        try:
+            fdb2 = os.open(str(board_pty), os.O_RDWR | os.O_NONBLOCK)
+        except OSError:
+            fdb2 = -1
+        shell2 = False
+        if fdb2 >= 0:
+            os.write(fdb2, b'\r\nroot@s2n-board:~# ')
+            deadline = time.time() + 3
+            while time.time() < deadline:
+                try:
+                    if json.loads(sf2.read_text()).get('state') == 'SHELL':
+                        shell2 = True; break
+                except Exception:
+                    pass
+                time.sleep(0.05)
+        check(shell2, 'ser2net socket data reaches _append (state → SHELL)')
+
+        watch2 = False
+        ofifo2 = Path(env2['SERIAL_AGENT_BASE']) / Path(vdev2).name / 'output.fifo'
+        if fdb2 >= 0 and ofifo2.exists():
+            wp = subprocess.Popen(
+                [sys.argv[0], 'watch', vdev2, '--until', 'S2N_PUSH', '--timeout', '5'],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, env=env2)
+            time.sleep(0.4); os.write(fdb2, b'\r\nS2N_PUSH ok\r\n')
+            try: wo, _ = wp.communicate(timeout=6)
+            except subprocess.TimeoutExpired: wp.kill(); wo, _ = wp.communicate()
+            try: watch2 = json.loads(wo.strip().splitlines()[-1]).get('matched') is not None
+            except Exception: pass
+        check(watch2, 'watch works through ser2net (push over TCP transport)')
+
+        subprocess.run([sys.argv[0], 'stop', '--force', vdev2],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env2)
+        if fdb2 >= 0: os.close(fdb2)
+        s2proc.terminate(); s2proc.wait()
+
     total = passed + failed
     print(f'\n{"─"*40}')
     if failed == 0:
@@ -3361,7 +3455,10 @@ def main():
 
     # ── Daemon lifecycle ───────────────────────────────────────────────────────
     sp = sub.add_parser('start'); dev(sp); sp.set_defaults(func=cmd_start)
-    sp.add_argument('--tcp',  metavar='HOST:PORT')
+    sp.add_argument('--tcp',  metavar='HOST:PORT',
+                    help='Connect via this TCP endpoint (ser2net). Overrides auto-detect.')
+    sp.add_argument('--no-ser2net', action='store_true',
+                    help='Force direct port access even if ser2net is configured for it')
     sp.add_argument('--baud', type=int, default=115200)
     sp.add_argument('--lines',type=int, default=DEFAULT_LINES)
     sp.add_argument('--idle-timeout', type=int, default=0, dest='idle_timeout',

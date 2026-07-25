@@ -195,6 +195,14 @@ board → /dev/ttyUSB1 ← ser2net:3001
 Generate ser2net config: `serial-agent ser2net-gen --output /tmp/ser2net.yaml`
 Install: `sudo cp /tmp/ser2net.yaml /etc/ser2net.yaml && sudo systemctl restart ser2net`
 
+**Auto-leverage:** when ser2net is configured for a device, ALL entry points route
+through it automatically — `connect`/`discover` propose it, and `start` now detects it
+too (config-based; explicit `--tcp` overrides, `--no-ser2net` forces direct). Everything
+downstream (buffer, state machine, `send`, `expect`, and the `watch`/`output.fifo` push
+channel) works identically over the ser2net TCP transport as over a direct port, because
+the daemon's read loop feeds `_append` the same way regardless of source. Detection reads
+`/etc/ser2net.yaml`|`.conf`, or `$SERIAL_SER2NET_CONF` if set (non-root installs / tests).
+
 ---
 
 ## Known Limitations
@@ -227,4 +235,5 @@ Install: `sudo cp /tmp/ser2net.yaml /etc/ser2net.yaml && sudo systemctl restart 
 ---
 
 *Last updated: 2026-07-25 — output.fifo push channel + `watch` command (real-time,
-~0.2ms results); `expect` reads stream.log (ring-truncation fix)*
+~0.2ms results); `expect` reads stream.log (ring-truncation fix); `start` auto-leverages
+ser2net when configured (`--no-ser2net` / `$SERIAL_SER2NET_CONF`)*

@@ -346,6 +346,8 @@ serial-agent wait-state "$DEV" SHELL          # block until shell ready
 serial-agent stop "$DEV"                      # kill daemon (fuses all holders)
 
 # Environment overrides
-SERIAL_AGENT_DIR=/custom/path serial-agent ... # custom state directory
-BOARD=AM62D2-EVM serial-agent connect ...      # specify board
+SERIAL_AGENT_DIR=/custom/path serial-agent ...  # custom state directory
+BOARD=AM62D2-EVM serial-agent connect ...       # specify board
+SERIAL_SER2NET_CONF=/path/ser2net.yaml serial-agent start ...  # non-standard ser2net config
+# start auto-routes through ser2net when configured; --no-ser2net forces direct
 ```
