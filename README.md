@@ -206,12 +206,12 @@ serial-discover --rm-udev    # remove installed rules and session symlinks
 
 ## serial-agent
 
-Background daemon that reads serial output continuously into a ring buffer. Scripts and agents query the buffer or send commands without fighting over the port with an interactive terminal.
+Background daemon that reads serial output continuously into a ring buffer. Scripts and agents query the buffer, subscribe to a real-time output push channel (`watch`), or send commands without fighting over the port with an interactive terminal.
 
 ```bash
 serial-agent connect --board AM62D2-EVM --wait-shell   # start daemon, wait for shell prompt
 serial-agent send /dev/ttyUSB1 "uname -r" --json       # → {"output":"6.6.0","elapsed_ms":50}
-serial-agent watch /dev/ttyUSB1 --send 'reboot' --until '~#|panic' --timeout 120  # real-time push (~0.2ms match), fused send+wait
+serial-agent watch /dev/ttyUSB1 --send reboot --until '~#'  # real-time push, fused send+wait (~0.2ms)
 serial-agent reboot /dev/ttyUSB1 --setup-terminal      # reboot and wait for shell
 serial-agent upload /dev/ttyUSB1 ./driver.ko /tmp/     # file transfer over serial
 serial-agent health /dev/ttyUSB1                        # memory, load, kernel info as JSON
