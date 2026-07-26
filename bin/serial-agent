@@ -1681,28 +1681,48 @@ def cmd_alive(args):
     print(f'DEAD_OR_UNKNOWN  state={state}'); sys.exit(1)
 
 
+def _read_tail_lines(path, n):
+    """Last n lines of path, read backward from EOF so a small 'read' never pulls
+    the whole (up to 8 MB) file into memory.  Reads 64 KB chunks from the end until
+    it holds more than n newlines or reaches the start.  Returns (lines, at_start).
+    A partial leading line (chunk started mid-line) is harmless: it only exists when
+    we already hold > n lines, so the caller's [-n:] trim drops it."""
+    try:
+        with open(path, 'rb') as f:
+            f.seek(0, os.SEEK_END)
+            pos = f.tell()
+            data = b''
+            while pos > 0 and data.count(b'\n') <= n:
+                step = min(65536, pos)
+                pos -= step
+                f.seek(pos)
+                data = f.read(step) + data
+            return data.decode('utf-8', errors='replace').splitlines(), pos == 0
+    except OSError:
+        return [], True
+
+
 def cmd_read(args):
     # Source from stream.log (append-only, full retained history) so 'read
-    # --lines N' works past the 500-line buf.log ring — buf.log drops lines from
-    # the front and would silently cap large reads.  Prepend the rotated segment
-    # when the request spans an 8 MB rotation.  Fall back to buf.log only for
-    # pre-stream.log daemons.
+    # --lines N' works past the 500-line buf.log ring, walking rotated segments
+    # (stream.log.1..N) newest→oldest until it holds enough.  Tail-read each segment
+    # from EOF so a small read never loads the whole 8 MB file.  Fall back to
+    # buf.log only for pre-stream.log daemons.
     dd = devdir(args.device)
+    n = max(1, args.lines)
     stream = dd / 'stream.log'
     if stream.exists():
-        lines = stream.read_text(errors='replace').splitlines()
-        i = 1                               # walk rotated segments newest→oldest
-        while len(lines) < args.lines:
-            seg = dd / f'stream.log.{i}'
-            if not seg.exists():
-                break
-            lines = seg.read_text(errors='replace').splitlines() + lines
+        lines, _ = _read_tail_lines(stream, n)
+        i = 1
+        while len(lines) < n and (dd / f'stream.log.{i}').exists():
+            older, _ = _read_tail_lines(dd / f'stream.log.{i}', n - len(lines))
+            lines = older + lines
             i += 1
     elif (dd / 'buf.log').exists():
         lines = (dd / 'buf.log').read_text(errors='replace').splitlines()
     else:
         sys.exit(0)
-    tail = lines[-args.lines:]
+    tail = lines[-n:]
     if args.no_timestamps:
         tail = _strip_timestamps(tail)
     print('\n'.join(tail))
