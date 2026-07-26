@@ -303,6 +303,8 @@ EXITCODE_TAG  = 'SERIAL_EXITCODE'  # sentinel prefix injected by --exit-code
 DEVICE_ABSENT_POLL        = 2.0    # s between reconnect tries while the node is missing
 DEVICE_ABSENT_FAST_WINDOW = 30.0   # s of fast polling before reverting to exponential backoff
 TX_STALL_TIMEOUT          = 5.0    # s of zero TX progress before giving up on a wedged port
+STREAM_MAX_BYTES     = 8 * 1024 * 1024  # per-segment size before stream.log rotates
+STREAM_KEEP_SEGMENTS = 4                 # rotated segments kept (.1..N); retained ≈ (N+1)*8MB/device on disk
 
 # ── Patterns ───────────────────────────────────────────────────────────────────
 RE_SHELL    = re.compile(r'[\$#>]\s*$')
@@ -640,6 +642,30 @@ class Daemon:
             else:
                 select.select([], [self._fd], [], 0.5)
 
+    def _rotate_stream(self):
+        # Deepen history cheaply: drop the oldest segment, shift .{N-1..1} → .{N..2},
+        # then stream.log → .1.  Append-only + O(1) renames, so retention scales on
+        # disk without growing the per-read buf.log ring.  Names are built explicitly
+        # (NOT Path.with_suffix, which mis-parses the '.1' in 'stream.log.1').
+        dd = self.ddir
+        oldest = dd / f'stream.log.{STREAM_KEEP_SEGMENTS}'
+        try:
+            if oldest.exists():
+                oldest.unlink()
+        except OSError:
+            pass
+        for i in range(STREAM_KEEP_SEGMENTS - 1, 0, -1):
+            src = dd / f'stream.log.{i}'
+            if src.exists():
+                try:
+                    src.rename(dd / f'stream.log.{i + 1}')
+                except OSError:
+                    pass
+        try:
+            self.stream_file.rename(dd / 'stream.log.1')
+        except OSError:
+            pass
+
     def _update_state(self, text: str):
         """Update the board state machine from a chunk of received text.
 
@@ -761,14 +787,13 @@ class Daemon:
         except OSError:
             pass
         # Append the same lines to stream.log (append mode: inode is stable,
-        # so tail -f works). Rotate at 8 MB to stream.log.1 — a follower
-        # using tail -F survives the rotation.
+        # so tail -f works). Rotate at STREAM_MAX_BYTES across STREAM_KEEP_SEGMENTS
+        # numbered segments — a follower using tail -F survives the rotation.
         try:
             if new_entries:
                 if (self.stream_file.exists()
-                        and self.stream_file.stat().st_size > 8 * 1024 * 1024):
-                    self.stream_file.rename(
-                        self.stream_file.with_suffix('.log.1'))
+                        and self.stream_file.stat().st_size > STREAM_MAX_BYTES):
+                    self._rotate_stream()
                 with open(self.stream_file, 'a') as _sf:
                     _sf.write('\n'.join(new_entries) + '\n')
         except OSError:
@@ -1666,8 +1691,13 @@ def cmd_read(args):
     stream = dd / 'stream.log'
     if stream.exists():
         lines = stream.read_text(errors='replace').splitlines()
-        if len(lines) < args.lines and (dd / 'stream.log.1').exists():
-            lines = (dd / 'stream.log.1').read_text(errors='replace').splitlines() + lines
+        i = 1                               # walk rotated segments newest→oldest
+        while len(lines) < args.lines:
+            seg = dd / f'stream.log.{i}'
+            if not seg.exists():
+                break
+            lines = seg.read_text(errors='replace').splitlines() + lines
+            i += 1
     elif (dd / 'buf.log').exists():
         lines = (dd / 'buf.log').read_text(errors='replace').splitlines()
     else:
