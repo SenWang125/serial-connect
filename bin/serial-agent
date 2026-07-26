@@ -1657,10 +1657,21 @@ def cmd_alive(args):
 
 
 def cmd_read(args):
-    bf = devdir(args.device) / 'buf.log'
-    if not bf.exists():
+    # Source from stream.log (append-only, full retained history) so 'read
+    # --lines N' works past the 500-line buf.log ring — buf.log drops lines from
+    # the front and would silently cap large reads.  Prepend the rotated segment
+    # when the request spans an 8 MB rotation.  Fall back to buf.log only for
+    # pre-stream.log daemons.
+    dd = devdir(args.device)
+    stream = dd / 'stream.log'
+    if stream.exists():
+        lines = stream.read_text(errors='replace').splitlines()
+        if len(lines) < args.lines and (dd / 'stream.log.1').exists():
+            lines = (dd / 'stream.log.1').read_text(errors='replace').splitlines() + lines
+    elif (dd / 'buf.log').exists():
+        lines = (dd / 'buf.log').read_text(errors='replace').splitlines()
+    else:
         sys.exit(0)
-    lines = bf.read_text().splitlines()
     tail = lines[-args.lines:]
     if args.no_timestamps:
         tail = _strip_timestamps(tail)
