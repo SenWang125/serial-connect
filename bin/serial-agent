@@ -303,8 +303,8 @@ EXITCODE_TAG  = 'SERIAL_EXITCODE'  # sentinel prefix injected by --exit-code
 DEVICE_ABSENT_POLL        = 2.0    # s between reconnect tries while the node is missing
 DEVICE_ABSENT_FAST_WINDOW = 30.0   # s of fast polling before reverting to exponential backoff
 TX_STALL_TIMEOUT          = 5.0    # s of zero TX progress before giving up on a wedged port
-STREAM_MAX_BYTES     = 8 * 1024 * 1024  # per-segment size before stream.log rotates
-STREAM_KEEP_SEGMENTS = 4                 # rotated segments kept (.1..N); retained ≈ (N+1)*8MB/device on disk
+STREAM_MAX_BYTES     = int(os.environ.get('SERIAL_STREAM_MAX_BYTES', 8 * 1024 * 1024))  # per-segment rotate size
+STREAM_KEEP_SEGMENTS = int(os.environ.get('SERIAL_STREAM_SEGMENTS', 4))  # rotated segments kept; retained ≈ (N+1)*size/device
 
 # ── Patterns ───────────────────────────────────────────────────────────────────
 RE_SHELL    = re.compile(r'[\$#>]\s*$')
