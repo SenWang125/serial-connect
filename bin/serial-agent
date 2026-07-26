@@ -297,6 +297,12 @@ DEAD_AFTER    = 30.0     # seconds of silence before state → IDLE (EOF/connect
 IDLE_PROBE_INTERVAL = 15.0  # seconds of silence before sending a keepalive CR (must be < DEAD_AFTER)
 RUNNING_AFTER = 3.0      # seconds of output without a prompt → state = RUNNING
 EXITCODE_TAG  = 'SERIAL_EXITCODE'  # sentinel prefix injected by --exit-code
+# A local device node that vanishes (ENOENT) is almost always a transient USB
+# re-enumeration (FTDI flap / board reboot).  Poll fast for a bounded window so the
+# daemon reconnects seconds after the node returns, then fall back to slow backoff.
+DEVICE_ABSENT_POLL        = 2.0    # s between reconnect tries while the node is missing
+DEVICE_ABSENT_FAST_WINDOW = 30.0   # s of fast polling before reverting to exponential backoff
+TX_STALL_TIMEOUT          = 5.0    # s of zero TX progress before giving up on a wedged port
 
 # ── Patterns ───────────────────────────────────────────────────────────────────
 RE_SHELL    = re.compile(r'[\$#>]\s*$')
@@ -603,8 +609,36 @@ class Daemon:
     def _send_raw(self, data: bytes):
         if self._sock:
             self._sock.sendall(data)
-        elif self._fd is not None:
-            os.write(self._fd, data)
+            return
+        if self._fd is None:
+            return
+        # The device fd is O_NONBLOCK: os.write can write FEWER bytes than given
+        # (or raise EAGAIN) once the UART TX buffer fills.  The old code ignored the
+        # count and wrote once, so a fast/large/pasted command lost its tail — that
+        # dropped tail is what turns "echo start" into a mangled line on the board.
+        # Loop over the remainder, using select() to wait for the port to drain
+        # instead of busy-spinning.  The stall timer only fires after TX_STALL_TIMEOUT
+        # of *zero* progress (reset on every successful write) so a large payload
+        # drains fully while a genuinely wedged port (stuck flow control) still bails
+        # with a visible drop rather than hanging the writer thread forever.
+        mv = memoryview(data)
+        stall_deadline = now() + TX_STALL_TIMEOUT
+        while mv:
+            try:
+                n = os.write(self._fd, mv)
+            except BlockingIOError:
+                n = 0
+            except OSError:
+                return          # fd closed / device vanished — reconnect handles it
+            if n:
+                mv = mv[n:]
+                stall_deadline = now() + TX_STALL_TIMEOUT
+            elif now() > stall_deadline:
+                print(f'[serial-agent] TX stalled — dropped {len(mv)} byte(s) to '
+                      f'{self.device}', flush=True)
+                return
+            else:
+                select.select([], [self._fd], [], 0.5)
 
     def _update_state(self, text: str):
         """Update the board state machine from a chunk of received text.
@@ -966,6 +1000,7 @@ class Daemon:
         self._start_relay_if_direct()
 
         backoff = 1.0
+        _absent_since = None   # wall-clock when a local device node first went missing
         while not self._stop.is_set():
             # On-demand: park until a relay client connects.
             if on_demand and not self._relay_clients:
@@ -992,6 +1027,7 @@ class Daemon:
             try:
                 rfd = self._connect()
                 backoff = 1.0
+                _absent_since = None
                 t_connected = now()
                 _probe_sent = False
                 _t_last_idle_probe = t_connected
@@ -1107,24 +1143,44 @@ class Daemon:
                             self._stop.set()
             except (ConnectionRefusedError, OSError) as e:
                 if not _clients_gone:
-                    print(f'[serial-agent] connect error: {e} — retry in {backoff}s', flush=True)
-                    _prev = self._prev_state
-                    self.state = 'DEAD'
-                    self._prev_state = 'DEAD'
-                    self._write_status()
-                    _entry = f'[{ts()}] {_prev} → DEAD  (connect error)'
-                    try:
-                        _ex = (self.events_file.read_text().splitlines()
-                               if self.events_file.exists() else [])
-                        _ex.append(_entry)
-                        if len(_ex) > MAX_EVENTS: _ex = _ex[-MAX_EVENTS:]
-                        _etmp = self.events_file.with_suffix('.tmp')
-                        _etmp.write_text('\n'.join(_ex) + '\n')
-                        _etmp.rename(self.events_file)
-                    except OSError:
-                        pass
-                    time.sleep(backoff)
-                    backoff = min(backoff * 2, 30)
+                    # A missing local device node (ENOENT) is a transient USB
+                    # re-enumeration far more often than a real fault: poll at a
+                    # short fixed interval during an initial fast window so we
+                    # reconnect ~1 poll after the node reappears instead of up to
+                    # 30s later.  Only past the window (board powered off) do we
+                    # fall back to the exponential backoff, so a long-gone board
+                    # does not spam logs.  Real errors (refused TCP, EACCES) keep
+                    # the escalating backoff from the first failure.
+                    _absent = (not self._given_tcp
+                               and getattr(e, 'errno', None) == errno.ENOENT)
+                    if _absent and _absent_since is None:
+                        _absent_since = now()
+                    if not _absent:
+                        _absent_since = None
+                    if _absent and now() - _absent_since < DEVICE_ABSENT_FAST_WINDOW:
+                        _delay = DEVICE_ABSENT_POLL
+                    else:
+                        _delay = backoff
+                        backoff = min(backoff * 2, 30)
+                    print(f'[serial-agent] connect error: {e} — retry in {_delay}s', flush=True)
+                    # Record the DEAD transition once, not on every poll iteration.
+                    if self.state != 'DEAD':
+                        _prev = self._prev_state
+                        self.state = 'DEAD'
+                        self._prev_state = 'DEAD'
+                        self._write_status()
+                        _entry = f'[{ts()}] {_prev} → DEAD  (connect error)'
+                        try:
+                            _ex = (self.events_file.read_text().splitlines()
+                                   if self.events_file.exists() else [])
+                            _ex.append(_entry)
+                            if len(_ex) > MAX_EVENTS: _ex = _ex[-MAX_EVENTS:]
+                            _etmp = self.events_file.with_suffix('.tmp')
+                            _etmp.write_text('\n'.join(_ex) + '\n')
+                            _etmp.rename(self.events_file)
+                        except OSError:
+                            pass
+                    time.sleep(_delay)
             finally:
                 if self._sock:
                     try: self._sock.close()
