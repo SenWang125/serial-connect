@@ -277,7 +277,12 @@ probe_tty() {
         local _sf="/tmp/serial-agent/$_devname/status.json"
         local _state='UNKNOWN'
         [[ -f "$_sf" ]] && _state=$(awk -F'"' '/"state"/{print $4;exit}' "$_sf" 2>/dev/null)
-        if _state_is_live "${_state:-}"; then
+        if [[ "${_state:-}" == "FROZEN" ]]; then
+            # Board hung mid-boot: transport is fine, the board stopped talking.
+            # Distinct from DEAD (host lost the port) so a hang is not mistaken for
+            # a dead cable — the two need opposite fixes.
+            printf 'FROZEN|%s|%s\n' "$cfg_baud" "${_hostname:-}"
+        elif _state_is_live "${_state:-}"; then
             printf 'LIVE|%s|%s\n' "$cfg_baud" "${_hostname:-}"
         else
             printf 'DEAD|%s|%s\n' "$cfg_baud" "${_hostname:-}"

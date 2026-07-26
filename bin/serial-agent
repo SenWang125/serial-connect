@@ -291,9 +291,23 @@ def _resolve_board_cfg() -> Path:
 
 
 # ── Tunables ───────────────────────────────────────────────────────────────────
+def _env_int(name, default, lo):
+    # Tolerant parse: a malformed env value must never crash import for every command.
+    try:
+        return max(lo, int(os.environ[name]))
+    except (KeyError, ValueError):
+        return default
+def _env_float(name, default, lo):
+    try:
+        return max(lo, float(os.environ[name]))
+    except (KeyError, ValueError):
+        return default
+
 DEFAULT_LINES = 500      # buf.log ring buffer depth (lines)
 MAX_EVENTS    = 200      # events.log rotation threshold
-DEAD_AFTER    = 30.0     # seconds of silence before state → IDLE (EOF/connect-error still → DEAD)
+# Silence before state → QUIET/FROZEN (EOF/connect-error still → DEAD).  Env-tunable
+# mainly so the self-test can force a fast freeze without a 30s wait.
+DEAD_AFTER    = _env_float('SERIAL_DEAD_AFTER', 30.0, 0.2)
 IDLE_PROBE_INTERVAL = 15.0  # seconds of silence before sending a keepalive CR (must be < DEAD_AFTER)
 RUNNING_AFTER = 3.0      # seconds of output without a prompt → state = RUNNING
 EXITCODE_TAG  = 'SERIAL_EXITCODE'  # sentinel prefix injected by --exit-code
@@ -302,13 +316,13 @@ EXITCODE_TAG  = 'SERIAL_EXITCODE'  # sentinel prefix injected by --exit-code
 # daemon reconnects seconds after the node returns, then fall back to slow backoff.
 DEVICE_ABSENT_POLL        = 2.0    # s between reconnect tries while the node is missing
 DEVICE_ABSENT_FAST_WINDOW = 30.0   # s of fast polling before reverting to exponential backoff
+# An EOF (peer closed, not ENOENT) on a reboot flaps the node briefly; retry fast for
+# a short window so the reconnect gap that loses board output shrinks from ~1s to ~0.2s.
+RECONNECT_FAST_DELAY  = 0.2        # s between EOF-reconnect tries during the fast window
+RECONNECT_FAST_WINDOW = 8.0        # s of fast EOF retry before reverting to exponential backoff
+GAP_MARKER_MIN        = 0.3        # only annotate a reconnect gap longer than this (s)
 TX_STALL_TIMEOUT          = 5.0    # s of zero TX progress before giving up on a wedged port
-def _env_int(name, default, lo):
-    # Tolerant parse: a malformed env value must never crash import for every command.
-    try:
-        return max(lo, int(os.environ[name]))
-    except (KeyError, ValueError):
-        return default
+BOOT_DIGEST_TAIL      = 30         # lines of the boot tail always kept in a digest
 STREAM_MAX_BYTES     = _env_int('SERIAL_STREAM_MAX_BYTES', 8 * 1024 * 1024, 512)  # per-segment rotate size
 STREAM_KEEP_SEGMENTS = _env_int('SERIAL_STREAM_SEGMENTS', 4, 1)  # rotated segments kept; retained ≈ (N+1)*size/device
 
@@ -319,7 +333,36 @@ RE_LOGIN    = re.compile(r'(login|Username)\s*:\s*$', re.I)
 RE_PASSWORD = re.compile(r'(Password|passwd)\s*:\s*$', re.I)
 RE_BOOT     = re.compile(r'\[\s*\d+\.\d{3,6}\]')
 RE_UBOOT    = re.compile(r'^(=>|u-boot[#>])\s*$', re.I)   # U-Boot prompt
-RE_PANIC    = re.compile(r'Kernel panic|BUG:|OOPS:|Unable to handle kernel')
+# Hard-fault / panic conditions meaning the board is dead or frozen and needs a
+# reboot.  Cased to match real kernel/U-Boot output (the old 'OOPS:' never matched:
+# the kernel prints 'Oops:').  Kept case-sensitive to avoid flipping to PANIC on
+# benign lines like 'debug:' that a case-insensitive match would catch.
+RE_PANIC    = re.compile(
+    r'Kernel panic'
+    r'|Internal error'
+    r'|Unable to handle kernel'
+    r'|Oops'                          # 'Internal error: Oops:' / 'Oops - undefined instruction'
+    r'|BUG:'
+    r'|Call trace:'
+    r'|Unhandled fault'
+    r'|SError'
+    r'|Bad mode in'
+    r'|Synchronous External Abort'
+    r'|soft lockup|hard LOCKUP'          # the real fatal watchdog cases (not benign 'watchdog:' chatter)
+    r'|detected stalls'
+    r'|Rebooting in \d'
+    r'|Kernel offset:'
+    r'|data abort|prefetch abort'     # U-Boot aborts
+)
+# Boot-digest severity buckets — used by _boot_digest to pull the signal out of a
+# multi-thousand-line boot log.  Broader than RE_PANIC (includes recoverable
+# errors and warnings) but still skips the ordinary informational firehose.
+RE_DIG_ERR  = re.compile(
+    r'\berror\b|\bfail(ed|ure)?\b|\bfault\b|denied|refused|timeout|timed[ _-]?out'
+    r'|cannot|segfault|\babort\b|\bnack\b|out of memory|\boom\b|corrupt|panic|Oops',
+    re.I)
+RE_DIG_WARN = re.compile(r'\bwarn(ing)?\b|deprecated|not found|no such|missing|invalid',
+                         re.I)
 RE_ANSI     = re.compile(r'\x1b(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
 RE_TIMESTAMP= re.compile(r'^\[\d{2}:\d{2}:\d{2}\.\d+\] ')
 RE_EXITCODE = re.compile(rf'^{EXITCODE_TAG}:(\d+)\s*$')
@@ -508,6 +551,9 @@ class Daemon:
         self.fifo_file   = self.ddir / 'input.fifo'
         self.pid_file    = self.ddir / 'daemon.pid'
         self.events_file = self.ddir / 'events.log'
+        # Last N lines captured the moment a boot goes silent (FROZEN), so the
+        # output that preceded a mid-boot hang is never scrolled out of a small read.
+        self.frozen_file = self.ddir / 'frozen.snapshot'
         # Follower-friendly append-only stream (see _append): buf.log is a
         # ring rewritten by tmp+rename, so its inode changes on EVERY chunk
         # and tail -f/-F followers silently detach after the first byte.
@@ -540,6 +586,7 @@ class Daemon:
         self._relay_lock     = Lock()
         self._t_last_client  = 0.0   # monotonic time of last relay client connect/disconnect
         self._out_fd         = None  # lazily-opened O_WRONLY|O_NONBLOCK to output_fifo
+        self._dead_since     = 0.0   # monotonic time the port went DEAD (for reconnect-gap marker)
 
     def _connect(self):
         """Open the serial device or TCP connection and configure terminal settings.
@@ -1059,6 +1106,16 @@ class Daemon:
                 rfd = self._connect()
                 backoff = 1.0
                 _absent_since = None
+                # Reconnect-gap marker: while the port was DEAD nobody held it, so any
+                # board output in that window was lost.  Make the gap VISIBLE in the log
+                # — an agent parsing a boot otherwise cannot tell output is missing.
+                if self._dead_since:
+                    _gap = now() - self._dead_since
+                    self._dead_since = 0.0
+                    if _gap >= GAP_MARKER_MIN:
+                        self._append(
+                            f'\n<<serial-agent GAP {_gap:.1f}s — port reopened; board '
+                            f'output during this window may be lost>>\n'.encode())
                 t_connected = now()
                 _probe_sent = False
                 _t_last_idle_probe = t_connected
@@ -1082,16 +1139,18 @@ class Daemon:
                                 continue   # spurious wakeup — no data yet
                             raise
                         if not data:
-                            # EOF — device or TCP peer closed the connection.
-                            # Without a sleep here the outer loop spins at full speed
-                            # re-connecting and immediately getting EOF again.
+                            # EOF — device or TCP peer closed the connection.  A reboot
+                            # flaps the node briefly, so retry FAST for a short window
+                            # (shrinks the lost-output gap from ~1s to ~0.2s) before
+                            # falling back to exponential backoff for a genuinely gone
+                            # peer.  Without any sleep the outer loop would spin at full
+                            # speed re-connecting and immediately getting EOF again.
                             if not _clients_gone and not self._stop.is_set():
-                                print(f'[serial-agent] {self.device} disconnected (EOF) '
-                                      f'— retry in {backoff}s', flush=True)
                                 if self.state != 'DEAD':
                                     _prev = self._prev_state
                                     self.state = 'DEAD'
                                     self._prev_state = 'DEAD'
+                                    self._dead_since = now()
                                     self._write_status()
                                     _entry = f'[{ts()}] {_prev} → DEAD  (eof)'
                                     try:
@@ -1105,8 +1164,14 @@ class Daemon:
                                         _etmp.rename(self.events_file)
                                     except OSError:
                                         pass
-                                time.sleep(backoff)
-                                backoff = min(backoff * 2, 30)
+                                if now() - (self._dead_since or now()) < RECONNECT_FAST_WINDOW:
+                                    _delay = RECONNECT_FAST_DELAY
+                                else:
+                                    _delay = backoff
+                                    backoff = min(backoff * 2, 30)
+                                print(f'[serial-agent] {self.device} disconnected (EOF) '
+                                      f'— retry in {_delay}s', flush=True)
+                                time.sleep(_delay)
                             break
                         self._append(data)
                     else:
@@ -1138,21 +1203,37 @@ class Daemon:
                             self._send_raw(b'\r')
                             _t_last_idle_probe = now()
                         if self.t_output and now() - self.t_output > DEAD_AFTER:
-                            # QUIET = console silent >30s; the daemon is HEALTHY and
-                            # (in always-on mode) still holds the port.  This used to
-                            # be named IDLE, colliding with the historical parked-
-                            # daemon trap — operators force-restarted healthy daemons
-                            # every time they saw it.
-                            if self.state != 'QUIET':
+                            # Console silent > DEAD_AFTER.  Two flavours:
+                            #   FROZEN — went quiet mid-boot (BOOTING) or right after
+                            #     a panic, i.e. WITHOUT reaching a usable prompt: a
+                            #     hang.  Snapshot the last lines so the output that
+                            #     preceded the hang survives a small 'read'.
+                            #   QUIET  — a usable prompt (or unknown) sitting idle; the
+                            #     daemon is HEALTHY and still holds the port.  (Renamed
+                            #     from IDLE, which collided with the parked-daemon trap
+                            #     and got healthy daemons force-restarted.)
+                            if self.state not in ('QUIET', 'FROZEN'):
                                 _prev = self._prev_state
+                                _silent = ('FROZEN' if self.state in ('BOOTING', 'PANIC')
+                                           else 'QUIET')
                                 self.quiet_from = _prev
-                                self.state = 'QUIET'
-                                self._prev_state = 'QUIET'
+                                self.state = _silent
+                                self._prev_state = _silent
                                 self._write_status()
-                                # Write to events.log so _wait_state can detect IDLE
-                                # via inotifywait — without this, IDLE is only in
+                                if _silent == 'FROZEN':
+                                    try:
+                                        _snap = self.buf_lines[-BOOT_DIGEST_TAIL:]
+                                        self.frozen_file.write_text('\n'.join(_snap) + '\n')
+                                    except OSError:
+                                        pass
+                                    _note = (f'boot stalled — silent {DEAD_AFTER:.0f}s '
+                                             f'before a prompt; last output preserved')
+                                else:
+                                    _note = 'console silent'
+                                # Write to events.log so _wait_state can detect this
+                                # via inotifywait — without it the state is only in
                                 # status.json and _wait_state's loop never sees it.
-                                _entry = f'[{ts()}] {_prev} → QUIET  (console silent)'
+                                _entry = f'[{ts()}] {_prev} → {_silent}  ({_note})'
                                 try:
                                     _existing = (self.events_file.read_text().splitlines()
                                                  if self.events_file.exists() else [])
@@ -1199,6 +1280,7 @@ class Daemon:
                         _prev = self._prev_state
                         self.state = 'DEAD'
                         self._prev_state = 'DEAD'
+                        self._dead_since = now()
                         self._write_status()
                         _entry = f'[{ts()}] {_prev} → DEAD  (connect error)'
                         try:
@@ -1732,6 +1814,176 @@ def cmd_read(args):
     if args.no_timestamps:
         tail = _strip_timestamps(tail)
     print('\n'.join(tail))
+
+
+# ── Boot capture + digest ────────────────────────────────────────────────────
+def _stream_size(device) -> int:
+    """Byte size of the live stream.log now — snap this BEFORE a reboot to mark
+    where the boot begins.  0 if there is no stream yet."""
+    sf = devdir(device) / 'stream.log'
+    try:
+        return sf.stat().st_size if sf.exists() else 0
+    except OSError:
+        return 0
+
+
+def _read_stream_slice(device, start_offset: int) -> list:
+    """Lines written to stream.log from byte `start_offset` to EOF.
+
+    Handles the 8 MB rotation: if the file shrank below start_offset the boot
+    spanned a rotate, so fold in the previous segment (stream.log.1) too.  A boot
+    almost never exceeds one 8 MB segment, so this stays cheap in the common case.
+    """
+    dd = devdir(device)
+    sf = dd / 'stream.log'
+    if not sf.exists():
+        return []
+    try:
+        sz = sf.stat().st_size
+        with open(sf, 'rb') as f:
+            if sz >= start_offset:
+                f.seek(start_offset)
+                data = f.read()
+            else:
+                prev = dd / 'stream.log.1'          # rotated mid-boot
+                data = (prev.read_bytes() if prev.exists() else b'') + f.read()
+        return data.decode('utf-8', errors='replace').splitlines()
+    except OSError:
+        return []
+
+
+def _boot_digest(lines: list, tail: int = BOOT_DIGEST_TAIL, max_hits: int = 120):
+    """Reduce a full boot log to the lines that matter.
+
+    Returns (summary: dict, digest: list[str]).  Keeps every panic/fatal line, the
+    most recent error/warning lines (capped), and the last `tail` lines (the
+    context right before a prompt or a hang) — with '…' markers where runs of
+    ordinary output were elided, so the result stays chronological and greppable.
+    """
+    fatal_idx, err_idx, warn_idx = [], [], []
+    boot_secs = None
+    gap = False
+    for i, l in enumerate(lines):
+        body = RE_TIMESTAMP.sub('', l)
+        if '<<serial-agent GAP' in body:
+            gap = True
+        if RE_PANIC.search(body):
+            fatal_idx.append(i)
+        elif RE_DIG_ERR.search(body):
+            err_idx.append(i)
+        elif RE_DIG_WARN.search(body):
+            warn_idx.append(i)
+        m = RE_BOOT.search(body)
+        if m:
+            try:
+                boot_secs = float(m.group(0).strip('[] '))
+            except ValueError:
+                pass
+    # Fatals are always kept.  Cap the recoverable error/warning volume, keeping
+    # the most RECENT (most diagnostic for a failed boot).  Guard budget<=0: a
+    # negative slice bound (ew[-0:]) would silently keep the WHOLE list.
+    budget = max(0, max_hits - len(fatal_idx))
+    ew = sorted(err_idx + warn_idx)
+    ew = ew[-budget:] if budget > 0 else []
+    tail_idx = range(max(0, len(lines) - tail), len(lines))
+    keep = sorted(set(fatal_idx) | set(ew) | set(tail_idx))
+    digest, prev = [], -1
+    for i in keep:
+        if prev >= 0 and i > prev + 1:
+            digest.append(f'      … {i - prev - 1} lines …')
+        digest.append(_strip_ansi(lines[i]))   # keep host timestamp, drop colour
+        prev = i
+    summary = {'total_lines': len(lines), 'fatal': len(fatal_idx),
+               'errors': len(err_idx), 'warnings': len(warn_idx),
+               'boot_secs': boot_secs, 'gap': gap}
+    return summary, digest
+
+
+def _boot_capture(device, baseline, timeout, digest_lines=BOOT_DIGEST_TAIL,
+                  capture_file=None, as_json=False, quiet=False, do_wait=True):
+    """Wait for the board to reach a prompt (or hang), then slice + digest the boot.
+
+    Waits for SHELL/LOGIN/UBOOT (up), FROZEN/PANIC (hung), or timeout; reads the
+    boot slice from byte `baseline`, writes the FULL boot to `capture_file`, and
+    prints a filtered digest.  Returns a dict (also the --json payload).  Pass
+    do_wait=False when the caller already waited for the board to settle.
+    """
+    reached = (_wait_state(device, 'SHELL,LOGIN,UBOOT,FROZEN,PANIC',
+                           timeout, print_output=False) if do_wait else True)
+    sf = devdir(device) / 'status.json'
+    state = json.loads(sf.read_text()).get('state', '?') if sf.exists() else '?'
+    lines = _read_stream_slice(device, baseline)
+    summary, digest = _boot_digest(lines, tail=digest_lines)
+
+    if capture_file is None:
+        cap_dir = Path('/tmp/serial-connect-boot')
+        try:
+            cap_dir.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            cap_dir = Path('/tmp')
+        capture_file = cap_dir / f'{devname(device)}.boot.log'
+    try:
+        Path(capture_file).write_text('\n'.join(lines) + '\n')
+    except OSError:
+        capture_file = None
+
+    outcome = ('up' if state in ('SHELL', 'LOGIN', 'UBOOT')
+               else 'frozen' if state in ('FROZEN', 'PANIC') else 'timeout')
+    result = {'device': device, 'outcome': outcome, 'state': state,
+              'reached': bool(reached), **summary,
+              'capture_file': str(capture_file) if capture_file else None}
+    if as_json:
+        result['digest'] = digest
+        print(json.dumps(result))
+        return result
+    if not quiet:
+        banner = {'up':      '\033[32m✓ booted\033[0m',
+                  'frozen':  '\033[31m✗ FROZEN — board hung mid-boot\033[0m',
+                  'timeout': '\033[33m… TIMEOUT — no prompt reached\033[0m'}[outcome]
+        bt = f", kernel {summary['boot_secs']:.1f}s" if summary['boot_secs'] else ''
+        print(f"boot {device}: {banner}  (state={state}{bt}; {summary['fatal']} fatal / "
+              f"{summary['errors']} err / {summary['warnings']} warn "
+              f"in {summary['total_lines']} captured lines)")
+        if summary['gap']:
+            print('  \033[33m⚠ reconnect gap during capture — some output may be lost\033[0m')
+        print('─' * 64)
+        print('\n'.join(digest))
+        print('─' * 64)
+        if capture_file:
+            print(f'full boot log ({summary["total_lines"]} lines): {capture_file}')
+    return result
+
+
+def cmd_boot(args):
+    """Capture a boot: mark the stream, wait for the board to come up (or hang),
+    print a filtered digest + write the full boot log to a file.
+
+    Does NOT send 'reboot' by default — trigger the reset however you like (power,
+    relay, sysrq) and this captures it.  Use --reset-cmd to send a command first,
+    or 'reboot --capture' for the send-reboot-then-capture flow with auto-login.
+    """
+    device = args.device
+    if not _daemon_running(device):
+        print(f'{device}: no daemon running — start one first (serial-agent start)',
+              file=sys.stderr)
+        sys.exit(2)
+    baseline = _stream_size(device)
+    if args.reset_cmd:
+        _log_op(device, 'boot', reset_cmd=args.reset_cmd)
+        fifo = devdir(device) / 'input.fifo'
+        try:
+            fd = os.open(str(fifo), os.O_WRONLY | os.O_NONBLOCK)
+            try: os.write(fd, (args.reset_cmd + '\n').encode())
+            finally: os.close(fd)
+        except OSError:
+            pass
+    elif not args.quiet and not args.json:
+        print(f'Waiting for {device} to boot (trigger the reset now)…', file=sys.stderr)
+    result = _boot_capture(device, baseline, args.timeout,
+                           digest_lines=args.digest_lines,
+                           capture_file=args.capture_file,
+                           as_json=args.json, quiet=args.quiet)
+    sys.exit(0 if result['outcome'] == 'up' else 1)
 
 
 def _maybe_auto_login(args):
@@ -2583,6 +2835,9 @@ def cmd_reboot(args):
 
     _log_op(device, 'reboot', cmd=args.cmd)
 
+    # Mark where the boot begins in stream.log so --capture can slice+digest it.
+    _cap_baseline = _stream_size(device) if getattr(args, 'capture', False) else 0
+
     # Record wall time before sending reboot.  After the board comes back we
     # verify the shell prompt timestamp is NEWER than this — if it's older the
     # board never actually rebooted (command was ignored or came back instantly
@@ -2617,9 +2872,15 @@ def cmd_reboot(args):
             print(f'WARNING: board still at {cur} after 30s — reboot may not have executed',
                   file=sys.stderr)
 
-    # Wait for board to come back
-    target = 'SHELL,LOGIN,UBOOT' if not args.no_login else 'SHELL,UBOOT'
+    # Wait for board to come back.  FROZEN/PANIC are terminal too — reaching them
+    # means the board hung/panicked, so stop waiting immediately instead of burning
+    # the full timeout, and let the state check below report the failure.
+    target = ('SHELL,LOGIN,UBOOT' if not args.no_login else 'SHELL,UBOOT') + ',FROZEN,PANIC'
     if not _wait_state(device, target, args.timeout):
+        if getattr(args, 'capture', False):
+            _boot_capture(device, _cap_baseline, timeout=1,
+                          digest_lines=args.digest_lines, capture_file=args.capture_file,
+                          as_json=args.json, quiet=args.quiet, do_wait=False)
         sys.exit(1)  # _wait_state already printed DAEMON_DIED or TIMEOUT
 
     # Verify this is a NEW shell, not the pre-reboot one.
@@ -2648,7 +2909,11 @@ def cmd_reboot(args):
         _do_send(device, 'stty cols 220 rows 50', timeout=5)
 
     state = json.loads(sf.read_text()).get('state', '?') if sf.exists() else '?'
-    if args.json:
+    if getattr(args, 'capture', False):
+        _boot_capture(device, _cap_baseline, timeout=1,
+                      digest_lines=args.digest_lines, capture_file=args.capture_file,
+                      as_json=args.json, quiet=args.quiet, do_wait=False)
+    elif args.json:
         print(json.dumps({'state': state, 'device': device}))
     elif not args.quiet:
         print(f'Board back: state={state}')
@@ -3184,11 +3449,49 @@ def cmd_test(args):
         if cond: ok(msg)
         else:    fail(msg, detail)
 
+    # ── Unit: boot-digest + freeze/panic patterns (no hardware needed) ─────────
+    print(f'\nserial-agent self-test\n{"─"*40}')
+    print('  boot digest + patterns (unit)')
+    _panic_hits = ['Kernel panic - not syncing', 'Internal error: Oops: 96000005',
+                   'Unable to handle kernel NULL pointer dereference', 'Call trace:',
+                   'Unhandled fault: alignment', 'SError Interrupt on CPU0',
+                   'watchdog: BUG: soft lockup - CPU#0 stuck for 22s', 'data abort',
+                   'rcu: INFO: rcu_sched detected stalls on CPUs']
+    check(all(RE_PANIC.search(s) for s in _panic_hits),
+          'RE_PANIC matches real kernel/U-Boot fault strings',
+          'missed: ' + '; '.join(s for s in _panic_hits if not RE_PANIC.search(s)))
+    _panic_miss = ['Starting kernel ...', 'random: crng init done',
+                   'debug: enabling feature x', 'systemd[1]: Reached target Basic System.']
+    check(not any(RE_PANIC.search(s) for s in _panic_miss),
+          'RE_PANIC does not false-fire on benign boot lines',
+          'fired: ' + '; '.join(s for s in _panic_miss if RE_PANIC.search(s)))
+    _boot = [f'[00:00:0{i%10}.000] [    {i}.000000] init step {i}' for i in range(500)]
+    _boot[200] = '[00:00:03.000] [    3.100000] Kernel panic - not syncing: attempted to kill init!'
+    _boot[201] = '[00:00:03.000] [    3.200000] Call trace:'
+    _sum, _dig = _boot_digest(_boot, tail=10)
+    _digtext = '\n'.join(_dig)
+    check(_sum['fatal'] == 2 and 'Kernel panic' in _digtext,
+          '_boot_digest keeps every fatal line', f"fatal={_sum['fatal']}")
+    check(len(_dig) < len(_boot) and '…' in _digtext,
+          '_boot_digest elides the benign firehose', f'{len(_dig)} of {len(_boot)} lines')
+    check('init step 499' in _digtext,
+          '_boot_digest preserves the boot tail (pre-prompt / pre-freeze context)')
+    check(abs((_sum['boot_secs'] or 0) - 499.0) < 0.01,
+          '_boot_digest extracts kernel boot time', f"boot_secs={_sum['boot_secs']}")
+    _gapped = _boot + ['[00:00:05.000] <<serial-agent GAP 1.2s — port reopened; '
+                       'board output during this window may be lost>>']
+    check(_boot_digest(_gapped)[0]['gap'], '_boot_digest flags a reconnect gap')
+    # Cap regression: a flood of error lines must NOT blow up the digest (the
+    # budget<=0 slice bug kept the whole list; guard it stays bounded).
+    _noisy = [f'[00:00:00.000] error: thing {i} failed' for i in range(3000)]
+    _cap_sum, _cap_dig = _boot_digest(_noisy, tail=30, max_hits=120)
+    check(len(_cap_dig) < 400 and _cap_sum['errors'] == 3000,
+          '_boot_digest caps a flood of errors (no runaway digest)',
+          f'digest={len(_cap_dig)} lines')
+
     if not shutil.which('socat'):
         print('serial-agent test requires socat (sudo apt install socat)', file=sys.stderr)
         sys.exit(1)
-
-    print(f'\nserial-agent self-test\n{"─"*40}')
 
     # Create a temp dir for the virtual device + daemon state
     with tempfile.TemporaryDirectory(prefix='sa-test-') as td:
@@ -3519,6 +3822,57 @@ def cmd_test(args):
         if fdb2 >= 0: os.close(fdb2)
         s2proc.terminate(); s2proc.wait()
 
+    # ── Integration: FROZEN detection + snapshot ──────────────────────────────
+    # Dedicated daemon with a short DEAD_AFTER so a mid-boot silence trips FROZEN
+    # in ~1.2s instead of 30s.  Isolated (own socat pair + state dir) so the low
+    # threshold cannot disturb the other tests.
+    if shutil.which('socat'):
+        with tempfile.TemporaryDirectory(prefix='sa-frz-') as tf:
+            tf = Path(tf)
+            pa, pb = tf / 'pa', tf / 'pb'
+            fz = subprocess.Popen(
+                ['socat', f'pty,raw,echo=0,link={pa}', f'pty,raw,echo=0,link={pb}'],
+                stderr=subprocess.DEVNULL)
+            dl = time.time() + 3
+            while time.time() < dl and not (pa.exists() and pb.exists()):
+                time.sleep(0.05)
+            fenv = os.environ.copy()
+            fenv['SERIAL_AGENT_BASE'] = str(tf / 'state')
+            fenv['SERIAL_DEAD_AFTER'] = '1.2'
+            subprocess.run([sys.argv[0], 'start', str(pa), '--idle-timeout', '0'],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=fenv)
+            fdir  = Path(fenv['SERIAL_AGENT_BASE']) / pa.name
+            fpid  = fdir / 'daemon.pid'
+            dl = time.time() + 2
+            while time.time() < dl and not fpid.exists():
+                time.sleep(0.05)
+            fzsf   = fdir / 'status.json'
+            fzsnap = fdir / 'frozen.snapshot'
+            fdb = os.open(str(pb), os.O_RDWR | os.O_NONBLOCK)
+            try: os.read(fdb, 256)           # drain the startup-probe CR
+            except OSError: pass
+            # Inject a mid-boot kernel line, then go silent → should trip FROZEN.
+            os.write(fdb, b'\r\n[    1.234567] mmc0: starting card init\r\n')
+            got_frozen = False
+            dl = time.time() + 6
+            while time.time() < dl:
+                try:
+                    if json.loads(fzsf.read_text()).get('state') == 'FROZEN':
+                        got_frozen = True; break
+                except Exception:
+                    pass
+                time.sleep(0.1)
+            _fst = (json.loads(fzsf.read_text()).get('state', '?')
+                    if fzsf.exists() else '?')
+            check(got_frozen, 'mid-boot silence → state FROZEN (not QUIET)', f'state={_fst}')
+            check(got_frozen and fzsnap.exists()
+                  and 'mmc0: starting card init' in fzsnap.read_text(),
+                  'FROZEN snapshots pre-freeze output to frozen.snapshot')
+            os.close(fdb)
+            subprocess.run([sys.argv[0], 'stop', '--force', str(pa)],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=fenv)
+            fz.terminate(); fz.wait()
+
     total = passed + failed
     print(f'\n{"─"*40}')
     if failed == 0:
@@ -3712,6 +4066,24 @@ def main():
     sp.add_argument('--user',           default='root')
     sp.add_argument('--password',       default=None, help='Login password (None=skip if not prompted)')
     sp.add_argument('--setup-terminal', action='store_true', help='Run stty cols 220 after shell')
+    sp.add_argument('--quiet',          action='store_true')
+    sp.add_argument('--json',           action='store_true')
+    sp.add_argument('--capture',        action='store_true',
+                    help='After reboot, print a filtered boot digest + write the full boot log')
+    sp.add_argument('--capture-file',   metavar='PATH', default=None,
+                    help='Where to write the full boot log (default /tmp/serial-connect-boot/<dev>.boot.log)')
+    sp.add_argument('--digest-lines',   type=int, default=BOOT_DIGEST_TAIL,
+                    help=f'Boot-tail lines always kept in the digest (default {BOOT_DIGEST_TAIL})')
+
+    sp = sub.add_parser('boot',
+        help='Capture an externally-triggered boot: wait for prompt/hang, print a '
+             'digest + write the full boot log. Does NOT send reboot (use --reset-cmd).')
+    dev(sp); sp.set_defaults(func=cmd_boot)
+    sp.add_argument('--reset-cmd',      metavar='CMD', default=None,
+                    help='Send CMD first to trigger the boot (e.g. reboot); default: wait for external reset')
+    sp.add_argument('--timeout',        type=float, default=120.0)
+    sp.add_argument('--capture-file',   metavar='PATH', default=None)
+    sp.add_argument('--digest-lines',   type=int, default=BOOT_DIGEST_TAIL)
     sp.add_argument('--quiet',          action='store_true')
     sp.add_argument('--json',           action='store_true')
 
