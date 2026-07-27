@@ -3371,7 +3371,9 @@ def cmd_list(args):
         if s in ('SHELL', 'RUNNING'):   return f'{G}{s:<9}{N}'
         if s in ('UBOOT', 'BOOTING'):   return f'{Y}{s:<9}{N}'
         if s in ('LOGIN', 'PASSWORD'):  return f'{C}{s:<9}{N}'
-        if s == 'DEAD':                 return f'{R}{s:<9}{N}'
+        if s in ('DEAD', 'PANIC') or s.startswith('QUIET←PANIC'):
+            return f'{R}{s:<9}{N}'
+        if s == 'FROZEN':               return f'{Y}{s:<9}{N}'
         return f'{D}{s:<9}{N}'
     print(f'{B}{"Device":<14} {"State":<9} {"Via":<28} {"Buf":>5}  Prompt{N}')
     print('─' * 74)
@@ -3821,6 +3823,49 @@ def cmd_test(args):
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env2)
         if fdb2 >= 0: os.close(fdb2)
         s2proc.terminate(); s2proc.wait()
+
+    # ── Unit: probe_tty daemon-state mapping (QUIET/PANIC surfaced, not dead) ──
+    # Stages a fake daemon dir under /tmp/serial-agent (status.json in the
+    # daemon's real indent=2 format) and runs the real bash probe_tty against
+    # it: QUIET reached from a live state must surface as QUIET (idle board ≠
+    # dead cable), PANIC (incl. QUIET←PANIC) as PANIC; silence from UNKNOWN
+    # stays DEAD.  probe_tty output goes to a file, not a pipe — pipe capture
+    # of these subprocesses intermittently read empty in-suite.
+    print('  probe_tty state mapping (unit)')
+    _common = Path(sys.argv[0]).resolve().parent / 'serial-common.sh'
+    _fake = 'ttyFAKEPROBE0'
+    _fdir = Path('/tmp/serial-agent') / _fake
+    _fdir.mkdir(parents=True, exist_ok=True)
+    try:
+        (_fdir / 'daemon.pid').write_text(str(os.getpid()))
+        with tempfile.TemporaryDirectory(prefix='sa-probe-') as _ptd:
+            _pout = Path(_ptd) / 'probe.out'
+            for _st, _qf, _want in [
+                    ('SHELL',   '',        'LIVE'),
+                    ('BOOTING', '',        'LIVE'),
+                    ('QUIET',   'LOGIN',   'QUIET'),
+                    ('QUIET',   'SHELL',   'QUIET'),
+                    ('QUIET',   'UNKNOWN', 'DEAD'),
+                    ('QUIET',   'PANIC',   'PANIC'),
+                    ('PANIC',   'PANIC',   'PANIC'),
+                    ('FROZEN',  'BOOTING', 'FROZEN'),
+                    ('UNKNOWN', '',        'DEAD')]:
+                (_fdir / 'status.json').write_text(json.dumps(
+                    {'quiet_from': _qf, 'state': _st, 'prompt_text': 'x'},
+                    indent=2))
+                _pr = subprocess.run(
+                    ['bash', '-c',
+                     f'source "{_common}"; '
+                     f'probe_tty /dev/{_fake} 115200 > "{_pout}"'],
+                    capture_output=True, text=True, timeout=10)
+                _out = _pout.read_text().strip() if _pout.exists() else ''
+                _got = (_out.split('|') or [''])[0]
+                check(_got == _want,
+                      f'probe_tty: state={_st} quiet_from={_qf or "-"} → {_want}',
+                      f'got {_out!r} rc={_pr.returncode} '
+                      f'err={_pr.stderr.strip()[:160]!r}')
+    finally:
+        shutil.rmtree(_fdir, ignore_errors=True)
 
     # ── Integration: FROZEN detection + snapshot ──────────────────────────────
     # Dedicated daemon with a short DEAD_AFTER so a mid-boot silence trips FROZEN

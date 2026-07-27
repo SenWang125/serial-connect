@@ -84,7 +84,8 @@ if [[ "${1:-}" == "--tmp-udev" ]]; then
     declare -A _tseen
     for i in "${!DEVS[@]}"; do
         IFS='|' read -r raw _ _ < "$PROBE_DIR/${DEVS[$i]##*/}" 2>/dev/null || raw=""
-        [[ "$raw" != "LIVE" && "$raw" != "OPEN" ]] && continue
+        # QUIET/FROZEN/PANIC also prove a real console — the daemon holds the port.
+        case "$raw" in LIVE|OPEN|QUIET|FROZEN|PANIC) ;; *) continue ;; esac
         label="${LABELS[$i]}"; [[ -z "$label" ]] && continue
         ser="${SERS[$i]}"; ifn="${IFNS[$i]}"
         [[ -n "${_tseen[$ser:$ifn]+x}" ]] && continue; _tseen["$ser:$ifn"]=1
@@ -140,7 +141,9 @@ for i in "${_disp_order[@]}"; do
     case "$state" in
         LIVE)   sym="${GREEN}★${NC}"; dc="$NC";   sc="$GREEN"  ;;
         OPEN)   sym="${CYAN}⊙${NC}";  dc="$CYAN"; sc="$CYAN"   ;;
+        QUIET)  sym="${GREEN}◌${NC}"; dc="$NC";   sc="$GREEN"  ;;
         FROZEN) sym="${YELLOW}❄${NC}"; dc="$YELLOW"; sc="$YELLOW" ;;
+        PANIC)  sym="${RED}☠${NC}";   dc="$RED";  sc="$RED"    ;;
         dead)   sym=" ";              dc="$DIM";  sc="$DIM"    ;;
         FAIL)   sym="${RED}✗${NC}";   dc="$RED";  sc="$RED"    ;;
     esac
@@ -148,7 +151,7 @@ for i in "${_disp_order[@]}"; do
     _render_board_chip "$ser" "$chip" "$board_w" "$chip_w"
 
     baud_col=""
-    [[ "$state" == "LIVE" || "$state" == "OPEN" ]] && baud_col=$(baud_display "$baud")
+    [[ "$state" == "LIVE" || "$state" == "OPEN" || "$state" == "QUIET" ]] && baud_col=$(baud_display "$baud")
     [[ -n "$alias" ]] && baud_col+="${baud_col:+ }${CYAN}→${alias}${NC}"
 
     printf "  %b  %b%-${dev_w}s${NC}  %b%-6s${NC}    %s  %s  %-5s  %b\n" \
@@ -158,7 +161,7 @@ done
 
 (( ${#DEVS[@]} == 0 )) && echo -e "${RED}No serial devices found.${NC}"
 echo ""
-printf "  ${GREEN}★ LIVE${NC}    ${CYAN}⊙ OPEN${NC}    ${YELLOW}❄ FROZEN${NC}    ${RED}✗ FAIL${NC}    ${DIM}  dead${NC}\n"
+printf "  ${GREEN}★ LIVE${NC}    ${CYAN}⊙ OPEN${NC}    ${GREEN}◌ QUIET${NC}    ${YELLOW}❄ FROZEN${NC}    ${RED}☠ PANIC${NC}    ${RED}✗ FAIL${NC}    ${DIM}  dead${NC}\n"
 echo -e "  ${DIM}Config: ${BOARD_CFG}${NC}"
 
 [[ "${1:-}" != "--gen-udev" ]] && exit 0
@@ -184,7 +187,7 @@ echo "# Live/open multi-port interfaces"
 declare -A _seen
 for i in "${!DEVS[@]}"; do
     IFS='|' read -r raw _ _ < "$PROBE_DIR/${DEVS[$i]##*/}" 2>/dev/null || raw=""
-    [[ "$raw" != "LIVE" && "$raw" != "OPEN" ]] && continue
+    case "$raw" in LIVE|OPEN|QUIET|FROZEN|PANIC) ;; *) continue ;; esac
     vid="${VIDS[$i]}"; pid="${PIDS[$i]}"; ser="${SERS[$i]}"; ifn="${IFNS[$i]}"
     vp="${vid}:${pid}"
     case "$vp" in "10c4:ea60"|"1a86:7523"|"0403:6001") continue ;; esac

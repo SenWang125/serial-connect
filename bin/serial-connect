@@ -315,15 +315,9 @@ elif [[ -f "$CACHE_FILE" ]]; then
             _da=0; _agent_is_alive "$_dn" _da
             if (( _da && !_lock_live )); then
                 # Daemon holds device as observer, no human session: report board state.
-                local _sf="/tmp/serial-agent/$_dn/status.json"
-                local _ds='UNKNOWN'
-                [[ -f "$_sf" ]] && _ds=$(awk -F'"' '/"state"/{print $4;exit}' "$_sf" 2>/dev/null)
                 _agent_hostname "$_dn" _bid
-                if _state_is_live "${_ds:-}"; then
-                    printf 'LIVE|%s|%s\n' "${_baud:-${BAUDS[$i]}}" "${_bid:-}" > "$_pf"
-                else
-                    printf 'DEAD|%s|%s\n' "${_baud:-${BAUDS[$i]}}" "${_bid:-}" > "$_pf"
-                fi
+                local _ds; _daemon_board_state "$_dn" _ds
+                printf '%s|%s|%s\n' "$_ds" "${_baud:-${BAUDS[$i]}}" "${_bid:-}" > "$_pf"
             else
                 [[ -z "$_bid" ]] && _agent_hostname "$_dn" _bid
                 printf 'OPEN|%s|%s\n' "${_baud:-${BAUDS[$i]}}" "$_bid" > "$_pf"
@@ -348,7 +342,7 @@ elif [[ -f "$CACHE_FILE" ]]; then
     for i in "${!DEVS[@]}"; do
         ser="${SERS[$i]}"
         read -r result < "$PROBE_DIR/${DEVS[$i]##*/}" 2>/dev/null || result=""
-        [[ "$result" =~ ^(LIVE|OPEN)\| ]] && _recog[$ser]=1
+        [[ "$result" =~ ^(LIVE|OPEN|QUIET|FROZEN|PANIC)\| ]] && _recog[$ser]=1
         # REPROBE_DEAD=0: skip re-probing dead serials, but never skip stale-OPEN
         # ports — they must be re-probed regardless of their serial's other states.
         if (( !REPROBE_DEAD )) && [[ "$result" =~ ^(DEAD|FAIL)\| ]] \
@@ -416,17 +410,18 @@ if [[ "${1:-}" == "--label" ]]; then
             IFS='|' read -r _rj _bj _idj _ < "$PROBE_DIR/${DEVS[$j]##*/}" 2>/dev/null \
                 || { _rj='FAIL'; _bj=''; _idj=''; }
             [[ -z "$_rj" || "$_rj" == "DEAD" ]] && _rj="dead"
-            if [[ "$_rj" == "LIVE" || "$_rj" == "OPEN" ]]; then
+            if [[ "$_rj" == "LIVE" || "$_rj" == "OPEN" || "$_rj" == "QUIET" ]]; then
                 _r="$_rj"
                 [[ -n "$_idj" ]] && _probed="$_idj"
                 break
             fi
         done
         case "$_r" in
-            LIVE) _sym="${GREEN}★${NC}" ;;
-            OPEN) _sym="${CYAN}⊙${NC}"  ;;
-            dead) _sym=" "              ;;
-            *)    _sym="${RED}✗${NC}"   ;;
+            LIVE)  _sym="${GREEN}★${NC}" ;;
+            OPEN)  _sym="${CYAN}⊙${NC}"  ;;
+            QUIET) _sym="${GREEN}◌${NC}" ;;
+            dead)  _sym=" "              ;;
+            *)     _sym="${RED}✗${NC}"   ;;
         esac
         _suggested="${_cur:-${_probed}}"
         printf "  %b  %s - %s\n" "$_sym" "${CHIPS[$i]}" "${_lbl_ports[$ser]}"
@@ -501,10 +496,13 @@ for i in "${_disp_order[@]}"; do
     ROW_DEV[$row]="$dev"; ROW_BAUD[$row]="$baud"; ROW_STATE[$row]="$state"
     ROW_BY_CHIPPORT["${DEVICE_IDX[$ser]:-0}-p${PORT_IDX[$dev]:-0}"]=$row
     case "$state" in
-        LIVE) sym="${GREEN}★${NC}"; dc="$NC";  sc="${GREEN}"; pc="$NC"  ;;
-        OPEN) sym="${CYAN}⊙${NC}";  dc="$NC";  sc="${CYAN}";  pc="$NC"  ;;
-        dead) sym=" ";             dc="$DIM"; sc="$DIM";    pc="$DIM" ;;
-        FAIL) sym="${RED}✗${NC}";  dc="$DIM"; sc="${RED}";   pc="$DIM" ;;
+        LIVE)   sym="${GREEN}★${NC}";  dc="$NC";     sc="${GREEN}";  pc="$NC"  ;;
+        OPEN)   sym="${CYAN}⊙${NC}";   dc="$NC";     sc="${CYAN}";   pc="$NC"  ;;
+        QUIET)  sym="${GREEN}◌${NC}";  dc="$NC";     sc="${GREEN}";  pc="$NC"  ;;
+        FROZEN) sym="${YELLOW}❄${NC}"; dc="$YELLOW"; sc="${YELLOW}"; pc="$DIM" ;;
+        PANIC)  sym="${RED}☠${NC}";    dc="$RED";    sc="${RED}";    pc="$DIM" ;;
+        dead)   sym=" ";              dc="$DIM";    sc="$DIM";      pc="$DIM" ;;
+        FAIL)   sym="${RED}✗${NC}";   dc="$DIM";    sc="${RED}";    pc="$DIM" ;;
     esac
     board_name="${BOARD_ID[$ser]:-}"
     [[ -z "$board_name" ]] && { ser_disp="${ser}"; (( ${#ser} > 12 )) && ser_disp="${ser:0:10}"; board_name="${chip}-${ser_disp}"; }
@@ -515,7 +513,7 @@ for i in "${_disp_order[@]}"; do
         board_col="${DIM}$(printf "%-${board_w}s" "$board_name")${NC}"
         chip_col="${DIM}$(printf "%-${chip_w}s" "$chip")${NC}"
     fi
-    baud_col=""; [[ "$state" == "LIVE" || "$state" == "OPEN" ]] && baud_col=$(baud_display "$baud")
+    baud_col=""; [[ "$state" == "LIVE" || "$state" == "OPEN" || "$state" == "QUIET" ]] && baud_col=$(baud_display "$baud")
     printf "  %b  %b%3d)${NC}  %b%-${dev_w}s${NC}  %b%-6s${NC}    %s  %s  %b%-5s${NC}  %s\n" \
         "$sym" "$BOLD" "$row" "$dc" "$devname" "$sc" "$state" \
         "$board_col" "$chip_col" "$pc" "${DEVICE_IDX[$ser]:-0}-p${PORT_IDX[$dev]:-0}" "$baud_col"
@@ -524,7 +522,7 @@ done
 
 total=$(( row - 1 ))
 echo ""
-printf "  ${GREEN}★ LIVE${NC}    ${CYAN}⊙ OPEN${NC}    ${RED}✗ FAIL${NC}    ${DIM}  dead${NC}\n"
+printf "  ${GREEN}★ LIVE${NC}    ${CYAN}⊙ OPEN${NC}    ${GREEN}◌ QUIET${NC}    ${YELLOW}❄ FROZEN${NC}    ${RED}☠ PANIC${NC}    ${RED}✗ FAIL${NC}    ${DIM}  dead${NC}\n"
 echo -e "  use ${DIM}serial-discover${NC}             to force a fresh probe"
 echo -e "  use ${DIM}serial-discover --gen-udev${NC}  for stable port names across reboots"
 echo -e "  use ${DIM}serial-discover --tmp-udev${NC}  for stable port names current session"

@@ -58,9 +58,39 @@ declare -A _PROBE_TIMEOUTS=()
 
 # Daemon states that mean "board is alive" for display purposes. Single
 # source of truth — probe_tty() and serial-connect's reconciliation block
-# both call _state_is_live() instead of keeping their own copy of this list.
-DAEMON_LIVE_STATES=" SHELL RUNNING UBOOT LOGIN PASSWORD BOOTING IDLE "
+# both call _daemon_board_state() instead of keeping their own copy of the
+# state mapping.  (IDLE is deliberately absent: it was renamed QUIET, and
+# silence is classified via quiet_from, not blanket-treated as live.)
+DAEMON_LIVE_STATES=" SHELL RUNNING UBOOT LOGIN PASSWORD BOOTING "
 _state_is_live() { [[ "$DAEMON_LIVE_STATES" == *" $1 "* ]]; }
+
+# ── _daemon_board_state ────────────────────────────────────────────────────────
+# Map a daemon's status.json to a probe state.
+# Usage: _daemon_board_state DEVNAME OUTVAR
+#   FROZEN — board hung mid-boot          PANIC — kernel panicked/oopsed
+#   QUIET  — idle but healthy (silence that began from a live state)
+#   LIVE   — in a live state now          DEAD  — everything else, incl.
+#            silence from UNKNOWN (the board never spoke on this port).
+# FROZEN/PANIC/QUIET mean the transport is fine — kept distinct from DEAD so
+# a hung or idle board is never mistaken for a dead cable.
+_daemon_board_state() {
+    local _sf="/tmp/serial-agent/$1/status.json" _st='' _qf=''
+    [[ -f "$_sf" ]] || _sf="$HOME/var/serial-agent/$1/status.json"
+    if [[ -f "$_sf" ]]; then
+        _st=$(awk -F'"' '/"state"/{print $4;exit}' "$_sf" 2>/dev/null)
+        _qf=$(awk -F'"' '/"quiet_from"/{print $4;exit}' "$_sf" 2>/dev/null)
+    fi
+    local _bs='DEAD'
+    case "$_st" in
+        FROZEN) _bs='FROZEN' ;;
+        PANIC)  _bs='PANIC'  ;;
+        QUIET)  if [[ "$_qf" == 'PANIC' ]]; then _bs='PANIC'
+                elif _state_is_live "$_qf"; then _bs='QUIET'
+                fi ;;
+        *)      _state_is_live "$_st" && _bs='LIVE' ;;
+    esac
+    printf -v "$2" '%s' "$_bs"
+}
 
 # ── parse_baud ─────────────────────────────────────────────────────────────────
 # Convert human-readable baud string to integer: 1.5M→1500000, 115.2K→115200
@@ -274,19 +304,8 @@ probe_tty() {
         # a force-close.  Instead, report the board's actual state from the daemon's
         # last-known status so the port shows LIVE/DEAD and is directly connectable.
         local _hostname; _agent_hostname "$_devname" _hostname
-        local _sf="/tmp/serial-agent/$_devname/status.json"
-        local _state='UNKNOWN'
-        [[ -f "$_sf" ]] && _state=$(awk -F'"' '/"state"/{print $4;exit}' "$_sf" 2>/dev/null)
-        if [[ "${_state:-}" == "FROZEN" ]]; then
-            # Board hung mid-boot: transport is fine, the board stopped talking.
-            # Distinct from DEAD (host lost the port) so a hang is not mistaken for
-            # a dead cable — the two need opposite fixes.
-            printf 'FROZEN|%s|%s\n' "$cfg_baud" "${_hostname:-}"
-        elif _state_is_live "${_state:-}"; then
-            printf 'LIVE|%s|%s\n' "$cfg_baud" "${_hostname:-}"
-        else
-            printf 'DEAD|%s|%s\n' "$cfg_baud" "${_hostname:-}"
-        fi
+        local _bstate; _daemon_board_state "$_devname" _bstate
+        printf '%s|%s|%s\n' "$_bstate" "$cfg_baud" "${_hostname:-}"
         return
     fi
     # No daemon running: fuser check (catches non-daemon holders), then direct probe.
