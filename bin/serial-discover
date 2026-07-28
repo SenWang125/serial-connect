@@ -135,6 +135,8 @@ for i in "${_disp_order[@]}"; do
 
     IFS='|' read -r raw probe_baud _ < "$PROBE_DIR/$devname" 2>/dev/null || { raw='FAIL'; probe_baud=''; }
     [[ -z "$raw" || "$raw" == "DEAD" ]] && state="dead" || state="$raw"
+    # hung or panicked = not usable; surface as one FAIL, not two separate statuses
+    [[ "$state" == "FROZEN" || "$state" == "PANIC" ]] && state="FAIL"
     [[ "$state" == "LIVE" && "$probe_baud" =~ ^[0-9]+$ ]] && baud="$probe_baud"
 
     alias="${_dev_alias[$dev]:-}"
@@ -142,8 +144,6 @@ for i in "${_disp_order[@]}"; do
         LIVE)   sym="${GREEN}★${NC}"; dc="$NC";   sc="$GREEN"  ;;
         OPEN)   sym="${CYAN}⊙${NC}";  dc="$CYAN"; sc="$CYAN"   ;;
         QUIET)  sym="${GREEN}◌${NC}"; dc="$NC";   sc="$GREEN"  ;;
-        FROZEN) sym="${YELLOW}❄${NC}"; dc="$YELLOW"; sc="$YELLOW" ;;
-        PANIC)  sym="${RED}☠${NC}";   dc="$RED";  sc="$RED"    ;;
         dead)   sym=" ";              dc="$DIM";  sc="$DIM"    ;;
         FAIL)   sym="${RED}✗${NC}";   dc="$RED";  sc="$RED"    ;;
     esac
@@ -161,7 +161,7 @@ done
 
 (( ${#DEVS[@]} == 0 )) && echo -e "${RED}No serial devices found.${NC}"
 echo ""
-printf "  ${GREEN}★ LIVE${NC}    ${CYAN}⊙ OPEN${NC}    ${GREEN}◌ QUIET${NC}    ${YELLOW}❄ FROZEN${NC}    ${RED}☠ PANIC${NC}    ${RED}✗ FAIL${NC}    ${DIM}  dead${NC}\n"
+printf "  ${GREEN}★ LIVE${NC}    ${CYAN}⊙ OPEN${NC}    ${GREEN}◌ QUIET${NC}    ${RED}✗ FAIL${NC}    ${DIM}  dead${NC}\n"
 echo -e "  ${DIM}Config: ${BOARD_CFG}${NC}"
 
 [[ "${1:-}" != "--gen-udev" ]] && exit 0

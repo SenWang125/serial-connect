@@ -1214,7 +1214,13 @@ class Daemon:
                             #     and got healthy daemons force-restarted.)
                             if self.state not in ('QUIET', 'FROZEN'):
                                 _prev = self._prev_state
-                                _silent = ('FROZEN' if self.state in ('BOOTING', 'PANIC')
+                                # FROZEN = genuine mid-boot hang (never reached a prompt)
+                                # or panic; a board that DID show a prompt then went silent
+                                # is just idle → QUIET, even if a late boot line flipped
+                                # state back to BOOTING.
+                                _silent = ('FROZEN'
+                                           if self.state == 'PANIC'
+                                           or (self.state == 'BOOTING' and self.t_prompt == 0.0)
                                            else 'QUIET')
                                 self.quiet_from = _prev
                                 self.state = _silent
@@ -3917,6 +3923,62 @@ def cmd_test(args):
             subprocess.run([sys.argv[0], 'stop', '--force', str(pa)],
                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=fenv)
             fz.terminate(); fz.wait()
+
+    # ── Regression: prompt-then-silent → QUIET, not false FROZEN ──────────────
+    # The ttyUSB1 case: board reached a shell prompt, a late boot-ish line flipped
+    # state back to BOOTING, then it went idle.  Must classify QUIET (healthy idle),
+    # not FROZEN — a prompt was seen, so it is not a mid-boot hang.
+    if shutil.which('socat'):
+        with tempfile.TemporaryDirectory(prefix='sa-qui-') as tf:
+            tf = Path(tf)
+            pa, pb = tf / 'pa', tf / 'pb'
+            qz = subprocess.Popen(
+                ['socat', f'pty,raw,echo=0,link={pa}', f'pty,raw,echo=0,link={pb}'],
+                stderr=subprocess.DEVNULL)
+            dl = time.time() + 3
+            while time.time() < dl and not (pa.exists() and pb.exists()):
+                time.sleep(0.05)
+            qenv = os.environ.copy()
+            qenv['SERIAL_AGENT_BASE'] = str(tf / 'state')
+            qenv['SERIAL_DEAD_AFTER'] = '1.2'
+            subprocess.run([sys.argv[0], 'start', str(pa), '--idle-timeout', '0'],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=qenv)
+            qdir = Path(qenv['SERIAL_AGENT_BASE']) / pa.name
+            qpid = qdir / 'daemon.pid'
+            dl = time.time() + 2
+            while time.time() < dl and not qpid.exists():
+                time.sleep(0.05)
+            qsf = qdir / 'status.json'
+            qdb = os.open(str(pb), os.O_RDWR | os.O_NONBLOCK)
+            try: os.read(qdb, 256)           # drain the startup-probe CR
+            except OSError: pass
+            # Reach a shell prompt (sets t_prompt), then emit a late boot line
+            # that flips state back to BOOTING, then go silent.
+            os.write(qdb, b'\r\nroot@testboard:~# ')
+            dl = time.time() + 4
+            while time.time() < dl:
+                try:
+                    if json.loads(qsf.read_text()).get('state') == 'SHELL': break
+                except Exception: pass
+                time.sleep(0.05)
+            os.write(qdb, b'\r\n[    2.345678] mmc0: re-tuning failed\r\n')
+            got_quiet = False
+            dl = time.time() + 6
+            while time.time() < dl:
+                try:
+                    if json.loads(qsf.read_text()).get('state') == 'QUIET':
+                        got_quiet = True; break
+                except Exception: pass
+                time.sleep(0.1)
+            _qst = (json.loads(qsf.read_text()).get('state', '?')
+                    if qsf.exists() else '?')
+            check(got_quiet,
+                  'prompt-then-BOOTING silence → QUIET (not false FROZEN)',
+                  f'state={_qst}')
+            os.close(qdb)
+            subprocess.run([sys.argv[0], 'stop', '--force', str(pa)],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=qenv)
+            qz.terminate(); qz.wait()
 
     total = passed + failed
     print(f'\n{"─"*40}')

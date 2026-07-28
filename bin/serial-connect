@@ -490,6 +490,8 @@ for i in "${_disp_order[@]}"; do
     prev_ser="$ser"
     IFS='|' read -r raw probe_baud _ < "$PROBE_DIR/$devname" 2>/dev/null || { raw='FAIL'; probe_baud=''; }
     [[ -z "$raw" || "$raw" == "DEAD" ]] && state="dead" || state="$raw"
+    # hung or panicked = not usable; surface as one FAIL, not two separate statuses
+    [[ "$state" == "FROZEN" || "$state" == "PANIC" ]] && state="FAIL"
     if [[ "$state" == "LIVE" && "$probe_baud" =~ ^[0-9]+$ ]]; then
         baud="$probe_baud"
     fi
@@ -499,8 +501,6 @@ for i in "${_disp_order[@]}"; do
         LIVE)   sym="${GREEN}★${NC}";  dc="$NC";     sc="${GREEN}";  pc="$NC"  ;;
         OPEN)   sym="${CYAN}⊙${NC}";   dc="$NC";     sc="${CYAN}";   pc="$NC"  ;;
         QUIET)  sym="${GREEN}◌${NC}";  dc="$NC";     sc="${GREEN}";  pc="$NC"  ;;
-        FROZEN) sym="${YELLOW}❄${NC}"; dc="$YELLOW"; sc="${YELLOW}"; pc="$DIM" ;;
-        PANIC)  sym="${RED}☠${NC}";    dc="$RED";    sc="${RED}";    pc="$DIM" ;;
         dead)   sym=" ";              dc="$DIM";    sc="$DIM";      pc="$DIM" ;;
         FAIL)   sym="${RED}✗${NC}";   dc="$DIM";    sc="${RED}";    pc="$DIM" ;;
     esac
@@ -522,7 +522,7 @@ done
 
 total=$(( row - 1 ))
 echo ""
-printf "  ${GREEN}★ LIVE${NC}    ${CYAN}⊙ OPEN${NC}    ${GREEN}◌ QUIET${NC}    ${YELLOW}❄ FROZEN${NC}    ${RED}☠ PANIC${NC}    ${RED}✗ FAIL${NC}    ${DIM}  dead${NC}\n"
+printf "  ${GREEN}★ LIVE${NC}    ${CYAN}⊙ OPEN${NC}    ${GREEN}◌ QUIET${NC}    ${RED}✗ FAIL${NC}    ${DIM}  dead${NC}\n"
 echo -e "  use ${DIM}serial-discover${NC}             to force a fresh probe"
 echo -e "  use ${DIM}serial-discover --gen-udev${NC}  for stable port names across reboots"
 echo -e "  use ${DIM}serial-discover --tmp-udev${NC}  for stable port names current session"
