@@ -68,11 +68,14 @@ _state_is_live() { [[ "$DAEMON_LIVE_STATES" == *" $1 "* ]]; }
 # Map a daemon's status.json to a probe state.
 # Usage: _daemon_board_state DEVNAME OUTVAR
 #   FROZEN — board hung mid-boot          PANIC — kernel panicked/oopsed
-#   QUIET  — idle but healthy (silence that began from a live state)
-#   LIVE   — in a live state now          DEAD  — everything else, incl.
-#            silence from UNKNOWN (the board never spoke on this port).
-# FROZEN/PANIC/QUIET mean the transport is fine — kept distinct from DEAD so
-# a hung or idle board is never mistaken for a dead cable.
+#   LIVE   — in a live state now, or idle-but-healthy silence that began
+#            from a live state (daemon's QUIET)
+#   DEAD   — everything else, incl. silence from UNKNOWN (the board never
+#            spoke on this port).
+# FROZEN/PANIC mean the transport is fine — kept distinct from DEAD so a
+# hung board is never mistaken for a dead cable. Idle-but-healthy silence
+# collapses into LIVE here: display only distinguishes LIVE/OPEN/FAIL/dead —
+# the daemon's own QUIET/quiet_from stays internal to serial-agent.
 _daemon_board_state() {
     local _sf="/tmp/serial-agent/$1/status.json" _st='' _qf=''
     [[ -f "$_sf" ]] || _sf="$HOME/var/serial-agent/$1/status.json"
@@ -85,7 +88,7 @@ _daemon_board_state() {
         FROZEN) _bs='FROZEN' ;;
         PANIC)  _bs='PANIC'  ;;
         QUIET)  if [[ "$_qf" == 'PANIC' ]]; then _bs='PANIC'
-                elif _state_is_live "$_qf"; then _bs='QUIET'
+                elif _state_is_live "$_qf"; then _bs='LIVE'
                 fi ;;
         *)      _state_is_live "$_st" && _bs='LIVE' ;;
     esac
