@@ -489,8 +489,8 @@ for i in "${_disp_order[@]}"; do
     prev_ser="$ser"
     IFS='|' read -r raw probe_baud _ < "$PROBE_DIR/$devname" 2>/dev/null || { raw='FAIL'; probe_baud=''; }
     [[ -z "$raw" || "$raw" == "DEAD" ]] && state="dead" || state="$raw"
-    # hung or panicked = not usable; fold into dead, not a separate status
-    [[ "$state" == "FROZEN" || "$state" == "PANIC" ]] && state="dead"
+    # hung or panicked = not usable; surface as one FAIL, not two separate statuses
+    [[ "$state" == "FROZEN" || "$state" == "PANIC" ]] && state="FAIL"
     if [[ "$state" == "LIVE" && "$probe_baud" =~ ^[0-9]+$ ]]; then
         baud="$probe_baud"
     fi
