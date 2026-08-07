@@ -1538,6 +1538,38 @@ def _daemon_running(device: str) -> bool:
     return b'serial-agent' in cmdline
 
 
+def _is_agent_pid(pid: int) -> bool:
+    """True if pid is a serial-agent daemon (not tio/ser2net/cat/a shell)."""
+    try:
+        return b'serial-agent' in Path(f'/proc/{pid}/cmdline').read_bytes()
+    except OSError:
+        return False
+
+
+def _is_real_serial(device: str) -> bool:
+    """True for a physical UART. A pty's 'holder' may be the master side of a
+    bridge (socat pty,link=), so fuser cannot prove a read conflict there."""
+    return bool(re.match(r'^/dev/tty(USB|ACM|S|AMA)\d+$', device))
+
+
+def _device_holders(device: str) -> list:
+    """PIDs holding the tty open, excluding this process. Empty if fuser is absent."""
+    import subprocess
+    try:
+        r = subprocess.run(['fuser', device], capture_output=True, text=True)
+    except FileNotFoundError:
+        return []
+    out = []
+    for p in r.stdout.split():
+        try:
+            pid = int(p)
+        except ValueError:
+            continue
+        if pid != os.getpid():
+            out.append(pid)
+    return out
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # CLI commands
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1572,12 +1604,6 @@ def cmd_start(args):
         else:
             print(f"ALREADY  daemon running for {args.device}")
         return
-    # Remove CONTROL files so an old daemon can't steal commands. buf.log is
-    # deliberately kept: it is pure output history, the new daemon preloads it
-    # into its ring so board context survives restarts (it used to be wiped,
-    # which destroyed history at every restart and broke debugging sessions).
-    for stale in ('status.json', 'daemon.pid', 'input.fifo', 'output.fifo', 'events.log'):
-        (ddir / stale).unlink(missing_ok=True)
 
     # Fully leverage ser2net when available: if it is configured for this device
     # (and neither --tcp nor --no-ser2net was given), route through it — network /
@@ -1591,6 +1617,40 @@ def cmd_start(args):
             _h, _p = _s2.rsplit(':', 1)
             tcp = (_h, int(_p))
             print(f"ser2net configured for {args.device} at {_s2} — routing through it")
+
+    # daemon.pid is not proof: it gets deleted by hand (the documented restart
+    # recipe does exactly that) while the old daemon lives on.  Two daemons then
+    # read() the same tty, each byte reaches only one of them, and the console
+    # shows roughly every other character.  Check the device, not the file.
+    # One daemon owns the tty; sharing happens above it, on the relay/fifo.
+    if tcp is None:
+        holders = _device_holders(args.device)
+        orphan = next((p for p in holders if _is_agent_pid(p)), None)
+        if orphan is not None:
+            ddir.mkdir(parents=True, exist_ok=True)
+            (ddir / 'daemon.pid').write_text(str(orphan))
+            print(f"ADOPTED  orphaned daemon PID {orphan} for {args.device} "
+                  f"— daemon.pid restored, no second daemon started")
+            return
+        if holders:
+            who = ', '.join(map(str, holders))
+            if _is_real_serial(args.device):
+                print(f"REFUSED  {args.device} is already held by PID(s) {who} — a "
+                      f"second reader would split the byte stream.\n"
+                      f"         serial-agent stop {args.device} --force",
+                      file=sys.stderr)
+                sys.exit(1)
+            print(f"WARNING  {args.device} is already held by PID(s) {who}",
+                  file=sys.stderr)
+
+    # Remove CONTROL files so an old daemon can't steal commands. buf.log is
+    # deliberately kept: it is pure output history, the new daemon preloads it
+    # into its ring so board context survives restarts (it used to be wiped,
+    # which destroyed history at every restart and broke debugging sessions).
+    # Runs only once we know no live daemon owns the device — wiping first would
+    # strip a still-running orphan of its status.json and fifos.
+    for stale in ('status.json', 'daemon.pid', 'input.fifo', 'output.fifo', 'events.log'):
+        (ddir / stale).unlink(missing_ok=True)
 
     pid = os.fork()
     if pid:
@@ -3356,15 +3416,18 @@ def cmd_list(args):
             os.kill(int(pf.read_text().strip()), 0)
         except (OSError, ValueError):
             continue
-        state = via = '?'; buf_lines = 0; prompt = ''
+        state = via = '?'; buf_lines = 0; prompt = ''; dev_path = f'/dev/{ddir.name}'
         if sf.exists():
             try:
                 s = json.loads(sf.read_text())
                 state = s.get('state','?'); via = s.get('via','?')
+                dev_path = s.get('device', dev_path)
                 if state == 'QUIET' and s.get('quiet_from'):
                     state = f"QUIET\u2190{s['quiet_from']}"
                 buf_lines = s.get('buf_lines', 0); prompt = s.get('prompt_text','')
             except Exception: pass
+        if via == 'direct' and len(_device_holders(dev_path)) > 1:
+            state = 'SPLIT!'
         rows.append((ddir.name, state, via, buf_lines, prompt))
     if not rows:
         print('No daemons running'); return
@@ -3377,6 +3440,7 @@ def cmd_list(args):
         if s in ('SHELL', 'RUNNING'):   return f'{G}{s:<9}{N}'
         if s in ('UBOOT', 'BOOTING'):   return f'{Y}{s:<9}{N}'
         if s in ('LOGIN', 'PASSWORD'):  return f'{C}{s:<9}{N}'
+        if s == 'SPLIT!':               return f'{R}{B}{s:<9}{N}'
         if s in ('DEAD', 'PANIC') or s.startswith('QUIET←PANIC'):
             return f'{R}{s:<9}{N}'
         if s == 'FROZEN':               return f'{Y}{s:<9}{N}'
@@ -3830,11 +3894,82 @@ def cmd_test(args):
         if fdb2 >= 0: os.close(fdb2)
         s2proc.terminate(); s2proc.wait()
 
+    # ── Unit: one daemon per tty (duplicate-daemon guard) ─────────────────────
+    # Two daemons on one tty make the kernel hand each byte to exactly one of
+    # them, so a console shows roughly every other character.  daemon.pid alone
+    # cannot prevent that — it gets deleted by hand during a restart while the
+    # old daemon lives on.  Fixture is a bare pty with the slave closed, so
+    # fuser reports only real openers (socat's pty,link= would hold one itself).
+    print('  duplicate-daemon guard (unit)')
+    import pty as _pty
+    _gm, _gs = _pty.openpty()
+    _gdev = os.ttyname(_gs)
+    os.close(_gs)
+    _gtd = Path(tempfile.mkdtemp(prefix='sa-guard-'))
+    _genv = os.environ.copy(); _genv['SERIAL_AGENT_BASE'] = str(_gtd)
+    _gpidf = _gtd / Path(_gdev).name / 'daemon.pid'
+
+    def _sa(*a):
+        """Run a serial-agent subcommand; capture via files, not pipes — the
+        daemon double-forks and an inherited pipe write-end can stall run()."""
+        _o, _e = _gtd / '.out', _gtd / '.err'
+        with open(_o, 'w') as fo, open(_e, 'w') as fe:
+            r = subprocess.run([sys.argv[0], *a], stdout=fo, stderr=fe,
+                               text=True, env=_genv, timeout=30)
+        return r.returncode, _o.read_text(), _e.read_text()
+
+    _leech = None
+    try:
+        _rc, _out, _err = _sa('start', _gdev, '--idle-timeout', '0')
+        check('daemon PID' in _out, 'guard: first start succeeds', f'{_out!r} {_err!r}')
+        _rc, _out, _err = _sa('start', _gdev, '--idle-timeout', '0')
+        check('ALREADY' in _out, 'guard: pidfile guard blocks a 2nd start', repr(_out))
+
+        # The documented restart recipe removes daemon.pid by hand.  The live
+        # daemon must be adopted back, never joined by a second one.
+        _gpidf.unlink(missing_ok=True)
+        _rc, _out, _err = _sa('start', _gdev, '--idle-timeout', '0')
+        check('ADOPTED' in _out and _rc == 0,
+              'guard: orphan adopted after daemon.pid removed', f'rc={_rc} {_out!r}')
+        check(len(_device_holders(_gdev)) == 1,
+              'guard: still exactly one holder on the tty')
+        check(_gpidf.exists() and _gpidf.read_text().strip().isdigit(),
+              'guard: adoption restores daemon.pid')
+        # Adoption must not strip the running daemon of its control files.
+        check((_gtd / Path(_gdev).name / 'status.json').exists(),
+              'guard: adoption preserves the live daemon status.json')
+
+        # A second reader is reported, not silently tolerated.
+        _leech = subprocess.Popen(
+            [sys.executable, '-c',
+             'import os,sys,time;os.open(sys.argv[1],os.O_RDONLY|os.O_NOCTTY);'
+             'time.sleep(30)', _gdev])
+        time.sleep(0.5)
+        _rc, _out, _err = _sa('list')
+        check('SPLIT!' in _out, 'guard: list flags SPLIT! when a 2nd reader holds the tty',
+              repr(_out))
+        _leech.terminate(); _leech.wait(timeout=5); _leech = None
+        time.sleep(0.4)
+        _rc, _out, _err = _sa('list')
+        check('SPLIT!' not in _out, 'guard: SPLIT! clears when the 2nd reader exits')
+
+        check(_is_real_serial('/dev/ttyUSB5') and _is_real_serial('/dev/ttyACM0')
+              and not _is_real_serial(_gdev),
+              'guard: hard refusal scoped to real UARTs, not ptys')
+    finally:
+        if _leech is not None:
+            _leech.terminate()
+        subprocess.run([sys.argv[0], 'stop', _gdev, '--force'],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=_genv)
+        os.close(_gm)
+        shutil.rmtree(_gtd, ignore_errors=True)
+
     # ── Unit: probe_tty daemon-state mapping (QUIET/PANIC surfaced, not dead) ──
     # Stages a fake daemon dir under /tmp/serial-agent (status.json in the
     # daemon's real indent=2 format) and runs the real bash probe_tty against
-    # it: QUIET reached from a live state must surface as QUIET (idle board ≠
-    # dead cable), PANIC (incl. QUIET←PANIC) as PANIC; silence from UNKNOWN
+    # it: QUIET reached from a live state surfaces as LIVE (idle board ≠ dead
+    # cable; display carries only LIVE/OPEN/FAIL/dead, QUIET stays internal to
+    # the daemon), PANIC (incl. QUIET←PANIC) as PANIC; silence from UNKNOWN
     # stays DEAD.  probe_tty output goes to a file, not a pipe — pipe capture
     # of these subprocesses intermittently read empty in-suite.
     print('  probe_tty state mapping (unit)')
@@ -3849,8 +3984,8 @@ def cmd_test(args):
             for _st, _qf, _want in [
                     ('SHELL',   '',        'LIVE'),
                     ('BOOTING', '',        'LIVE'),
-                    ('QUIET',   'LOGIN',   'QUIET'),
-                    ('QUIET',   'SHELL',   'QUIET'),
+                    ('QUIET',   'LOGIN',   'LIVE'),
+                    ('QUIET',   'SHELL',   'LIVE'),
                     ('QUIET',   'UNKNOWN', 'DEAD'),
                     ('QUIET',   'PANIC',   'PANIC'),
                     ('PANIC',   'PANIC',   'PANIC'),

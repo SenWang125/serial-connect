@@ -39,6 +39,15 @@ serial-agent built-in TCP relay  (automatic, no configuration needed)
   • serial-connect bridges to tio via socat PTY (tio v2.7 has no tcp: device support)
   • multiple socat clients can share the relay simultaneously (read-only observation)
 
+One daemon per tty — the invariant
+  • the kernel gives each byte to exactly ONE reader, so two daemons on one device
+    split the stream and a console shows roughly every other character
+  • sharing belongs above the tty: the relay and output.fifo, never a second daemon
+  • `start` checks the device (fuser), not just daemon.pid: a serial-agent holder is
+    ADOPTED, a non-agent holder REFUSED on a real UART (warned on a pty, where a
+    socat pty,link= bridge legitimately holds the slave)
+  • `list` shows state SPLIT! when a direct-mode device has more than one holder
+
 ser2net  (optional, for multi-user / network access)
   • holds physical serial port exclusively, fans to TCP clients
   • takes precedence over built-in relay when configured
