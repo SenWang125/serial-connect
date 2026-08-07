@@ -2055,27 +2055,53 @@ def cmd_boot(args):
     sys.exit(0 if result['outcome'] == 'up' else 1)
 
 
+def _needs_login(st: dict, explicit: bool = False) -> bool:
+    """True if a command sent now would land in `login` instead of a shell.
+
+    A console parked at LOGIN/PASSWORD consumes the command as a username, then
+    asks for a password, then prints 'Login incorrect' — the command never runs
+    and nothing useful echoes back, which reads as the board dropping input.
+    QUIET reached from either state is the same situation, just idle.
+
+    BOOTING only counts with an explicit --login: auto mode must not silently
+    turn a send into a 90s wait for a prompt that may never come.
+    """
+    cst = st.get('state', '')
+    if cst in ('LOGIN', 'PASSWORD'):
+        return True
+    if cst == 'QUIET' and st.get('quiet_from') in ('LOGIN', 'PASSWORD'):
+        return True
+    return explicit and cst == 'BOOTING'
+
+
 def _maybe_auto_login(args):
-    """If --login was given and the console is at LOGIN/PASSWORD (or went
-    quiet there), run the standard login flow first. Board-agnostic: uses
-    cmd_login's existing credential handling (default root, no password)."""
-    if not getattr(args, 'login', False):
+    """Log in first when the console is sitting at a login prompt.
+
+    On by default — sending a shell command to `login` is never what the caller
+    meant, and it fails in a way that looks like a transport fault rather than a
+    login prompt. --no-login opts out; --login additionally covers BOOTING.
+    Board-agnostic: reuses cmd_login's credential handling (default root, no
+    password).
+    """
+    if getattr(args, 'no_login', False):
         return
     try:
         st = json.loads((devdir(args.device) / 'status.json').read_text())
     except (OSError, ValueError):
         return
-    cst = st.get('state', '')
-    if cst in ('LOGIN', 'PASSWORD', 'BOOTING') or \
-       (cst == 'QUIET' and st.get('quiet_from') in ('LOGIN', 'PASSWORD')):
-        ns = argparse.Namespace(device=args.device,
-                                user=getattr(args, 'user', 'root'),
-                                password=getattr(args, 'password', None),
-                                timeout=90)
-        try:
-            cmd_login(ns)
-        except SystemExit:
-            pass
+    if not _needs_login(st, getattr(args, 'login', False)):
+        return
+    user = getattr(args, 'user', 'root') or 'root'
+    print(f"[serial-agent] console at {st.get('state','?')} — logging in as "
+          f"{user} first (--no-login to disable)", file=sys.stderr)
+    ns = argparse.Namespace(device=args.device,
+                            user=user,
+                            password=getattr(args, 'password', None),
+                            timeout=90)
+    try:
+        cmd_login(ns)
+    except SystemExit:
+        pass
 
 
 def cmd_send(args):
@@ -2095,6 +2121,10 @@ def cmd_send(args):
                  wrapping long output lines (important for grep, find, etc.).
       --all      Fan-out: send to every device with a running daemon in
                  parallel; results keyed by device path in the JSON output.
+      --no-login Do not auto-login. By default a console at LOGIN/PASSWORD is
+                 logged in first, because `login` would otherwise swallow the
+                 command as a username and the failure looks like the board
+                 dropping input rather than a login prompt.
 
     Exit code: 0 = completed (pattern matched), 1 = timed out or failed.
     """
@@ -2352,6 +2382,11 @@ def cmd_watch(args):
     if not patterns:
         print('watch needs at least one --until REGEX or --on KEY=REGEX',
               file=sys.stderr); sys.exit(2)
+
+    # Only when we are about to send: a bare watch must stay free to observe the
+    # login prompt itself (--until 'login:' is a normal boot-capture pattern).
+    if args.send:
+        _maybe_auto_login(args)
 
     # Open the read end FIRST (non-blocking) so the daemon can attach its write
     # end and nothing emitted by --send is missed. Snapshot stream.log's end as
@@ -3922,6 +3957,26 @@ def cmd_test(args):
         if fdb2 >= 0: os.close(fdb2)
         s2proc.terminate(); s2proc.wait()
 
+    # ── Unit: login-prompt detection before sending ───────────────────────────
+    # A command sent to a console parked at LOGIN is consumed as a username, then
+    # a password, then 'Login incorrect'. Nothing runs and nothing useful echoes,
+    # which reads as the board dropping input — so sends auto-login by default.
+    print('  login-prompt detection (unit)')
+    for _st, _qf, _ex, _want in [
+            ('SHELL',    '',         False, False),
+            ('LOGIN',    '',         False, True),
+            ('PASSWORD', '',         False, True),
+            ('QUIET',    'LOGIN',    False, True),
+            ('QUIET',    'PASSWORD', False, True),
+            ('QUIET',    'SHELL',    False, False),
+            ('BOOTING',  '',         False, False),   # auto must not become a 90s wait
+            ('BOOTING',  '',         True,  True),    # --login opts into that wait
+            ('UNKNOWN',  '',         False, False)]:
+        _got = _needs_login({'state': _st, 'quiet_from': _qf}, _ex)
+        check(_got == _want,
+              f'_needs_login: {_st}{"←" + _qf if _qf else ""}'
+              f'{" --login" if _ex else ""} → {_want}', f'got {_got}')
+
     # ── Unit: one daemon per tty (duplicate-daemon guard) ─────────────────────
     # Two daemons on one tty make the kernel hand each byte to exactly one of
     # them, so a console shows roughly every other character.  daemon.pid alone
@@ -4254,8 +4309,11 @@ def main():
     sp = sub.add_parser('send',
         help='Send command; --json for structured output, --capture for clean stdout')
     dev(sp); sp.set_defaults(func=cmd_send)
+    sp.add_argument('--no-login', action='store_true',
+                    help='Do not auto-login when the console is at a login prompt')
     sp.add_argument('--login', action='store_true',
-                    help='Auto-login first if console is at a login prompt')
+                    help='Also wait through BOOTING for the login prompt '
+                         '(auto-login at LOGIN/PASSWORD is already the default)')
     sp.add_argument('command')
     sp.add_argument('--wait', metavar='PATTERN', default=r'[\$#>]\s*$',
                     help='Wait for regex after sending (default: shell prompt)')
@@ -4290,6 +4348,11 @@ def main():
                     help='Named pattern (repeatable); the matched KEY is reported')
     sp.add_argument('--send', metavar='CMD',
                     help='Command to send after the read side is open (no early output missed)')
+    sp.add_argument('--no-login', action='store_true',
+                    help='Do not auto-login when the console is at a login prompt')
+    sp.add_argument('--login', action='store_true',
+                    help='Also wait through BOOTING for the login prompt '
+                         '(auto-login at LOGIN/PASSWORD is already the default)')
     sp.add_argument('--timeout', type=float, default=30.0)
     sp.add_argument('--json', action='store_true', help='(output is JSON regardless)')
 
@@ -4384,8 +4447,11 @@ def main():
     sp.add_argument('--json',     action='store_true')
     sp.add_argument('--capture',  action='store_true')
     sp.add_argument('--no-wrap',  action='store_true')
+    sp.add_argument('--no-login', action='store_true',
+                    help='Do not auto-login when the console is at a login prompt')
     sp.add_argument('--login', action='store_true',
-                    help='Auto-login first if console is at a login prompt')
+                    help='Also wait through BOOTING for the login prompt '
+                         '(auto-login at LOGIN/PASSWORD is already the default)')
 
     sp = sub.add_parser('health',
         help='Board health snapshot: state, memory, load, kernel version')

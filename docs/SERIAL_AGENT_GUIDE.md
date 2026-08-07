@@ -103,6 +103,19 @@ output, rc, timed_out = board_run(dev, 'uname -r')
 
 ## 3. State Checking (ALWAYS check before sending)
 
+**Sending to a login prompt is the classic silent failure.** `login` takes the command
+as a username, asks for a password, prints `Login incorrect`, and after 60s times out and
+respawns getty. The command never runs, the password prompt echoes nothing, and every
+`--wait`/`--until` pattern misses — which reads as *the board dropping input characters*,
+not as a login prompt. Shortening the command does not help; length was never the variable.
+
+`send`, `run` and `watch --send` now auto-login at LOGIN/PASSWORD by default and say so on
+stderr. `--no-login` opts out; `--login` additionally waits through BOOTING for the prompt.
+A bare `watch` never auto-logs-in, so `--until 'login:'` still works for boot capture.
+
+The state check below is still the explicit form, and is what a polling loop should use —
+poll `wait-state SHELL`, not a command whose output you expect to see.
+
 ```bash
 # Fast state check (reads cached status, no serial traffic)
 state=$(serial-agent status "$DEV" | python3 -c "
