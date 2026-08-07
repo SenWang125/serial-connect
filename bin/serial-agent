@@ -814,10 +814,13 @@ class Daemon:
         self._push_output(data)
         text = data.decode('utf-8', errors='replace')
         self.t_output = now()
-        self._update_state(text)
         # Prepend any partial line buffered from the previous read to avoid
         # splitting lines across os.read() boundaries (e.g. "6.18.13" + "-dirty\n")
         full = self._partial + text
+        # State detection reads the trailing line, and a shell prompt has no
+        # newline to end it — so a read boundary inside one is routine. Matching
+        # the raw chunk recorded the fragment (':~#', '-evm:~#') as prompt_text.
+        self._update_state(full)
         parts = re.split(r'\r?\n', full)
         # If text didn't end with \n, the last element is an incomplete line
         if full and not full.endswith('\n'):
@@ -3645,6 +3648,31 @@ def cmd_test(args):
             time.sleep(0.05)
         check(shell_state, 'injected prompt → state SHELL',
               'check daemon log for details' if not shell_state else '')
+
+        # ── Test 3b: prompt split across two reads is learned whole ───────
+        # A shell prompt carries no trailing newline, so an os.read() boundary
+        # lands inside it routinely. State detection must see the stitched line,
+        # not the raw chunk — matching the chunk alone recorded fragments like
+        # '-evm:~#' as prompt_text and put them in `list` and status.json.
+        os.write(fd_b, b'\r\n')
+        time.sleep(0.4)
+        os.write(fd_b, b'root@splitboard')
+        time.sleep(0.4)
+        os.write(fd_b, b':~# ')
+        deadline = time.time() + 2
+        split_prompt = ''
+        while time.time() < deadline:
+            try:
+                s = json.loads(sf.read_text())
+                split_prompt = s.get('prompt_text', '')
+                if split_prompt == 'root@splitboard:~#':
+                    break
+            except Exception:
+                pass
+            time.sleep(0.05)
+        check(split_prompt == 'root@splitboard:~#',
+              'prompt split across reads is learned whole, not as a fragment',
+              f'prompt_text={split_prompt!r}')
 
         # ── Test 4: send() delivers command, output captured ──────────────
         # We can't do a full round-trip without an interactive shell, but we
