@@ -252,7 +252,10 @@ _agent_is_alive() {
     [[ -f "$_pf" ]] || _pf="$HOME/var/serial-agent/$1/daemon.pid"
     [[ -f "$_pf" ]] || return
     local _pid; _pid=$(cat "$_pf" 2>/dev/null) || return
-    [[ -n "$_pid" && -d "/proc/$_pid" ]] && printf -v "$2" '%s' '1'
+    [[ -n "$_pid" && -d "/proc/$_pid" ]] || return
+    # PID reuse: a recycled pid must not read as a live daemon.
+    grep -qa 'serial-agent' "/proc/$_pid/cmdline" 2>/dev/null || return
+    printf -v "$2" '%s' '1'
 }
 
 # ── _read_agent_tcp_via ────────────────────────────────────────────────────────

@@ -171,6 +171,13 @@ launch() {
             echo -e "  ${RED}✗${NC}  socat is required when serial-agent is running.  sudo apt install socat" >&2
             return 1
         fi
+        # status.json is a claim, not a live port. Bridging tio onto a dead
+        # relay yields a silent PTY that looks like a working console.
+        if ! timeout 2 bash -c "exec 3<>/dev/tcp/${agent_tcp%%:*}/${agent_tcp##*:}" 2>/dev/null; then
+            echo -e "  ${RED}✗${NC}  serial-agent relay $agent_tcp is not accepting connections." >&2
+            echo -e "  Restart it:  serial-agent stop $dev --force && serial-agent start $dev --idle-timeout 0" >&2
+            return 1
+        fi
         local _relay_label="ser2net"
         [[ "$agent_tcp" == 127.0.0.1:* ]] && _relay_label="built-in relay"
         # Include the bash PID ($$) to make the path unique per session.
@@ -191,7 +198,7 @@ launch() {
             # Daemon owns the device — connecting tio directly would split bytes with
             # the daemon.  Refuse rather than silently corrupt the session.
             echo -e "  ${RED}✗${NC}  socat PTY bridge failed — cannot connect tio directly (serial-agent owns the port)." >&2
-            echo -e "  Check relay is reachable: nc -z ${agent_tcp//:/ }" >&2
+            echo -e "  Check relay is reachable: timeout 2 bash -c 'exec 3<>/dev/tcp/${agent_tcp%%:*}/${agent_tcp##*:}'" >&2
             return 1
         fi
     fi

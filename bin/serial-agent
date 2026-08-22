@@ -333,6 +333,9 @@ RE_LOGIN    = re.compile(r'(login|Username)\s*:\s*$', re.I)
 RE_PASSWORD = re.compile(r'(Password|passwd)\s*:\s*$', re.I)
 RE_BOOT     = re.compile(r'\[\s*\d+\.\d{3,6}\]')
 RE_UBOOT    = re.compile(r'^(=>|u-boot[#>])\s*$', re.I)   # U-Boot prompt
+# Annotations this daemon injects into its own stream (see the GAP marker in
+# run()). They are not board output and must never drive state detection.
+RE_SELF_ANNOT = re.compile(r'^<<serial-agent ')
 # Hard-fault / panic conditions meaning the board is dead or frozen and needs a
 # reboot.  Cased to match real kernel/U-Boot output (the old 'OOPS:' never matched:
 # the kernel prints 'Oops:').  Kept case-sensitive to avoid flipping to PANIC on
@@ -739,7 +742,8 @@ class Daemon:
         t = now()
         # Strip ANSI codes before pattern matching (handles colored prompts)
         clean = _strip_ansi(text)
-        lines = [l for l in clean.replace('\r', '').split('\n') if l.strip()]
+        lines = [l for l in clean.replace('\r', '').split('\n')
+                 if l.strip() and not RE_SELF_ANNOT.match(l.strip())]
         last = lines[-1] if lines else ''
 
         prev = self.state
@@ -1117,8 +1121,8 @@ class Daemon:
                     self._dead_since = 0.0
                     if _gap >= GAP_MARKER_MIN:
                         self._append(
-                            f'\n<<serial-agent GAP {_gap:.1f}s — port reopened; board '
-                            f'output during this window may be lost>>\n'.encode())
+                            f'\r\n<<serial-agent GAP {_gap:.1f}s — port reopened; board '
+                            f'output during this window may be lost>>\r\n'.encode())
                 t_connected = now()
                 _probe_sent = False
                 _t_last_idle_probe = t_connected
