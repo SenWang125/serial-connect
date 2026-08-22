@@ -3691,7 +3691,19 @@ def cmd_test(args):
 
     Requires: socat
     """
-    import shutil, socket, subprocess, tempfile, threading
+    import fcntl, shutil, socket, subprocess, tempfile, threading
+
+    # This suite is NOT concurrency-safe: it binds listeners, creates ptys and
+    # takes lock paths that a second run collides with, producing failures that
+    # look like real defects. Refuse rather than mis-fail.
+    _lk = open('/tmp/serial-agent-test.lock', 'w')
+    try:
+        fcntl.flock(_lk, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        print('another `serial-agent test` is already running — this suite is not '
+              'concurrency-safe; wait for it to finish', file=sys.stderr)
+        sys.exit(2)
+    _lk.write(f'{os.getpid()}\n'); _lk.flush()
 
     verbose = args.verbose
     passed = 0
@@ -4039,8 +4051,11 @@ def cmd_test(args):
     with tempfile.TemporaryDirectory(prefix='sa-s2n-') as td2:
         td2 = Path(td2)
         board_pty = td2 / 'boardpty'          # the "board" serial side
-        port = 37651
-        vdev2 = '/dev/fake_s2n_dev'
+        # Ephemeral port + per-PID device name: two concurrent `serial-agent test`
+        # runs must not fight over a listener or a lock path.
+        with socket.socket() as _ps:
+            _ps.bind(('127.0.0.1', 0)); port = _ps.getsockname()[1]
+        vdev2 = f'/dev/fake_s2n_dev{os.getpid()}'
         s2conf = td2 / 'ser2net.yaml'
         s2conf.write_text(
             "connection: &con\n"
@@ -4213,7 +4228,7 @@ def cmd_test(args):
     # of these subprocesses intermittently read empty in-suite.
     print('  probe_tty state mapping (unit)')
     _common = _SCRIPT_DIR / 'serial-common.sh'
-    _fake = 'ttyFAKEPROBE0'
+    _fake = f'ttyFAKEPROBE{os.getpid()}'   # per-PID: concurrent runs must not share a fixture
     _fdir = Path('/tmp/serial-agent') / _fake
     _fdir.mkdir(parents=True, exist_ok=True)
     try:
