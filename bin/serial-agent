@@ -3915,15 +3915,18 @@ def cmd_test(args):
                 sock = socket.socket()
                 sock.settimeout(2)
                 sock.connect((host, int(port)))
-                # Inject data at board side; client should receive it
-                os.write(fd_b, b'relay-test-data\r\n')
-                time.sleep(0.2)
+                # connect() returns on the kernel handshake, but the daemon
+                # broadcasts only to clients its accept loop has registered —
+                # board data written inside that window is dropped, not queued.
+                # Re-inject until it lands; still fails in <=3s if it never does.
                 sock.settimeout(0.5)
-                try:
-                    chunk = sock.recv(256)
-                    relay_ok = b'relay-test-data' in chunk
-                except socket.timeout:
-                    pass
+                _dl = time.time() + 3
+                while time.time() < _dl and not relay_ok:
+                    os.write(fd_b, b'relay-test-data\r\n')
+                    try:
+                        relay_ok = b'relay-test-data' in sock.recv(256)
+                    except socket.timeout:
+                        pass
                 sock.close()
         except Exception as e:
             if verbose: print(f'     relay error: {e}')
