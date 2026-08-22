@@ -2140,6 +2140,14 @@ def _maybe_auto_login(args):
         cmd_login(ns)
     except SystemExit:
         pass
+    try:
+        st2 = json.loads((devdir(args.device) / 'status.json').read_text())
+    except (OSError, ValueError):
+        return
+    if _needs_login(st2):
+        print(f"[serial-agent] auto-login did NOT reach a shell — console still at "
+              f"{st2.get('state','?')}; the command below will be typed into login",
+              file=sys.stderr)
 
 
 def cmd_send(args):
@@ -2494,6 +2502,10 @@ def cmd_watch(args):
 
 def cmd_expect(args):
     """Wait for first of multiple patterns. Returns JSON with matched key and output."""
+    if getattr(args, 'pattern', None) and not args.on:
+        args.on = [f'match={args.pattern}']
+    if not args.on:
+        print('expect: give a pattern, or --on KEY=REGEX', file=sys.stderr); sys.exit(2)
     # Read stream.log (append-only, stable inode) not buf.log: buf.log is a
     # bounded ring rewritten by tmp+rename, so a fast/large burst can scroll past
     # its 500-line cap between polls and be missed (the front-truncation class
@@ -2715,7 +2727,7 @@ def cmd_tail(args):
     if not bf.exists():
         print('no buffer (daemon not started?)', file=sys.stderr); sys.exit(1)
     lines = bf.read_text().splitlines()
-    for l in lines[-20:]:
+    for l in lines[-max(0, getattr(args, 'lines', 20)):] if getattr(args, 'lines', 20) else []:
         print(RE_TIMESTAMP.sub('', l) if args.no_timestamps else l)
     offset = bf.stat().st_size
     deadline = time.time() + args.timeout if args.timeout > 0 else None
@@ -2741,6 +2753,15 @@ def cmd_tail(args):
 def cmd_connect(args):
     """One-shot: discover board, start daemon if needed, optionally wait for shell."""
     import subprocess, shutil
+    if getattr(args, 'device', None):
+        _d = args.device if args.device.startswith('/dev/') else f'/dev/{args.device}'
+        if not _daemon_running(_d):
+            cmd_start(argparse.Namespace(device=_d, baud=115200, lines=500,
+                                         idle_timeout=0, tcp=None, no_ser2net=False))
+        if args.wait_shell:
+            _wait_state(_d, 'SHELL,LOGIN,PASSWORD', args.timeout)
+        print(json.dumps({'device': _d}) if args.json else f'connected {_d}')
+        sys.exit(0)
     sd = shutil.which('serial-discover')
     if not sd:
         print('serial-discover not found', file=sys.stderr); sys.exit(1)
@@ -3095,12 +3116,18 @@ def cmd_login(args):
     if not sf.exists():
         print(f'No daemon for {device}', file=sys.stderr); sys.exit(1)
 
-    state = json.loads(sf.read_text()).get('state', 'UNKNOWN')
+    _st = json.loads(sf.read_text())
+    state = _st.get('state', 'UNKNOWN')
     if state == 'SHELL':
         print('Already at shell'); return
     if state == 'BOOTING':
-        _wait_state(device, 'LOGIN', 90)
-        state = json.loads(sf.read_text()).get('state', 'UNKNOWN')
+        _wait_state(device, 'LOGIN', getattr(args, 'timeout', 90) or 90)
+        _st = json.loads(sf.read_text())
+        state = _st.get('state', 'UNKNOWN')
+    # A console that went quiet AT a login prompt is still at it — treat the
+    # parked state as the real one, or auto-login is inert for the commonest case.
+    if state == 'QUIET' and _st.get('quiet_from') in ('LOGIN', 'PASSWORD'):
+        state = _st['quiet_from']
     if state not in ('LOGIN', 'PASSWORD', 'UNKNOWN'):
         print(f'Unexpected state: {state} (need LOGIN or PASSWORD)', file=sys.stderr); sys.exit(1)
 
@@ -3503,6 +3530,15 @@ def cmd_list(args):
     Quick overview — use 'status DEVICE' for full detail on one device."""
     if not AGENT_BASE.exists():
         print('No daemons running'); return
+    if getattr(args, 'verbose', False) and not args.json:
+        for _dd in sorted(AGENT_BASE.iterdir()):
+            _sf = _dd / 'status.json'
+            if not (_dd / 'daemon.pid').exists() or not _sf.exists(): continue
+            try: _s = json.loads(_sf.read_text())
+            except (OSError, ValueError): continue
+            print(f"{_dd.name:14} pid={_s.get('pid','?')} relay={_s.get('relay','-')} "
+                  f"idle_timeout={_s.get('idle_timeout','?')} port_held={_s.get('port_held','?')}")
+        print()
     rows = []
     for ddir in sorted(AGENT_BASE.iterdir()):
         if not ddir.is_dir(): continue
@@ -4132,9 +4168,11 @@ def cmd_test(args):
                     ('PANIC',   'PANIC',   'PANIC'),
                     ('FROZEN',  'BOOTING', 'FROZEN'),
                     ('UNKNOWN', '',        'DEAD')]:
-                (_fdir / 'status.json').write_text(json.dumps(
+                _tmpst = _fdir / 'status.json.tmp'
+                _tmpst.write_text(json.dumps(
                     {'quiet_from': _qf, 'state': _st, 'prompt_text': 'x'},
                     indent=2))
+                _tmpst.rename(_fdir / 'status.json')
                 _pr = subprocess.run(
                     ['bash', '-c',
                      f'source "{_common}"; '
@@ -4359,6 +4397,8 @@ def main():
     sp.add_argument('--lines', type=int, default=20)
 
     sp = sub.add_parser('tail'); dev(sp); sp.set_defaults(func=cmd_tail)
+    sp.add_argument('--lines', '-n', type=int, default=20, metavar='N',
+                    help='Backlog lines to print before following (default 20)')
     sp.add_argument('--no-timestamps', action='store_true')
     sp.add_argument('--timeout', type=float, default=0,
                     metavar='SECS', help='Exit after SECS seconds (0=no limit)')
@@ -4375,6 +4415,8 @@ def main():
     sp.add_argument('command')
     sp.add_argument('--wait', metavar='PATTERN', default=r'[\$#>]\s*$',
                     help='Wait for regex after sending (default: shell prompt)')
+    sp.add_argument('--until', dest='wait', metavar='PATTERN',
+                    help="Alias for --wait (watch's flag name, accepted here too)")
     sp.add_argument('--no-wait', dest='wait', action='store_const', const=None,
                     help='Fire and forget — do not wait for response')
     sp.add_argument('--timeout', type=float, default=30.0)
@@ -4392,7 +4434,9 @@ def main():
     sp = sub.add_parser('expect',
         help='Wait for first of multiple patterns; returns JSON {"matched","output","elapsed_ms"}')
     dev(sp); sp.set_defaults(func=cmd_expect)
-    sp.add_argument('--on', action='append', metavar='KEY=REGEX', required=True,
+    sp.add_argument('pattern', nargs='?', metavar='REGEX',
+                    help='Bare pattern; equivalent to --on match=REGEX')
+    sp.add_argument('--on', action='append', metavar='KEY=REGEX',
                     help='Pattern to watch for, e.g. --on READY="~#" --on PANIC="Kernel panic"')
     sp.add_argument('--timeout', type=float, default=60.0)
 
@@ -4402,6 +4446,8 @@ def main():
     dev(sp); sp.set_defaults(func=cmd_watch)
     sp.add_argument('--until', action='append', metavar='REGEX',
                     help='Pattern to stop on (repeatable); any match returns. Keyed u0,u1,...')
+    sp.add_argument('--pattern', dest='until', action='append', metavar='REGEX',
+                    help='Alias for --until')
     sp.add_argument('--on', action='append', metavar='KEY=REGEX',
                     help='Named pattern (repeatable); the matched KEY is reported')
     sp.add_argument('--send', metavar='CMD',
@@ -4431,6 +4477,8 @@ def main():
     sp.set_defaults(func=cmd_connect)
     sp.add_argument('--board',      metavar='PATTERN')
     sp.add_argument('--serial',     metavar='PARTIAL')
+    sp.add_argument('--device',     metavar='DEV',
+                    help='Skip discovery; use this port directly')
     sp.add_argument('--wait-shell', action='store_true',
                     help='Block until SHELL/LOGIN/PASSWORD reached')
     sp.add_argument('--setup-terminal', action='store_true',
@@ -4484,6 +4532,7 @@ def main():
     dev(sp); sp.set_defaults(func=cmd_login)
     sp.add_argument('--user',     default='root')
     sp.add_argument('--password', default=None)
+    sp.add_argument('--timeout',  type=float, default=90.0)
 
     sp = sub.add_parser('upload',
         help='Upload file: base64 serial (default, no network) or --via-network (wget, ~1MB/s)')
@@ -4526,6 +4575,8 @@ def main():
     sp = sub.add_parser('list', help='List all devices with running daemons')
     sp.set_defaults(func=cmd_list)
     sp.add_argument('--json', action='store_true')
+    sp.add_argument('--verbose', '-v', action='store_true',
+                    help='Also print each daemon pid, relay and idle-timeout')
 
     sp = sub.add_parser('attach', help='Launch terminal directly on daemon device (bypasses menu)')
     dev(sp); sp.set_defaults(func=cmd_attach)
