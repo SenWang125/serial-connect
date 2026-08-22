@@ -8,7 +8,10 @@ import os, shutil, sys
 from importlib.machinery import SourceFileLoader
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-sa = SourceFileLoader('sa', os.path.join(HERE, 'serial-agent')).load_module()
+AGENT = next(p for p in (os.path.join(HERE, 'serial-agent'),
+                         os.path.join(HERE, os.pardir, 'bin', 'serial-agent'))
+             if os.path.exists(p))
+sa = SourceFileLoader('sa', AGENT).load_module()
 
 DEV = '/dev/ttySELFTEST-gap'
 ddir = sa.devdir(DEV)

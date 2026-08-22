@@ -2078,6 +2078,16 @@ def _needs_login(st: dict, explicit: bool = False) -> bool:
     return explicit and cst == 'BOOTING'
 
 
+def _reboot_login_action(st: dict) -> str:
+    """'login' if a reboot command sent now would be typed as a username.
+
+    getty consumes it, asks for a password, and the board never reboots — the
+    console is left at Password: and the operator reads it as the serial link
+    corrupting input.
+    """
+    return 'login' if _needs_login(st) else 'send'
+
+
 def _maybe_auto_login(args):
     """Log in first when the console is sitting at a login prompt.
 
@@ -2953,6 +2963,26 @@ def cmd_reboot(args):
     t_reboot_sent = time.time()
     sf = devdir(device) / 'status.json'
 
+    # A console parked at login: swallows the reboot command as a username, so
+    # log in first; --no-login governs the post-reboot login only.
+    try:
+        _stj = json.loads(sf.read_text()) if sf.exists() else {}
+    except (OSError, ValueError):
+        _stj = {}
+    if _reboot_login_action(_stj) == 'login':
+        _maybe_auto_login(argparse.Namespace(device=device, user=args.user,
+                                             password=args.password,
+                                             no_login=False, login=False))
+        try:
+            _stj = json.loads(sf.read_text()) if sf.exists() else {}
+        except (OSError, ValueError):
+            _stj = {}
+        if _reboot_login_action(_stj) == 'login':
+            print(f"{device}: console still at {_stj.get('state', '?')} after "
+                  f"auto-login — refusing to send {args.cmd!r} into a login "
+                  f"prompt (it would be taken as a username).", file=sys.stderr)
+            sys.exit(1)
+
     # Send the reboot command — don't wait for prompt (shell dies immediately)
     if _daemon_running(device):
         fifo = devdir(device) / 'input.fifo'
@@ -2976,9 +3006,8 @@ def cmd_reboot(args):
         # Board did not go down within 30s.  Check if it's still at SHELL —
         # the reboot command may have been ignored.
         cur = json.loads(sf.read_text()).get('state', '') if sf.exists() else ''
-        if cur in ('SHELL', 'RUNNING'):
-            print(f'WARNING: board still at {cur} after 30s — reboot may not have executed',
-                  file=sys.stderr)
+        print(f'WARNING: board still at {cur or "?"} after 30s — reboot may not '
+              f'have executed', file=sys.stderr)
 
     # Wait for board to come back.  FROZEN/PANIC are terminal too — reaching them
     # means the board hung/panicked, so stop waiting immediately instead of burning
@@ -4398,7 +4427,7 @@ def main():
     dev(sp); sp.set_defaults(func=cmd_reboot)
     sp.add_argument('--cmd',            default='reboot', help='Reboot command (default: reboot)')
     sp.add_argument('--timeout',        type=float, default=120.0)
-    sp.add_argument('--no-login',       action='store_true', help='Do not auto-login after reboot')
+    sp.add_argument('--no-login',       action='store_true', help='Do not auto-login after reboot (a console already at login: is still logged in first, or the reboot would be typed as a username)')
     sp.add_argument('--login',          action='store_true', help='(no-op, auto-login is default)')
     sp.add_argument('--user',           default='root')
     sp.add_argument('--password',       default=None, help='Login password (None=skip if not prompted)')
