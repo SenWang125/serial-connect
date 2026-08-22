@@ -74,11 +74,11 @@ serial-connect          # see board status (OPEN = held by another user)
 serial-agent list       # see running daemons and board states
 ```
 
-**Board labels** are stored in two layers:
-- `/etc/serial-boards.conf` — chip table + shared labels (admin-managed, read by all users)
-- `~/.config/serial-boards.conf` — per-user label overrides (writable without sudo)
+**Board labels** live in the install's config:
+- Local install (scripts under `~/`) — `<script-dir>/serial-boards.conf`, a single file (here: `~/.serial-connect/serial-boards.conf`)
+- Global install (scripts under `/usr/` or `/opt/`) — `/etc/serial-boards.conf` for the chip table + shared labels (admin-managed), plus per-user overrides in `~/.config/serial-connect/boards.conf`
 
-Running `serial-connect --label` writes to the per-user conf automatically.
+Running `serial-connect --label` writes to whichever of those is writable without sudo.
 
 **Diagnose conflicts:**
 ```bash

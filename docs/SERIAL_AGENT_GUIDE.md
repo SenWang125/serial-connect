@@ -113,6 +113,9 @@ not as a login prompt. Shortening the command does not help; length was never th
 stderr. `--no-login` opts out; `--login` additionally waits through BOOTING for the prompt.
 A bare `watch` never auto-logs-in, so `--until 'login:'` still works for boot capture.
 
+`--login` is not the same flag on every subcommand — on `send`/`run`/`watch` it adds the
+BOOTING wait; on `reboot` it is a documented no-op (auto-login is already the default there).
+
 The state check below is still the explicit form, and is what a polling loop should use —
 poll `wait-state SHELL`, not a command whose output you expect to see.
 
@@ -341,7 +344,50 @@ serial-agent events "$DEV"                             # state transitions
 
 ---
 
-## 12. Quick Reference Card
+## 12. Self-Test (pre-commit gate)
+
+```bash
+serial-agent test        # 57 assertions on a virtual pty pair, no hardware, ~20s
+echo $?                  # 0 = green
+serial-agent test -v     # add daemon stdout + relay detail
+```
+
+Requires `socat`. Runs a real daemon over a socat pty loopback and injects board output:
+daemon start + port hold, startup CR probe, injected prompt → state, `send` capture, TCP
+relay client, `human_session` vs `stop --force`, clean exit, plus the QUIET/FROZEN/PANIC
+probe matrix. State goes to a temp `SERIAL_AGENT_DIR`, so `~/var/serial-agent/` is
+untouched. Run it before every commit.
+
+---
+
+## 13. Other Subcommands
+
+```bash
+serial-agent path "$DEV"                                # print the device's state dir
+serial-agent wait-alive "$DEV" --timeout 60             # block until SHELL, LOGIN or PASSWORD
+serial-agent tail "$DEV" --no-timestamps --timeout 30   # last 20 buf.log lines, then follow
+serial-agent boot "$DEV" --capture-file /tmp/boot.log --json
+serial-agent ops "$DEV" --lines 50 --json               # per-op history
+serial-agent attach "$DEV"                              # exec serial-connect on this device (human terminal)
+serial-agent clean "$DEV"                               # delete state dir (refuses while a daemon runs)
+```
+
+- `tail` prints the last 20 lines of `buf.log`, then follows it until the daemon exits,
+  `--timeout SECS` expires (0 = no limit), or Ctrl-C. **No line-count flag** — `--lines`
+  and `-n` are both rejected; use `read --lines N` for a fixed backlog.
+- `boot` needs a running daemon (exit 2 without one) and does NOT send `reboot`: trigger the
+  reset yourself (power, relay, sysrq) or pass `--reset-cmd reboot`. Waits for SHELL/LOGIN/UBOOT
+  (`up`, exit 0), FROZEN/PANIC (`frozen`) or timeout (both exit 1); writes the full boot slice to
+  `--capture-file` (default `/tmp/serial-connect-boot/ttyUSBx.boot.log`) and prints a digest
+  (`--digest-lines`, default 30).
+- `ops` prints `ops.log` — one JSON record per operation (`alive`, `boot`, `send`, `watch`,
+  `connect`, `reboot`) with `cmd`, `timeout`, `elapsed_ms`, `state`, `exit_code`, `timed_out`.
+  This is the post-mortem for "did that command actually run?".
+- `clean` with no device sweeps every state dir, skipping any with a live daemon.
+
+---
+
+## 14. Quick Reference Card
 
 ```
 # One-liners for agents
@@ -357,6 +403,10 @@ serial-agent health "$DEV"                    # board vitals
 serial-agent events "$DEV"                    # what happened recently
 serial-agent wait-state "$DEV" SHELL          # block until shell ready
 serial-agent stop "$DEV"                      # kill daemon (fuses all holders)
+serial-agent ops "$DEV"                       # per-op history (cmd, elapsed_ms, timed_out)
+serial-agent boot "$DEV" --json               # capture an externally-triggered boot
+serial-agent path "$DEV"                      # state dir for this device
+serial-agent test                             # 57-assertion self-test, no hardware (~20s)
 
 # Environment overrides
 SERIAL_AGENT_DIR=/custom/path serial-agent ...  # custom state directory

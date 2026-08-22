@@ -9,7 +9,10 @@
 ## Component Map
 
 ```
-~/.config/serial-boards.conf        ← USER CONFIG: USB serial# → board label
+board label config                  ← USER CONFIG: USB serial# → board label
+  local install  (scripts in ~/):   <script-dir>/serial-boards.conf
+  global install (/usr/, /opt/):    /etc/serial-boards.conf
+                                    + ~/.config/serial-connect/boards.conf (per-user override)
            │
            ▼
 serial-discover  ──────────────────────────────────────────────────────────►  stdout (table or --json)
@@ -76,8 +79,9 @@ serial-agent CLI  ←───────────────────�
 ## Storage Layout
 
 ```
-~/.config/serial-boards.conf       USB serial# → board label (+optional baud)
-                                    Key: unique, stable across replug and reboot
+board label config                  USB serial# → board label (+optional baud)
+  local:  <script-dir>/serial-boards.conf   Key: unique, stable across replug and reboot
+  global: /etc/serial-boards.conf + ~/.config/serial-connect/boards.conf
 
 ~/var/serial-agent/                 Real data (disk, not tmpfs)
   ttyUSBx/
@@ -86,6 +90,9 @@ serial-agent CLI  ←───────────────────�
     buf.log                         Ring buffer (last 500 lines, timestamped)
     status.json                     Current state machine snapshot
     events.log                      State transitions (capped 200 lines)
+    ops.log                         Per-op JSON records (capped 500 lines):
+                                    ts, op, pid + op fields (cmd, timeout,
+                                    elapsed_ms, timed_out). Read: `ops`
     input.fifo                      Write commands here → daemon sends to board
     output.fifo                     Push channel: daemon mirrors every raw serial
                                     chunk here; `watch` (or `cat`) reads it for
@@ -231,8 +238,9 @@ the daemon's read loop feeds `_append` the same way regardless of source. Detect
 
 | File | Role | Modified by |
 |------|------|-------------|
-| `/etc/serial-boards.conf` | System conf: chip table + probe settings + board labels | Admin / `sudo` |
-| `~/.config/serial-connect/boards.conf` | Per-user label overrides (shadows system conf key-by-key) | User / `auto-label` / `--label` |
+| `<script-dir>/serial-boards.conf` | Local install: the only conf (chip table + probe settings + labels) | User / `auto-label` / `--label` |
+| `/etc/serial-boards.conf` | Global install: system conf (chip table + probe settings + board labels) | Admin / `sudo` |
+| `~/.config/serial-connect/boards.conf` | Global install: per-user label overrides (shadows system conf key-by-key) | User / `auto-label` / `--label` |
 | `/usr/local/share/serial-connect/serial-*` | Installed scripts (global) | `sudo cp` |
 | `~/bin/serial-*.old` | Local development copies (not active) | Manual edit |
 | `~/var/serial-agent/*/` | Runtime state (buf, status, events, human_session) | serial-agent daemon / serial-connect |
