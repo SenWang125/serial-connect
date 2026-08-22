@@ -4150,7 +4150,7 @@ def cmd_test(args):
     # stays DEAD.  probe_tty output goes to a file, not a pipe — pipe capture
     # of these subprocesses intermittently read empty in-suite.
     print('  probe_tty state mapping (unit)')
-    _common = Path(sys.argv[0]).resolve().parent / 'serial-common.sh'
+    _common = _SCRIPT_DIR / 'serial-common.sh'
     _fake = 'ttyFAKEPROBE0'
     _fdir = Path('/tmp/serial-agent') / _fake
     _fdir.mkdir(parents=True, exist_ok=True)
@@ -4158,7 +4158,7 @@ def cmd_test(args):
         (_fdir / 'daemon.pid').write_text(str(os.getpid()))
         with tempfile.TemporaryDirectory(prefix='sa-probe-') as _ptd:
             _pout = Path(_ptd) / 'probe.out'
-            for _st, _qf, _want in [
+            _cases = [
                     ('SHELL',   '',        'LIVE'),
                     ('BOOTING', '',        'LIVE'),
                     ('QUIET',   'LOGIN',   'LIVE'),
@@ -4167,7 +4167,8 @@ def cmd_test(args):
                     ('QUIET',   'PANIC',   'PANIC'),
                     ('PANIC',   'PANIC',   'PANIC'),
                     ('FROZEN',  'BOOTING', 'FROZEN'),
-                    ('UNKNOWN', '',        'DEAD')]:
+                    ('UNKNOWN', '',        'DEAD')]
+            for _st, _qf, _want in _cases:
                 _tmpst = _fdir / 'status.json.tmp'
                 _tmpst.write_text(json.dumps(
                     {'quiet_from': _qf, 'state': _st, 'prompt_text': 'x'},
