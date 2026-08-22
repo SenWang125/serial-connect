@@ -3865,8 +3865,9 @@ def cmd_test(args):
         # We can't do a full round-trip without an interactive shell, but we
         # can verify the command bytes reach the board side.
         recv_buf = []
+        board_reader_stop = threading.Event()
         def _read_board():
-            while True:
+            while not board_reader_stop.is_set():
                 try:
                     d = os.read(fd_b, 256)
                     recv_buf.append(d)
@@ -4026,6 +4027,9 @@ def cmd_test(args):
         pid_gone = not pid_file.exists() or not os.path.exists(f'/proc/{daemon_pid}')
         check(pid_gone, 'daemon exited cleanly (pid file removed)')
 
+        # Stop the reader before the fd number is freed: a live reader on a
+        # recycled fd consumes a later test's file and leaves it at EOF.
+        board_reader_stop.set(); t.join(timeout=2)
         os.close(fd_b)
         socat_proc.terminate()
         socat_proc.wait()
