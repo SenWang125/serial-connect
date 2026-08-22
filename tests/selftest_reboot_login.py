@@ -48,4 +48,32 @@ print('3. a board that never went down is reported, whatever state it is in')
 check("warning is not restricted to SHELL/RUNNING",
       "('SHELL', 'RUNNING')" not in body)
 
+print('4. the reset command follows the console, not a hardcoded default')
+rc = getattr(sa, '_reboot_cmd', None)
+check('_reboot_cmd exists', callable(rc))
+if callable(rc):
+    for st, given, want in (
+            ({'state': 'UBOOT'},                        None, 'reset'),
+            ({'state': 'QUIET', 'quiet_from': 'UBOOT'}, None, 'reset'),
+            ({'state': 'SHELL'},                        None, 'reboot'),
+            ({'state': 'LOGIN'},                        None, 'reboot'),
+            ({},                                        None, 'reboot'),
+            ({'state': 'UBOOT'},              'reboot -f', 'reboot -f')):
+        got = rc(st, given)
+        check(f'{st} cmd={given!r} -> {got!r}', got == want)
+
+print('5. a board that never went down never exits 0')
+ec = getattr(sa, '_reboot_exit_code', None)
+check('_reboot_exit_code exists', callable(ec))
+if callable(ec):
+    for wd, st, want in ((False, 'UBOOT', 1),   # U-Boot ignored 'reboot'
+                         (False, 'SHELL', 1),   # shell ignored it
+                         (True,  'UBOOT', 0),
+                         (True,  'SHELL', 0),
+                         (True,  'LOGIN', 1),
+                         (True,  'PANIC', 1)):
+        got = ec(wd, st)
+        check(f'went_down={wd} state={st} -> {got}', got == want)
+    check('cmd_reboot uses it', '_reboot_exit_code(' in body)
+
 sys.exit(1 if fails else 0)

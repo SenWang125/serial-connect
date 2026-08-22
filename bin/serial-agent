@@ -2088,6 +2088,30 @@ def _reboot_login_action(st: dict) -> str:
     return 'login' if _needs_login(st) else 'send'
 
 
+def _reboot_cmd(st: dict, explicit=None) -> str:
+    """The reset command this console understands, unless the caller named one.
+
+    U-Boot has no `reboot` — it answers `Unknown command`, stays at its prompt,
+    and the board never restarts.
+    """
+    if explicit:
+        return explicit
+    cst = st.get('state', '')
+    if cst == 'UBOOT' or (cst == 'QUIET' and st.get('quiet_from') == 'UBOOT'):
+        return 'reset'
+    return 'reboot'
+
+
+def _reboot_exit_code(went_down: bool, state: str) -> int:
+    """0 only if the board actually went down AND came back usable.
+
+    Reaching a usable state proves nothing on its own: a board that ignored the
+    command was already at SHELL or UBOOT, and _wait_state's ALREADY fast path
+    reports that instantly as success.
+    """
+    return 0 if (went_down and state in ('SHELL', 'UBOOT')) else 1
+
+
 def _maybe_auto_login(args):
     """Log in first when the console is sitting at a login prompt.
 
@@ -2950,8 +2974,14 @@ def cmd_reboot(args):
       serial-agent reboot DEVICE --login --setup-terminal --timeout 120
     """
     device = args.device
+    sf = devdir(device) / 'status.json'
+    try:
+        _stj = json.loads(sf.read_text()) if sf.exists() else {}
+    except (OSError, ValueError):
+        _stj = {}
+    args.cmd = _reboot_cmd(_stj, args.cmd)
 
-    _log_op(device, 'reboot', cmd=args.cmd)
+    _log_op(device, 'reboot', cmd=args.cmd, state=_stj.get('state', ''))
 
     # Mark where the boot begins in stream.log so --capture can slice+digest it.
     _cap_baseline = _stream_size(device) if getattr(args, 'capture', False) else 0
@@ -2961,14 +2991,9 @@ def cmd_reboot(args):
     # board never actually rebooted (command was ignored or came back instantly
     # and hit the _wait_state fast path with the pre-reboot SHELL state).
     t_reboot_sent = time.time()
-    sf = devdir(device) / 'status.json'
 
     # A console parked at login: swallows the reboot command as a username, so
     # log in first; --no-login governs the post-reboot login only.
-    try:
-        _stj = json.loads(sf.read_text()) if sf.exists() else {}
-    except (OSError, ValueError):
-        _stj = {}
     if _reboot_login_action(_stj) == 'login':
         _maybe_auto_login(argparse.Namespace(device=device, user=args.user,
                                              password=args.password,
@@ -3054,7 +3079,7 @@ def cmd_reboot(args):
         print(json.dumps({'state': state, 'device': device}))
     elif not args.quiet:
         print(f'Board back: state={state}')
-    sys.exit(0 if state in ('SHELL', 'UBOOT') else 1)
+    sys.exit(_reboot_exit_code(went_down, state))
 
 
 def cmd_login(args):
@@ -4425,7 +4450,8 @@ def main():
     sp = sub.add_parser('reboot',
         help='Reboot board, wait for it to return, optionally auto-login')
     dev(sp); sp.set_defaults(func=cmd_reboot)
-    sp.add_argument('--cmd',            default='reboot', help='Reboot command (default: reboot)')
+    sp.add_argument('--cmd',            default=None,
+                    help='Reset command (default: reboot, or reset at a U-Boot prompt)')
     sp.add_argument('--timeout',        type=float, default=120.0)
     sp.add_argument('--no-login',       action='store_true', help='Do not auto-login after reboot (a console already at login: is still logged in first, or the reboot would be typed as a username)')
     sp.add_argument('--login',          action='store_true', help='(no-op, auto-login is default)')
