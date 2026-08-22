@@ -1432,7 +1432,7 @@ def _wait_pattern(device, pattern, timeout, show=False, baseline_offset=None):
         if pat.pattern == r'[\$#>]\s*$' or 'SHELL' in pattern.upper():
             try:
                 s = json.loads(sf.read_text())
-                if s.get('state') == 'SHELL':
+                if s.get('state') == 'SHELL' or _is_uboot(s):
                     lpa = s.get('last_prompt_ago')
                     elapsed = time.time() - t_start
                     if lpa is not None and lpa < elapsed:
@@ -1809,8 +1809,8 @@ def cmd_alive(args):
         _log_op(args.device, 'alive', result='ALIVE', state=state)
         print(f'ALIVE  state={state}  output {ago:.1f}s ago'); sys.exit(0)
 
-    # UBOOT = board is alive at U-Boot prompt
-    if state == 'UBOOT':
+    # UBOOT = board is alive at U-Boot prompt (parked at one counts)
+    if _is_uboot(s):
         _log_op(args.device, 'alive', result='ALIVE', state='UBOOT')
         print(f'ALIVE  state=UBOOT'); sys.exit(0)
 
@@ -1833,7 +1833,7 @@ def cmd_alive(args):
             if bf.exists() and bf.stat().st_size > prev:
                 s2 = json.loads(sf.read_text())
                 st2 = s2.get('state', '')
-                if st2 in ('SHELL', 'RUNNING', 'LOGIN', 'PASSWORD'):
+                if st2 in ('SHELL', 'RUNNING', 'LOGIN', 'PASSWORD', 'UBOOT'):
                     _log_op(args.device, 'alive', result='ALIVE', state=st2)
                     print(f'ALIVE  state={st2}  (probe response)'); sys.exit(0)
                 prev = bf.stat().st_size
@@ -1882,7 +1882,9 @@ def cmd_read(args):
     elif (dd / 'buf.log').exists():
         lines = (dd / 'buf.log').read_text(errors='replace').splitlines()
     else:
-        sys.exit(0)
+        print(f'{args.device}: no stream.log or buf.log — daemon never started?',
+              file=sys.stderr)
+        sys.exit(2)
     tail = lines[-n:]
     if args.no_timestamps:
         tail = _strip_timestamps(tail)
@@ -2000,8 +2002,7 @@ def _boot_capture(device, baseline, timeout, digest_lines=BOOT_DIGEST_TAIL,
     except OSError:
         capture_file = None
 
-    outcome = ('up' if state in ('SHELL', 'LOGIN', 'UBOOT')
-               else 'frozen' if state in ('FROZEN', 'PANIC') else 'timeout')
+    outcome = _boot_outcome(state, bool(reached), len(lines))
     result = {'device': device, 'outcome': outcome, 'state': state,
               'reached': bool(reached), **summary,
               'capture_file': str(capture_file) if capture_file else None}
@@ -2012,7 +2013,8 @@ def _boot_capture(device, baseline, timeout, digest_lines=BOOT_DIGEST_TAIL,
     if not quiet:
         banner = {'up':      '\033[32m✓ booted\033[0m',
                   'frozen':  '\033[31m✗ FROZEN — board hung mid-boot\033[0m',
-                  'timeout': '\033[33m… TIMEOUT — no prompt reached\033[0m'}[outcome]
+                  'timeout': '\033[33m… TIMEOUT — no prompt reached\033[0m',
+                  'nothing': '\033[31m✗ NOTHING CAPTURED — the board never reset\033[0m'}[outcome]
         bt = f", kernel {summary['boot_secs']:.1f}s" if summary['boot_secs'] else ''
         print(f"boot {device}: {banner}  (state={state}{bt}; {summary['fatal']} fatal / "
               f"{summary['errors']} err / {summary['warnings']} warn "
@@ -2042,14 +2044,31 @@ def cmd_boot(args):
         sys.exit(2)
     baseline = _stream_size(device)
     if args.reset_cmd:
-        _log_op(device, 'boot', reset_cmd=args.reset_cmd)
-        fifo = devdir(device) / 'input.fifo'
+        _maybe_auto_login(argparse.Namespace(device=device, user='root',
+                                             password=None, no_login=False,
+                                             login=False))
         try:
-            fd = os.open(str(fifo), os.O_WRONLY | os.O_NONBLOCK)
-            try: os.write(fd, (args.reset_cmd + '\n').encode())
-            finally: os.close(fd)
-        except OSError:
-            pass
+            _stj = json.loads((devdir(device) / 'status.json').read_text())
+        except (OSError, ValueError):
+            _stj = {}
+        args.reset_cmd = _reboot_cmd(
+            _stj, args.reset_cmd if args.reset_cmd != 'reboot' else None)
+        _log_op(device, 'boot', reset_cmd=args.reset_cmd,
+                state=_stj.get('state', ''))
+        fifo = devdir(device) / 'input.fifo'
+        sent = False
+        for _ in range(20):
+            try:
+                fd = os.open(str(fifo), os.O_WRONLY | os.O_NONBLOCK)
+                try: os.write(fd, (args.reset_cmd + '\n').encode())
+                finally: os.close(fd)
+                sent = True
+                break
+            except OSError:
+                time.sleep(0.1)
+        if not sent:
+            print(f'daemon not accepting input for {device}', file=sys.stderr)
+            sys.exit(1)
     elif not args.quiet and not args.json:
         print(f'Waiting for {device} to boot (trigger the reset now)…', file=sys.stderr)
     result = _boot_capture(device, baseline, args.timeout,
@@ -2086,6 +2105,32 @@ def _reboot_login_action(st: dict) -> str:
     corrupting input.
     """
     return 'login' if _needs_login(st) else 'send'
+
+
+def _is_uboot(st: dict) -> bool:
+    """True if the console is at a U-Boot prompt, parked or live.
+
+    U-Boot is a live console with a different dialect, not a dead board — the
+    distinction every caller that only tested `state == 'SHELL'` got wrong.
+    """
+    cst = st.get('state', '')
+    return cst == 'UBOOT' or (cst == 'QUIET' and st.get('quiet_from') == 'UBOOT')
+
+
+def _boot_outcome(state: str, reached: bool, captured_lines: int) -> str:
+    """'up' | 'frozen' | 'timeout' | 'nothing'.
+
+    Reaching a usable state proves nothing if the board was already in one:
+    _wait_state's ALREADY fast path returns instantly at a prompt, so a boot
+    that captured no output never happened.
+    """
+    if not reached:
+        return 'timeout'
+    if state in ('PANIC', 'FROZEN'):
+        return 'frozen'
+    if state in ('SHELL', 'LOGIN', 'UBOOT'):
+        return 'up' if captured_lines else 'nothing'
+    return 'timeout'
 
 
 def _reboot_cmd(st: dict, explicit=None) -> str:
@@ -2445,14 +2490,19 @@ def cmd_watch(args):
     if getattr(args, 'send', None):
         iff = devdir(dev) / 'input.fifo'
         cb = (args.send.rstrip('\n') + '\n').encode()
+        sent = False
         for _ in range(20):
             try:
                 wfd = os.open(str(iff), os.O_WRONLY | os.O_NONBLOCK)
                 try: os.write(wfd, cb)
                 finally: os.close(wfd)
+                sent = True
                 break
             except OSError:
                 time.sleep(0.1)
+        if not sent:
+            print(f'daemon not accepting input for {dev}', file=sys.stderr)
+            sys.exit(1)
 
     deadline = t0 + args.timeout
     acc = ''
@@ -3243,6 +3293,11 @@ def cmd_upload(args):
       serial-agent upload DEVICE ./large.bin /tmp/ --via-network
       serial-agent upload DEVICE ./large.bin /tmp/ --via-network --board-ip 192.168.1.100
     """
+    # A base64 chunk stream typed into getty is the worst version of this bug:
+    # every chunk becomes a failed username. Ask first, like every other sender.
+    _maybe_auto_login(argparse.Namespace(device=args.device, user="root",
+                                         password=None, no_login=False,
+                                         login=False))
     if args.via_network:
         _upload_via_network(args)
         return
@@ -3450,6 +3505,9 @@ def cmd_health(args):
                     / health['mem_total_kb'], 1)
 
     print(json.dumps(health, indent=2))
+    # State alone is not health: at UBOOT/LOGIN/PANIC/QUIET nothing was gathered.
+    sys.exit(0 if any(k in health for k in
+                      ('uname', 'uptime_sec', 'mem_free_kb', 'load')) else 1)
 
 
 def cmd_ser2net_gen(args):
