@@ -595,6 +595,10 @@ class Daemon:
         self._prev_state  = 'UNKNOWN'
         self.t_output     = 0.0
         self.t_prompt     = 0.0
+        # Monotonic: bumped only when a prompt actually arrives. t_prompt's
+        # AGE is recomputed only when a byte arrives, so on an idle board it
+        # freezes and cannot answer 'is this prompt newer than my command'.
+        self.prompt_seq   = 0
         self.prompt_text  = ''
         self._stop        = Event()
         self._sock        = None
@@ -767,6 +771,7 @@ class Daemon:
         elif RE_UBOOT.search(last) and not RE_KERNEL_TS.match(last):
             self.state = 'UBOOT'             # U-Boot interactive prompt
             self.t_prompt = t
+            self.prompt_seq += 1
             self.prompt_text = last.strip()
         elif RE_LOGIN.search(last):
             self.state = 'LOGIN'
@@ -776,6 +781,7 @@ class Daemon:
                 RE_SHELL2.search(last) or (RE_SHELL.search(last) and len(last) >= 2)):
             self.state = 'SHELL'
             self.t_prompt = t
+            self.prompt_seq += 1
             self.prompt_text = last.strip()
         elif RE_BOOT.search(clean[-300:]):
             self.state = 'BOOTING'
@@ -918,6 +924,7 @@ class Daemon:
             'state':           self.state,
             'last_output_ago': round(t - self.t_output, 1) if self.t_output else None,
             'last_prompt_ago': round(t - self.t_prompt, 1) if self.t_prompt else None,
+            'prompt_seq':      self.prompt_seq,
             'prompt_text':     self.prompt_text,
             'pid':             os.getpid(),
             'device':          self.device,
@@ -1478,6 +1485,10 @@ def _wait_pattern(device, pattern, timeout, show=False, baseline_offset=None,
     sf = devdir(device) / 'status.json'
     pat = re.compile(pattern)
     _prompt_wait = _seeks_prompt(pat, pattern)
+    try:
+        _seq0 = json.loads((devdir(device) / 'status.json').read_text()).get('prompt_seq')
+    except (OSError, ValueError):
+        _seq0 = None
     deadline = time.time() + timeout
     t_start = time.time()
     baseline = baseline_offset if baseline_offset is not None else (
@@ -1500,10 +1511,16 @@ def _wait_pattern(device, pattern, timeout, show=False, baseline_offset=None,
             try:
                 s = json.loads(sf.read_text())
                 if s.get('state') == 'SHELL' or _is_uboot(s):
-                    lpa = s.get('last_prompt_ago')
-                    elapsed = time.time() - t_start
-                    if lpa is not None and lpa < elapsed:
-                        return True
+                    seq = s.get('prompt_seq')
+                    if seq is not None:
+                        # Only a prompt that arrived AFTER we started counts.
+                        if _seq0 is not None and seq > _seq0:
+                            return True
+                    else:
+                        lpa = s.get('last_prompt_ago')   # daemon predates the counter
+                        elapsed = time.time() - t_start
+                        if lpa is not None and lpa < elapsed:
+                            return True
             except (OSError, ValueError, KeyError):
                 pass
 
