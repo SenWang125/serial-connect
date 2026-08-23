@@ -328,6 +328,10 @@ STREAM_KEEP_SEGMENTS = _env_int('SERIAL_STREAM_SEGMENTS', 4, 1)  # rotated segme
 
 # ── Patterns ───────────────────────────────────────────────────────────────────
 RE_SHELL    = re.compile(r'[\$#>]\s*$')
+# A kernel log line is never a prompt. RE_SHELL matches anything ending in
+# '>', and one printk with an email address in angle brackets was enough to
+# report state SHELL and store the whole line as prompt_text.
+RE_KERNEL_TS = re.compile(r'^\[\s*\d+\.\d+\]')
 RE_SHELL2   = re.compile(r'\w[\w.\-]*@[\w.\-]+[:#~/][^\n]*[\$#>]\s*$')
 RE_LOGIN    = re.compile(r'(login|Username)\s*:\s*$', re.I)
 RE_PASSWORD = re.compile(r'(Password|passwd)\s*:\s*$', re.I)
@@ -749,7 +753,7 @@ class Daemon:
         prev = self.state
         if RE_PANIC.search(clean[-500:]):
             self.state = 'PANIC'             # kernel panic / oops — board needs reboot
-        elif RE_UBOOT.search(last):
+        elif RE_UBOOT.search(last) and not RE_KERNEL_TS.match(last):
             self.state = 'UBOOT'             # U-Boot interactive prompt
             self.t_prompt = t
             self.prompt_text = last.strip()
@@ -757,7 +761,8 @@ class Daemon:
             self.state = 'LOGIN'
         elif RE_PASSWORD.search(last):
             self.state = 'PASSWORD'
-        elif RE_SHELL2.search(last) or (RE_SHELL.search(last) and len(last) >= 2):
+        elif not RE_KERNEL_TS.match(last) and (
+                RE_SHELL2.search(last) or (RE_SHELL.search(last) and len(last) >= 2)):
             self.state = 'SHELL'
             self.t_prompt = t
             self.prompt_text = last.strip()
