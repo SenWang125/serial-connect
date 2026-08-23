@@ -1809,10 +1809,12 @@ def cmd_alive(args):
         _log_op(args.device, 'alive', result='ALIVE', state=state)
         print(f'ALIVE  state={state}  output {ago:.1f}s ago'); sys.exit(0)
 
-    # UBOOT = board is alive at U-Boot prompt (parked at one counts)
-    if _is_uboot(s):
-        _log_op(args.device, 'alive', result='ALIVE', state='UBOOT')
-        print(f'ALIVE  state=UBOOT'); sys.exit(0)
+    # Any usable prompt means the board is alive, including one it has gone
+    # quiet at — that was reporting live boards as dead.
+    if _console_is_live(s):
+        _live = s.get('quiet_from') if s.get('state') == 'QUIET' else s.get('state')
+        _log_op(args.device, 'alive', result='ALIVE', state=_live)
+        print(f'ALIVE  state={_live}'); sys.exit(0)
 
     # Slow path: probe with CR — skip if a human tio session is active
     bf = devdir(args.device) / 'buf.log'
@@ -1841,8 +1843,7 @@ def cmd_alive(args):
                 s2 = {}
             st2 = s2.get('state', '')
             ago2 = s2.get('last_output_ago')
-            if st2 in ('SHELL', 'RUNNING', 'LOGIN', 'PASSWORD', 'UBOOT') \
-                    or _is_uboot(s2) \
+            if _console_is_live(s2) \
                     or (ago2 is not None and ago2 < 2.0) \
                     or (bf.exists() and bf.stat().st_size > prev):
                 _log_op(args.device, 'alive', result='ALIVE', state=st2)
@@ -2121,6 +2122,22 @@ def _reboot_login_action(st: dict) -> str:
     corrupting input.
     """
     return 'login' if _needs_login(st) else 'send'
+
+
+LIVE_CONSOLE_STATES = ('SHELL', 'RUNNING', 'LOGIN', 'PASSWORD', 'UBOOT')
+
+
+def _console_is_live(st: dict) -> bool:
+    """True if the console is at any usable prompt, parked or not.
+
+    QUIET only means nothing has printed lately. A console that went quiet AT a
+    prompt is still sitting at that prompt, so quiet_from carries the real
+    state — the same reasoning _needs_login and _is_uboot already use.
+    """
+    cst = st.get('state', '')
+    if cst in LIVE_CONSOLE_STATES:
+        return True
+    return cst == 'QUIET' and st.get('quiet_from') in LIVE_CONSOLE_STATES
 
 
 def _is_uboot(st: dict) -> bool:

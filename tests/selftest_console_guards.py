@@ -54,7 +54,8 @@ if callable(iu):
                      ({'state': 'QUIET', 'quiet_from': 'LOGIN'}, False),
                      ({}, False)):
         check(f'{st} -> {iu(st)}', iu(st) == want)
-    check('cmd_alive asks it',      '_is_uboot(' in body_of('cmd_alive'))
+    check('cmd_alive treats U-Boot as live',
+          '_is_uboot(' in body_of('cmd_alive') or '_console_is_live(' in body_of('cmd_alive'))
     check('_wait_pattern asks it',  '_is_uboot(' in body_of('_wait_pattern'))
 
 print()
@@ -85,7 +86,7 @@ print('6. liveness must not depend on buf.log growing')
 ab = body_of('cmd_alive')
 probe = ab[ab.index('Slow path'):] if 'Slow path' in ab else ab
 check('slow probe reads the daemon state, not only buf.log size',
-      "json.loads(sf.read_text())" in probe and "st2 in (" in probe)
+      "json.loads(sf.read_text())" in probe and "_console_is_live(s2)" in probe)
 check('slow probe accepts recent output as proof of life',
       'last_output_ago' in probe)
 check('the reported state is re-read, not the one from before the probe',
@@ -106,5 +107,19 @@ if callable(ti):
     check('cmd_upload uses it instead of str.isdigit', '_trailing_int(' in ub)
     check('cmd_upload no longer requires the whole output to be a number',
           'actual.isdigit()' not in ub)
+
+print()
+print('8. a console parked at a prompt is alive, not dead')
+cl = getattr(sa, '_console_is_live', None)
+check('_console_is_live exists', callable(cl))
+if callable(cl):
+    for st, want in (({'state': 'SHELL'}, True), ({'state': 'UBOOT'}, True),
+                     ({'state': 'QUIET', 'quiet_from': 'PASSWORD'}, True),
+                     ({'state': 'QUIET', 'quiet_from': 'LOGIN'}, True),
+                     ({'state': 'QUIET', 'quiet_from': 'UBOOT'}, True),
+                     ({'state': 'QUIET', 'quiet_from': 'UNKNOWN'}, False),
+                     ({'state': 'QUIET'}, False), ({'state': 'DEAD'}, False), ({}, False)):
+        check(f'{st} -> {cl(st)}', cl(st) == want)
+    check('cmd_alive uses it', '_console_is_live(' in body_of('cmd_alive'))
 
 sys.exit(1 if fails else 0)
