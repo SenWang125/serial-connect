@@ -2520,11 +2520,22 @@ def _send_impl(args):
             _st = json.loads((devdir(args.device) / 'status.json').read_text())
         except (OSError, ValueError):
             _st = {}
-        if _st.get('idle_timeout', 0) > 0 and not _st.get('port_held', True):
-            print(f'{args.device}: daemon is parked in on-demand mode '
-                  f'(--idle-timeout {_st["idle_timeout"]}) and is not holding the '
-                  f'port, so the command was discarded. Restart the daemon with '
-                  f'--idle-timeout 0 for automation use.', file=sys.stderr)
+        if not _st.get('port_held', True):
+            # port_held is what decides whether the write reached the wire.
+            # Keying on idle_timeout narrowed this to on-demand daemons, so an
+            # always-on daemon whose device had vanished gave a bare timeout
+            # with no explanation.
+            if _st.get('idle_timeout', 0) > 0:
+                print(f'{args.device}: daemon is parked in on-demand mode '
+                      f'(--idle-timeout {_st["idle_timeout"]}) and is not holding '
+                      f'the port, so the command was discarded. Restart the daemon '
+                      f'with --idle-timeout 0 for automation use.', file=sys.stderr)
+            else:
+                print(f'{args.device}: the daemon is running but is NOT holding the '
+                      f'port (port_held=false) — the device is gone or could not be '
+                      f'opened, so the command never reached the wire. Check '
+                      f'`serial-agent list` and that {args.device} still exists.',
+                      file=sys.stderr)
 
     if args.json or args.capture or args.exit_code:
         new_lines = []
@@ -2927,8 +2938,11 @@ def cmd_connect(args):
         if not _daemon_running(_d):
             cmd_start(argparse.Namespace(device=_d, baud=115200, lines=500,
                                          idle_timeout=0, tcp=None, no_ser2net=False))
-        if args.wait_shell:
-            _wait_state(_d, 'SHELL,LOGIN,PASSWORD,UBOOT', args.timeout)
+        if args.wait_shell and not _wait_state(_d, 'SHELL,LOGIN,PASSWORD,UBOOT',
+                                               args.timeout,
+                                               print_output=not args.json):
+            print(f'{_d}: no prompt within {args.timeout}s', file=sys.stderr)
+            sys.exit(1)
         print(json.dumps({'device': _d}) if args.json else f'connected {_d}')
         sys.exit(0)
     sd = shutil.which('serial-discover')

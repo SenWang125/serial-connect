@@ -61,7 +61,7 @@ if [[ "${1:-}" == "--json" ]]; then
     sep=""
     for i in "${!DEVS[@]}"; do
         dev="${DEVS[$i]}"; devname="${dev##*/}"
-        local state baud_raw probe_id
+        state=''; baud_raw=''; probe_id=''
         IFS='|' read -r state baud_raw probe_id _ < "$PROBE_DIR/$devname" 2>/dev/null \
             || { state='FAIL'; baud_raw=''; probe_id=''; }
         [[ "$state" == "DEAD" ]] && state="dead"
