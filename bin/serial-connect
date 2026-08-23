@@ -178,6 +178,16 @@ launch() {
             echo -e "  Restart it:  serial-agent stop $dev --force && serial-agent start $dev --idle-timeout 0" >&2
             return 1
         fi
+        # The accept loop runs from daemon start in its own thread and accepts
+        # whether or not the serial fd is open, so the probe above reads the same
+        # in both worlds. port_held is the value that distinguishes them.
+        local _sj="$HOME/var/serial-agent/${_devname}/status.json"
+        if [[ -f "$_sj" ]] && grep -q '"port_held": *false' "$_sj" 2>/dev/null; then
+            echo -e "  ${RED}✗${NC}  the daemon is running but is NOT holding $dev." >&2
+            echo -e "  The console would be silent and swallow every keystroke." >&2
+            echo -e "  Check the device still exists, then:  serial-agent stop $dev --force && serial-agent start $dev --idle-timeout 0" >&2
+            return 1
+        fi
         local _relay_label="ser2net"
         [[ "$agent_tcp" == 127.0.0.1:* ]] && _relay_label="built-in relay"
         # Include the bash PID ($$) to make the path unique per session.

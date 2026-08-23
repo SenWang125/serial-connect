@@ -1749,9 +1749,25 @@ def cmd_start(args):
         sf = ddir / 'status.json'
         if sf.exists():
             s = json.loads(sf.read_text())
+            # run() writes status.json BEFORE the connect loop, so its existence
+            # only proves the process started. port_held answers whether the
+            # device was actually opened -- without it, `start` reported success
+            # for a board that had re-enumerated to another node, and every
+            # later send timed out with no clue why.
+            for _ in range(20):
+                if s.get('port_held'):
+                    break
+                time.sleep(0.2)
+                try: s = json.loads(sf.read_text())
+                except (OSError, ValueError): break
             print(f"daemon PID {s['pid']}  {args.device}  via {s['via']}")
             print(f"  buf:  {s['buf_file']}")
             print(f"  tail: tail -F {Path(s['buf_file']).parent / 'stream.log'}")
+            if not s.get('port_held', True):
+                print(f"  WARNING: the daemon is NOT holding {args.device} — it "
+                      f"could not be opened. Sends will be discarded until it "
+                      f"appears. See {ddir}/daemon.log", file=sys.stderr)
+                sys.exit(1)
         else:
             print(f"daemon failed to start — check {ddir}/daemon.log", file=sys.stderr)
             sys.exit(1)
