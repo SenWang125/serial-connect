@@ -418,7 +418,7 @@ def _clean_output(raw_lines: list, sent_cmd: str = '') -> tuple:
     # Note: --no-wrap sets COLUMNS=32767 env var for the executed command's
     # output, but the terminal echo of typed characters still wraps at the
     # board's tty cols setting.  Form 1b handles that wrapping.
-    cmd_stripped = sent_cmd.strip()
+    cmd_stripped = (sent_cmd or '').strip()
     if cmd_stripped and lines:
         first = lines[0].strip()
         if first.endswith(cmd_stripped) and len(first) > len(cmd_stripped):
@@ -479,8 +479,19 @@ def _clean_output(raw_lines: list, sent_cmd: str = '') -> tuple:
         else:
             cleaned.append(l)
 
-    # Remove trailing prompt line(s)
-    while cleaned and (RE_SHELL.search(cleaned[-1]) or RE_SHELL2.search(cleaned[-1])):
+    # Remove trailing prompt line(s). RE_SHELL matches ANY line ending in $ # or
+    # >, so this has to be told what a prompt looks like or it deletes real
+    # output: a kernel line quoting <someone@host>, or every closing tag of an
+    # XML file. A prompt is short, is not a kernel log line, and is either the
+    # user@host form or almost nothing but the sigil itself.
+    def _is_prompt_line(l):
+        t = l.strip()
+        if not t or RE_KERNEL_TS.match(t):
+            return False
+        if RE_SHELL2.search(t):
+            return True
+        return bool(RE_SHELL.search(t)) and len(t) <= 4
+    while cleaned and _is_prompt_line(cleaned[-1]):
         cleaned.pop()
 
     # Remove trailing blank lines
@@ -1399,8 +1410,6 @@ def _seeks_prompt(pat, pattern: str) -> bool:
     never reaches buf.log either, so the wait burned its whole timeout on a login
     that had already succeeded.
     """
-    if 'SHELL' in pattern.upper():
-        return True
     if any(pat.search(sample) for sample in ('root@host:~# ', '# ', '$ ', '=> ')):
         return True
     # A caller pasting its own board's prompt literal, e.g. root@am62dxx-evm:~#,
@@ -2612,8 +2621,10 @@ def cmd_watch(args):
             time.sleep(0.02)     # writer end momentarily closed; keep waiting
             continue
         acc += _strip_ansi(chunk.decode('utf-8', errors='replace'))
+        # Without this, --send 'echo DONE' --until DONE matches the echoed
+        # command the instant it appears, before the board has run anything.
         for k, pat in patterns.items():
-            if pat.search(acc):
+            if pat.search(_echo_free(acc, args.send)):
                 matched = k; break
     os.close(rfd)
 
@@ -2625,12 +2636,12 @@ def cmd_watch(args):
                 tail = f.read().decode('utf-8', errors='replace')
             merged = acc + _strip_ansi(tail)
             for k, pat in patterns.items():
-                if pat.search(merged):
+                if pat.search(_echo_free(merged, args.send)):
                     matched = k; acc = merged; break
         except OSError:
             pass
 
-    out_text, _ = _clean_output(acc.splitlines())
+    out_text, _ = _clean_output(acc.splitlines(), sent_cmd=args.send or '')
     res = {'matched': matched, 'output': out_text,
            'elapsed_ms': int((time.time() - t0) * 1000)}
     if matched is None:
@@ -2900,7 +2911,7 @@ def cmd_connect(args):
             cmd_start(argparse.Namespace(device=_d, baud=115200, lines=500,
                                          idle_timeout=0, tcp=None, no_ser2net=False))
         if args.wait_shell:
-            _wait_state(_d, 'SHELL,LOGIN,PASSWORD', args.timeout)
+            _wait_state(_d, 'SHELL,LOGIN,PASSWORD,UBOOT', args.timeout)
         print(json.dumps({'device': _d}) if args.json else f'connected {_d}')
         sys.exit(0)
     sd = shutil.which('serial-discover')
@@ -2967,7 +2978,7 @@ def cmd_connect(args):
                     pass
 
     if args.wait_shell:
-        if not _wait_state(device, 'SHELL,LOGIN,PASSWORD', args.timeout,
+        if not _wait_state(device, 'SHELL,LOGIN,PASSWORD,UBOOT', args.timeout,
                            print_output=not args.json):
             sys.exit(1)  # _wait_state already printed DAEMON_DIED or TIMEOUT
         sf = devdir(device) / 'status.json'
@@ -3271,7 +3282,7 @@ def cmd_login(args):
 
     _st = json.loads(sf.read_text())
     state = _st.get('state', 'UNKNOWN')
-    if state == 'SHELL':
+    if state == 'SHELL' or (state == 'QUIET' and _st.get('quiet_from') == 'SHELL'):
         print('Already at shell'); return
     if state == 'BOOTING':
         _wait_state(device, 'LOGIN', getattr(args, 'timeout', 90) or 90)
@@ -3505,7 +3516,8 @@ def cmd_run(args):
     sf = devdir(device) / 'status.json'
     s = json.loads(sf.read_text()) if sf.exists() else {}
     state = s.get('state', 'UNKNOWN')
-    if state in ('LOGIN', 'PASSWORD', 'BOOTING', 'PANIC'):
+    if _is_uboot(s) or state in ('LOGIN', 'PASSWORD', 'BOOTING', 'PANIC',
+                                   'FROZEN', 'DEAD'):
         print(f'Board not at shell (state={state}). Run: serial-agent login {device}',
               file=sys.stderr); sys.exit(1)
     if state == 'RUNNING':
@@ -3544,19 +3556,11 @@ def cmd_run(args):
         timeout=args.timeout, no_wrap=getattr(args, 'no_wrap', False))
 
     if result:
-        # Parse exit code from output
-        output = result.get('output', '')
-        exit_code = None
-        lines = output.splitlines()
-        clean = []
-        for l in lines:
-            m = RE_EXITCODE.match(l.strip())
-            if m:
-                exit_code = int(m.group(1))
-            else:
-                clean.append(l)
-        result['output'] = '\n'.join(clean).strip()
-        result['exit_code'] = exit_code
+        # _clean_output already extracted the exit code AND removed the tag line,
+        # so re-parsing its output for the tag always found nothing and every run
+        # exited 0 regardless of what the script did.
+        exit_code = result.get('exit_code')
+        result['output'] = (result.get('output') or '').strip()
 
         if args.json:
             print(json.dumps(result, indent=2))
@@ -3591,7 +3595,10 @@ def cmd_health(args):
         state = s.get('state', 'UNKNOWN')
         health['state'] = state
 
-    if state == 'SHELL':
+    # A board quiet at a shell is still at a shell. Gating on the exact name
+    # reported it unhealthy with no error text whenever the keepalive was
+    # suppressed, which is any time a human tio session is open.
+    if state == 'SHELL' or (state == 'QUIET' and s.get('quiet_from') == 'SHELL'):
         # Gather vitals with a single compound command
         vitals_cmd = (
             'printf "UNAME:%s\\n" "$(uname -r)"; '
@@ -4595,7 +4602,7 @@ def main():
 
     sp = sub.add_parser('wait-alive'); dev(sp)
     sp.add_argument('--timeout', type=float, default=120.0)
-    def _wait_alive(a): a.state = 'SHELL,LOGIN,PASSWORD'; cmd_wait_state(a)
+    def _wait_alive(a): a.state = 'SHELL,LOGIN,PASSWORD,UBOOT'; cmd_wait_state(a)
     sp.set_defaults(func=_wait_alive)
 
     sp = sub.add_parser('wait-state',

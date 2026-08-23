@@ -32,7 +32,8 @@ if callable(sp):
             (r'root@am62dxx-evm:~#',     True,  'an explicit prompt string'),
             (r'#',                       True,  'a bare hash'),
             (r'=>',                      True,  'a U-Boot prompt'),
-            (r'SHELL',                   True,  'the literal word'),
+            (r'SHELL',                   False, 'a user marker, not a prompt'),
+            (r'SHELL_READY',             False, 'a user marker containing SHELL'),
             (r'MARKER_END',              False, 'a caller-built marker'),
             (r'card0|FAIL|Error',        False, 'a result pattern'),
             (r'PS_DONE',                 False, 'a runtime marker')):
