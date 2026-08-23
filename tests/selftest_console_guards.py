@@ -78,4 +78,33 @@ check('cmd_health does not exit 0 having gathered nothing',
 check('cmd_read does not exit 0 with no log at all',
       "sys.exit(0)" not in body_of('cmd_read').split('no buffer')[0])
 
+print()
+print('6. liveness must not depend on buf.log growing')
+# A prompt with no trailing newline is held in _partial and never written to
+# buf.log. Found on hardware: a board at a login prompt reported DEAD.
+ab = body_of('cmd_alive')
+probe = ab[ab.index('Slow path'):] if 'Slow path' in ab else ab
+check('slow probe reads the daemon state, not only buf.log size',
+      "json.loads(sf.read_text())" in probe and "st2 in (" in probe)
+check('slow probe accepts recent output as proof of life',
+      'last_output_ago' in probe)
+check('the reported state is re-read, not the one from before the probe',
+      "state = json.loads(sf.read_text()).get('state', state)" in ab)
+
+print()
+print('7. a command echo must not be mistaken for the command result')
+ti = getattr(sa, '_trailing_int', None)
+check('_trailing_int exists', callable(ti))
+if callable(ti):
+    # exactly what the board returns: echoed command, then the byte count
+    echoed = 'root@am62dxx-evm:~# base64 -d /tmp/_sa_upload.b64 > "/tmp/f" && wc -c < "/tmp/f"\n44'
+    for text, want in ((echoed, 44), ('44', 44), ('', None), ('no digits here', None),
+                       ('wc -c < /tmp/x9\n1024', 1024)):
+        got = ti(text)
+        check(f'{text[-24:]!r} -> {got}', got == want)
+    ub = body_of('cmd_upload')
+    check('cmd_upload uses it instead of str.isdigit', '_trailing_int(' in ub)
+    check('cmd_upload no longer requires the whole output to be a number',
+          'actual.isdigit()' not in ub)
+
 sys.exit(1 if fails else 0)

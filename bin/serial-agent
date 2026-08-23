@@ -1830,14 +1830,30 @@ def cmd_alive(args):
             if not _daemon_running(args.device):
                 break
             time.sleep(0.15)
-            if bf.exists() and bf.stat().st_size > prev:
+            # A prompt with no trailing newline never reaches buf.log — _append
+            # holds it in _partial — so buf.log growth cannot be the liveness
+            # signal. The daemon's state machine sees the raw text and records
+            # it in status.json, so read that. A board answering our CR with
+            # "login:" is alive; waiting for a whole line reports it dead.
+            try:
                 s2 = json.loads(sf.read_text())
-                st2 = s2.get('state', '')
-                if st2 in ('SHELL', 'RUNNING', 'LOGIN', 'PASSWORD', 'UBOOT'):
-                    _log_op(args.device, 'alive', result='ALIVE', state=st2)
-                    print(f'ALIVE  state={st2}  (probe response)'); sys.exit(0)
-                prev = bf.stat().st_size
+            except (OSError, ValueError):
+                s2 = {}
+            st2 = s2.get('state', '')
+            ago2 = s2.get('last_output_ago')
+            if st2 in ('SHELL', 'RUNNING', 'LOGIN', 'PASSWORD', 'UBOOT') \
+                    or _is_uboot(s2) \
+                    or (ago2 is not None and ago2 < 2.0) \
+                    or (bf.exists() and bf.stat().st_size > prev):
+                _log_op(args.device, 'alive', result='ALIVE', state=st2)
+                print(f'ALIVE  state={st2}  (probe response)'); sys.exit(0)
+            prev = bf.stat().st_size if bf.exists() else prev
 
+    # Report the state as it is NOW, not the one read before the probe.
+    try:
+        state = json.loads(sf.read_text()).get('state', state)
+    except (OSError, ValueError):
+        pass
     _log_op(args.device, 'alive', result='DEAD_OR_UNKNOWN', state=state)
     print(f'DEAD_OR_UNKNOWN  state={state}'); sys.exit(1)
 
@@ -3265,8 +3281,8 @@ def _upload_via_network(args):
             timeout=60, no_wrap=True)
 
         if result and not result.get('timed_out'):
-            actual = result.get('output', '').strip()
-            if actual.isdigit() and int(actual) == size:
+            actual = _trailing_int(result.get('output', ''))
+            if actual == size:
                 print(f'✓ {board_path} ({size} bytes) via HTTP')
                 return
             else:
@@ -3276,6 +3292,19 @@ def _upload_via_network(args):
         sys.exit(1)
     finally:
         httpd.shutdown()
+
+
+def _trailing_int(text):
+    """Last all-digit token in text, or None.
+
+    `wc -c` output comes back with the echoed command in front of it, so the
+    whole string is never a bare number and str.isdigit() on it always fails —
+    which reported every successful upload as a size mismatch.
+    """
+    for tok in reversed((text or '').split()):
+        if tok.isdigit():
+            return int(tok)
+    return None
 
 
 def cmd_upload(args):
@@ -3349,8 +3378,8 @@ def cmd_upload(args):
         timeout=30, no_wrap=True)
 
     if result and not result.get('timed_out'):
-        actual = result.get('output', '').strip()
-        if actual.isdigit() and int(actual) == size:
+        actual = _trailing_int(result.get('output', ''))
+        if actual == size:
             print(f'✓ {board_path} ({size} bytes)')
             sys.exit(0)
         else:
