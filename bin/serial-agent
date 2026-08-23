@@ -3094,6 +3094,16 @@ def cmd_reboot(args):
                   f"auto-login — refusing to send {args.cmd!r} into a login "
                   f"prompt (it would be taken as a username).", file=sys.stderr)
             sys.exit(1)
+        # Not needing a login is not the same as having a shell ready. getty
+        # hands over before the shell prints its first prompt, and a reboot sent
+        # into that gap is swallowed -- the board stays up and only the exit
+        # status reveals it. Wait for a real prompt before sending.
+        if _stj.get('state') not in ('SHELL', 'UBOOT'):
+            _wait_state(device, 'SHELL,UBOOT', 20, print_output=False)
+            try:
+                _stj = json.loads(sf.read_text()) if sf.exists() else {}
+            except (OSError, ValueError):
+                _stj = {}
 
     # Send the reboot command — don't wait for prompt (shell dies immediately)
     if _daemon_running(device):
@@ -3132,10 +3142,12 @@ def cmd_reboot(args):
                           as_json=args.json, quiet=args.quiet, do_wait=False)
         sys.exit(1)  # _wait_state already printed DAEMON_DIED or TIMEOUT
 
-    # Verify this is a NEW shell, not the pre-reboot one.
-    # last_prompt_ago = seconds since last prompt; approx_prompt_wall = when it happened.
-    # If that wall time is before t_reboot_sent, this is the old pre-reboot shell.
-    if sf.exists() and not args.quiet:
+    # Verify this is a NEW shell, not the pre-reboot one. Only meaningful when we
+    # are actually looking at a shell: a board that comes back to a login prompt
+    # has no post-reboot prompt yet, so the only timestamp available is the
+    # pre-reboot one and the check fires on every successful reboot.
+    _st_now = json.loads(sf.read_text()).get('state', '') if sf.exists() else ''
+    if sf.exists() and not args.quiet and _st_now == 'SHELL':
         prompt_ago = json.loads(sf.read_text()).get('last_prompt_ago')
         if prompt_ago is not None:
             approx_prompt_wall = time.time() - prompt_ago
