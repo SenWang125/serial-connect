@@ -1384,7 +1384,40 @@ def find_ser2net_port(device: str):
     return None
 
 
-def _wait_pattern(device, pattern, timeout, show=False, baseline_offset=None):
+def _echo_free(text: str, cmd: str) -> str:
+    """Drop the terminal's echo of `cmd` from the front of `text`.
+
+    A marker inside the command matches its own echo before the board has
+    answered, so `--wait DONE` on `echo DONE` returns immediately with an empty
+    reply. Only the LEADING run of lines is consumed, and only while they keep
+    spelling out the command, so real output is never eaten even when it repeats
+    a word from the command. The board wraps long commands across lines, which
+    is why this accumulates rather than comparing line by line.
+    """
+    if not cmd:
+        return text
+    norm = re.sub(r'\s+', '', _strip_ansi(cmd))
+    if not norm:
+        return text
+    lines = text.split('\n')
+    acc, i = '', 0
+    while i < len(lines) and len(acc) < len(norm):
+        l = re.sub(r'\s+', '', RE_TIMESTAMP.sub('', _strip_ansi(lines[i])))
+        if '#' in l:                      # drop a leading shell prompt
+            l = l.split('#', 1)[1]
+        if not l:
+            i += 1
+            continue
+        if norm.startswith(acc + l):
+            acc += l
+            i += 1
+            continue
+        break
+    return '\n'.join(lines[i:])
+
+
+def _wait_pattern(device, pattern, timeout, show=False, baseline_offset=None,
+                  echo_of=None):
     """Poll buf.log until `pattern` appears or timeout expires.
 
     Args:
@@ -1461,7 +1494,7 @@ def _wait_pattern(device, pattern, timeout, show=False, baseline_offset=None):
                 print(RE_TIMESTAMP.sub('', line))
             sys.stdout.flush()
 
-        if pat.search(_strip_ansi(new)):
+        if pat.search(_strip_ansi(_echo_free(new, echo_of))):
             return True
 
     return False
@@ -2424,7 +2457,7 @@ def _send_impl(args):
 
     wait_pat = args.wait if args.wait is not None else r'[\$#>]\s*$'
     show = not (args.json or args.capture)
-    ok = _wait_pattern(args.device, wait_pat, args.timeout,
+    ok = _wait_pattern(args.device, wait_pat, args.timeout, echo_of=cmd,
                        show=show, baseline_offset=baseline_offset)
     elapsed_ms = int((time.time() - t0) * 1000)
 
