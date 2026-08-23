@@ -1389,6 +1389,25 @@ def find_ser2net_port(device: str):
     return None
 
 
+def _seeks_prompt(pat, pattern: str) -> bool:
+    """True if `pat` is waiting for a shell or U-Boot prompt.
+
+    Decided by asking whether the pattern actually matches a prompt, not by
+    comparing the regex source. String equality missed every pattern that merely
+    contains the prompt alternative -- cmd_login waits on
+    `Password|[\\$#>]\\s*$` -- and since a prompt has no trailing newline it
+    never reaches buf.log either, so the wait burned its whole timeout on a login
+    that had already succeeded.
+    """
+    if 'SHELL' in pattern.upper():
+        return True
+    if any(pat.search(sample) for sample in ('root@host:~# ', '# ', '$ ', '=> ')):
+        return True
+    # A caller pasting its own board's prompt literal, e.g. root@am62dxx-evm:~#,
+    # matches no generic sample but is still a prompt wait.
+    return bool(re.search(r'\w+@[\w.\-]+\S*[#$>]', pattern))
+
+
 def _echo_free(text: str, cmd: str) -> str:
     """Drop the terminal's echo of `cmd` from the front of `text`.
 
@@ -1449,6 +1468,7 @@ def _wait_pattern(device, pattern, timeout, show=False, baseline_offset=None,
         bf = devdir(device) / 'buf.log'   # pre-stream.log daemon
     sf = devdir(device) / 'status.json'
     pat = re.compile(pattern)
+    _prompt_wait = _seeks_prompt(pat, pattern)
     deadline = time.time() + timeout
     t_start = time.time()
     baseline = baseline_offset if baseline_offset is not None else (
@@ -1467,7 +1487,7 @@ def _wait_pattern(device, pattern, timeout, show=False, baseline_offset=None,
         # via the raw text and updates status.json, so we check here too.
         # Guard: last_prompt_ago must be < elapsed so we match the prompt
         # from THIS command, not a pre-existing SHELL from before the send.
-        if pat.pattern == r'[\$#>]\s*$' or 'SHELL' in pattern.upper():
+        if _prompt_wait:
             try:
                 s = json.loads(sf.read_text())
                 if s.get('state') == 'SHELL' or _is_uboot(s):
