@@ -2696,6 +2696,26 @@ def cmd_watch(args):
     sys.exit(0 if matched is not None else 1)
 
 
+def _console_line(st: dict) -> str:
+    """What is on the console right now, per the daemon's state machine.
+
+    A prompt has no trailing newline, so it never reaches stream.log, and no
+    keepalive is sent at LOGIN or PASSWORD to flush it. Anything matching only
+    against the log therefore never sees a board already parked at a prompt.
+    The daemon knows; this exposes it.
+    """
+    cst = st.get('state', '')
+    if cst == 'QUIET':
+        cst = st.get('quiet_from', '')
+    if cst == 'LOGIN':
+        return 'login: '
+    if cst == 'PASSWORD':
+        return 'Password: '
+    if cst in ('SHELL', 'UBOOT'):
+        return (st.get('prompt_text') or '') + ' '
+    return ''
+
+
 def cmd_expect(args):
     """Wait for first of multiple patterns. Returns JSON with matched key and output."""
     if getattr(args, 'pattern', None) and not args.on:
@@ -2716,6 +2736,21 @@ def cmd_expect(args):
         baseline_offset = _nl + 1 if _nl >= 0 else len(_raw)
     else:
         baseline_offset = 0
+
+    # A board already parked at a prompt has nothing left to write, so match
+    # against what the daemon says is on screen before waiting on the log.
+    try:
+        _now = _console_line(json.loads(
+            (devdir(args.device) / 'status.json').read_text()))
+    except (OSError, ValueError):
+        _now = ''
+    if _now:
+        for _spec in args.on:
+            _k, _, _p = _spec.partition('=')
+            if _p and re.search(_p, _now):
+                print(json.dumps({'matched': _k, 'output': _now.strip(),
+                                  'elapsed_ms': 0}))
+                sys.exit(0)
     deadline = time.time() + args.timeout
     t0 = time.time()
 

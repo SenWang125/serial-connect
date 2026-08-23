@@ -122,4 +122,21 @@ if callable(cl):
         check(f'{st} -> {cl(st)}', cl(st) == want)
     check('cmd_alive uses it', '_console_is_live(' in body_of('cmd_alive'))
 
+print()
+print('9. expect must see a board already parked at a prompt')
+cline = getattr(sa, '_console_line', None)
+check('_console_line exists', callable(cline))
+if callable(cline):
+    for st, want in (({'state': 'LOGIN'}, 'login: '),
+                     ({'state': 'QUIET', 'quiet_from': 'LOGIN'}, 'login: '),
+                     ({'state': 'PASSWORD'}, 'Password: '),
+                     ({'state': 'SHELL', 'prompt_text': 'root@x:~#'}, 'root@x:~# '),
+                     ({'state': 'UBOOT', 'prompt_text': '=>'}, '=> '),
+                     ({'state': 'BOOTING'}, ''), ({}, '')):
+        check(f'{st} -> {cline(st)!r}', cline(st) == want)
+    import re as _re
+    check("expect 'login:' would now match a parked login prompt",
+          bool(_re.search('login:', cline({'state': 'QUIET', 'quiet_from': 'LOGIN'}))))
+    check('cmd_expect consults it', '_console_line(' in body_of('cmd_expect'))
+
 sys.exit(1 if fails else 0)
