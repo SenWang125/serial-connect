@@ -55,6 +55,24 @@ if not d['daemon_running']:
 subprocess.run(['serial-agent','wait-alive', dev,'--timeout','60'], check=True)
 ```
 
+### Changing baud on an already-running daemon
+
+A running daemon owns the real device — `--baud` on `serial-agent start` only
+applies at first start. To reprogram an already-running daemon's baud live
+(no restart, no dropped connection):
+
+```bash
+serial-agent setbaud "$DEV" 1500000
+```
+
+`serial-connect` calls this automatically when you type a baud at the
+`Baud [...]:` prompt that differs from what the live daemon is actually
+holding — you'll see `⚠ daemon is running at X, reprogramming to Y...`
+before it connects. Without this, the requested baud used to be silently
+dropped: `tio -b <baud>` only has real effect when it opens the device
+directly, and a running daemon always routes tio through a `socat` PTY
+bridge instead (PTYs have no UART clock — the flag is a no-op there).
+
 ---
 
 ## 2. Sending Commands

@@ -510,6 +510,16 @@ def devdir(device: str) -> Path:
     d.mkdir(parents=True, exist_ok=True)
     return d
 
+# Baud → termios constant. Shared by initial open (_connect) and live
+# reprogramming (_set_baud_live) so the two paths can never drift apart.
+_BAUD_CONST = {
+    9600: termios.B9600,   19200: termios.B19200,  38400: termios.B38400,
+    57600: termios.B57600, 115200: termios.B115200, 230400: termios.B230400,
+    460800: termios.B460800, 921600: termios.B921600,
+    1000000: getattr(termios, 'B1000000', termios.B115200),
+    1500000: getattr(termios, 'B1500000', termios.B115200),
+}
+
 def ensure_symlink():
     """Keep /tmp/serial-agent pointing to the current user's storage.
     If it points elsewhere (another user created it first), update it."""
@@ -635,13 +645,7 @@ class Daemon:
             return s.fileno()
         else:
             fd = os.open(self.device, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
-            bconst = {
-                9600: termios.B9600,   19200: termios.B19200,  38400: termios.B38400,
-                57600: termios.B57600, 115200: termios.B115200, 230400: termios.B230400,
-                460800: termios.B460800, 921600: termios.B921600,
-                1000000: getattr(termios, 'B1000000', termios.B115200),
-                1500000: getattr(termios, 'B1500000', termios.B115200),
-            }.get(self.baud, termios.B115200)
+            bconst = _BAUD_CONST.get(self.baud, termios.B115200)
             saved = termios.tcgetattr(fd)
             attrs = list(saved)
             # Full raw-mode setup (cfmakeraw equivalent + daemon-specific flags).
@@ -682,6 +686,44 @@ class Daemon:
                 pass
             self._fd = fd
             return fd
+
+    def _set_baud_live(self, new_baud: int) -> bool:
+        """Reprogram the already-open fd's baud rate without closing it.
+
+        Termios settings belong to the tty line discipline, not the fd, so
+        this takes effect immediately for any in-flight os.read() — no
+        reconnect, no dropped bytes, no daemon restart. Only the ispeed/
+        ospeed fields are touched; raw-mode flags set at _connect() time are
+        untouched. No-op for TCP-backed (ser2net) connections, which have no
+        local termios to reprogram.
+        """
+        if self._fd is None or self._given_tcp:
+            return False
+        bconst = _BAUD_CONST.get(new_baud, termios.B115200)
+        attrs = termios.tcgetattr(self._fd)
+        attrs[4] = bconst; attrs[5] = bconst
+        termios.tcsetattr(self._fd, termios.TCSANOW, attrs)
+        self.baud = new_baud
+        self._write_status()
+        return True
+
+    def _on_sighup(self, *_):
+        """Reload signal: apply a pending baud change requested by cmd_setbaud.
+
+        cmd_setbaud writes the target baud to ddir/baud_request then signals
+        this pid. Reading the request here (in the daemon's own process)
+        rather than having the CLI poke self.baud directly keeps the daemon
+        as the sole owner of its own state, consistent with how every other
+        piece of daemon state is only ever mutated from inside run().
+        """
+        try:
+            req = self.ddir / 'baud_request'
+            if req.exists():
+                new_baud = int(req.read_text().strip())
+                req.unlink(missing_ok=True)
+                self._set_baud_live(new_baud)
+        except (OSError, ValueError):
+            pass
 
     def _send_raw(self, data: bytes):
         if self._sock:
@@ -1104,6 +1146,7 @@ class Daemon:
             os.mkfifo(self.output_fifo)
         signal.signal(signal.SIGTERM, lambda *_: self._stop.set())
         signal.signal(signal.SIGINT,  lambda *_: self._stop.set())
+        signal.signal(signal.SIGHUP,  self._on_sighup)
         Thread(target=self._writer, daemon=True).start()
         self._start_relay_if_direct()
 
@@ -1857,6 +1900,43 @@ def cmd_stop(args):
         print(f'SIGTERM → PIDs {killed}')
     else:
         print(f'no daemon running for {args.device}')
+
+
+def cmd_setbaud(args):
+    """Reprogram a running daemon's baud rate live, without restarting it.
+
+    serial-connect calls this when a user requests a baud that differs from
+    what an already-running daemon is holding — without this, that request
+    was previously silently dropped (the daemon owns the real fd; nothing
+    told it to change).
+    """
+    ddir = devdir(args.device)
+    pf = ddir / 'daemon.pid'
+    if not pf.exists():
+        print(f'no daemon for {args.device}', file=sys.stderr)
+        sys.exit(1)
+    try:
+        pid = int(pf.read_text().strip())
+    except (OSError, ValueError):
+        print(f'no daemon for {args.device}', file=sys.stderr)
+        sys.exit(1)
+    (ddir / 'baud_request').write_text(str(args.baud))
+    try:
+        os.kill(pid, signal.SIGHUP)
+    except OSError as e:
+        print(f'failed to signal daemon: {e}', file=sys.stderr)
+        sys.exit(1)
+    status_file = ddir / 'status.json'
+    for _ in range(20):   # poll up to ~1s for the daemon to confirm
+        time.sleep(0.05)
+        try:
+            if json.loads(status_file.read_text()).get('baud') == args.baud:
+                print(f'baud set to {args.baud}')
+                return
+        except (OSError, json.JSONDecodeError):
+            pass
+    print(f'daemon did not confirm baud change within 1s', file=sys.stderr)
+    sys.exit(1)
 
 
 def cmd_status(args):
@@ -4675,6 +4755,9 @@ def main():
     sp = sub.add_parser('stop');   dev(sp); sp.set_defaults(func=cmd_stop)
     sp.add_argument('--force', action='store_true',
                     help='Stop even if a human tio session is active')
+    sp = sub.add_parser('setbaud',
+                    help="Reprogram a running daemon's baud rate live (no restart)")
+    dev(sp); sp.add_argument('baud', type=int); sp.set_defaults(func=cmd_setbaud)
     sp = sub.add_parser('status'); dev(sp); sp.set_defaults(func=cmd_status)
     sp = sub.add_parser('path');   dev(sp); sp.set_defaults(func=cmd_path)
 

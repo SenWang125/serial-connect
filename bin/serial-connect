@@ -143,7 +143,22 @@ launch() {
     [[ ! -f "$agent_status" ]] && agent_status="/tmp/serial-agent/$_devname/status.json"
     local _agent_live
     _agent_is_alive "$_devname" _agent_live
-    (( _agent_live )) && _read_agent_tcp_via "$agent_status" agent_tcp
+    if (( _agent_live )); then
+        _read_agent_tcp_via "$agent_status" agent_tcp
+        # A running daemon owns the real device and ignores whatever baud tio
+        # is told to use on its PTY relay target (PTYs have no real UART
+        # clock — see launch()'s stty guard below). If the user picked a
+        # baud different from what the daemon actually has the wire at,
+        # reprogram the live daemon rather than silently going along with
+        # a number that will never reach the hardware.
+        local _live_baud
+        _live_baud=$(awk -F': ' '/"baud"/{gsub(/[,]/,"",$2); print $2; exit}' \
+                     "$agent_status" 2>/dev/null)
+        if [[ -n "$_live_baud" && "$_live_baud" != "$baud" ]]; then
+            echo -e "  ${YELLOW}⚠${NC}  daemon is running at ${_live_baud}, reprogramming to ${baud}..."
+            serial-agent setbaud "$dev" "$baud" 2>&1 | sed 's/^/  /'
+        fi
+    fi
     # If serial-agent is available but not running, auto-start it as a persistent
     # always-on daemon (--idle-timeout 0).  The daemon keeps running after
     # serial-connect exits so agents can monitor the board between sessions.

@@ -171,6 +171,16 @@ serial-agent send/run/health...
 - Detection: 80% of received bytes must be printable (rejects wrong-baud garbage)
 - Display: `baud_display(1500000)` → `1.5M`, `115200` → `115.2K`
 - Parse: `parse_baud("1.5M")` → 1500000, `parse_baud("115.2K")` → 115200
+- Live reprogram: `serial-agent setbaud <dev> <baud>` writes `ddir/baud_request`
+  and sends `SIGHUP` to the daemon pid; `_on_sighup` reads the request and
+  calls `_set_baud_live()`, which patches ispeed/ospeed on the already-open
+  fd via `tcsetattr` and updates `status.json` immediately. Termios lives on
+  the tty line discipline, not the fd, so this is safe without a reconnect.
+  `serial-connect` calls this automatically on reattach when the requested
+  baud differs from what the live daemon reports — previously that mismatch
+  was silently ignored (`tio -b` only affects the real device when tio opens
+  it directly; a running daemon always routes tio through a PTY, where the
+  flag is a no-op).
 
 ---
 
