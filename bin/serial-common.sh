@@ -244,9 +244,14 @@ _agent_hostname() {
 
 # ── _agent_is_alive ────────────────────────────────────────────────────────────
 # Set OUTVAR to 1 if the serial-agent daemon is running for DEVNAME, else 0.
-# Usage: _agent_is_alive DEVNAME OUTVAR
+# Usage: _agent_is_alive DEVNAME OUTVAR [PIDVAR]
+# PIDVAR (optional) is set to the confirmed-live pid — callers that need to
+# cross-check status.json against the *actual* running daemon (e.g. to catch
+# a stale status.json left behind by a prior dead instance) can compare
+# against this instead of re-deriving and re-validating the pid themselves.
 _agent_is_alive() {
     printf -v "$2" '%s' '0'
+    [[ -n "${3:-}" ]] && printf -v "$3" '%s' ''
     local _pf="/tmp/serial-agent/$1/daemon.pid"
     # Fall back to real path if /tmp symlink is missing or stale.
     [[ -f "$_pf" ]] || _pf="$HOME/var/serial-agent/$1/daemon.pid"
@@ -256,6 +261,7 @@ _agent_is_alive() {
     # PID reuse: a recycled pid must not read as a live daemon.
     grep -qa 'serial-agent' "/proc/$_pid/cmdline" 2>/dev/null || return
     printf -v "$2" '%s' '1'
+    [[ -n "${3:-}" ]] && printf -v "$3" '%s' "$_pid"
 }
 
 # ── _read_agent_tcp_via ────────────────────────────────────────────────────────

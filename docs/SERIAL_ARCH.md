@@ -176,11 +176,15 @@ serial-agent send/run/health...
   calls `_set_baud_live()`, which patches ispeed/ospeed on the already-open
   fd via `tcsetattr` and updates `status.json` immediately. Termios lives on
   the tty line discipline, not the fd, so this is safe without a reconnect.
-  `serial-connect` calls this automatically on reattach when the requested
-  baud differs from what the live daemon reports — previously that mismatch
-  was silently ignored (`tio -b` only affects the real device when tio opens
-  it directly; a running daemon always routes tio through a PTY, where the
-  flag is a no-op).
+  `serial-connect` prompts for this on reattach when the requested baud
+  differs from what the live daemon reports (`y` calls `setbaud`; `N` keeps
+  the daemon's existing baud instead) — previously that mismatch was
+  silently ignored (`tio -b` only affects the real device when tio opens it
+  directly; a running daemon always routes tio through a PTY, where the flag
+  is a no-op). Before prompting, `status.json`'s own `"pid"` field is
+  cross-checked against the pid `_agent_is_alive` just confirmed live, so a
+  stale status.json from a crashed prior instance in the same device dir is
+  never mistaken for the current session's real baud.
 
 ---
 
