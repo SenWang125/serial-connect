@@ -263,7 +263,7 @@ DESIGN NOTES
     2  — usage error (bad arguments, missing device)
 """
 
-import argparse, errno, json, os, re, select, signal, socket, sys, termios, time
+import argparse, errno, glob, json, os, re, select, signal, socket, sys, termios, time
 from datetime import datetime
 from pathlib import Path
 from threading import Thread, Event, Lock
@@ -316,6 +316,7 @@ EXITCODE_TAG  = 'SERIAL_EXITCODE'  # sentinel prefix injected by --exit-code
 # daemon reconnects seconds after the node returns, then fall back to slow backoff.
 DEVICE_ABSENT_POLL        = 2.0    # s between reconnect tries while the node is missing
 DEVICE_ABSENT_FAST_WINDOW = 30.0   # s of fast polling before reverting to exponential backoff
+DEVICE_ABSENT_MAX_POLL    = 5.0    # s cap on the backoff while the node is merely missing
 # An EOF (peer closed, not ENOENT) on a reboot flaps the node briefly; retry fast for
 # a short window so the reconnect gap that loses board output shrinks from ~1s to ~0.2s.
 RECONNECT_FAST_DELAY  = 0.2        # s between EOF-reconnect tries during the fast window
@@ -619,6 +620,32 @@ class Daemon:
         self._t_last_client  = 0.0   # monotonic time of last relay client connect/disconnect
         self._out_fd         = None  # lazily-opened O_WRONLY|O_NONBLOCK to output_fifo
         self._dead_since     = 0.0   # monotonic time the port went DEAD (for reconnect-gap marker)
+        # A USB adapter that re-enumerates can come back on a different ttyUSBn
+        # (an FT4232H that was ttyUSB0-3 reappears as ttyUSB4-7), leaving the
+        # daemon retrying a path that no longer exists while the board is fine.
+        # /dev/serial/by-id is keyed on the adapter serial + interface, so
+        # reopening through it follows the move and can never land on another board.
+        self._byid           = ''       # by-id link for this adapter, learned on first open
+        self._node           = device   # ttyUSBn currently open (may differ from self.device)
+
+    def _stable_device(self) -> str:
+        """Path to open: the adapter's by-id link once known, else the given path."""
+        if self._byid and os.path.exists(self._byid):
+            return self._byid
+        return self.device
+
+    def _learn_byid(self, node: str):
+        """Record the /dev/serial/by-id link pointing at the node we just opened."""
+        if self._byid or self._given_tcp:
+            return
+        try:
+            target = os.path.realpath(node)
+            for link in Path('/dev/serial/by-id').iterdir():
+                if os.path.realpath(str(link)) == target:
+                    self._byid = str(link)
+                    return
+        except OSError:
+            pass
 
     def _connect(self):
         """Open the serial device or TCP connection and configure terminal settings.
@@ -644,7 +671,8 @@ class Daemon:
             self._sock = s
             return s.fileno()
         else:
-            fd = os.open(self.device, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
+            _dev = self._stable_device()
+            fd = os.open(_dev, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
             bconst = _BAUD_CONST.get(self.baud, termios.B115200)
             saved = termios.tcgetattr(fd)
             attrs = list(saved)
@@ -684,6 +712,11 @@ class Daemon:
                 fcntl.ioctl(fd, termios.TIOCSWINSZ, winsize)
             except Exception:
                 pass
+            try:
+                self._node = os.ttyname(fd)
+            except OSError:
+                self._node = os.path.realpath(_dev)
+            self._learn_byid(self._node)
             self._fd = fd
             return fd
 
@@ -970,6 +1003,7 @@ class Daemon:
             'prompt_text':     self.prompt_text,
             'pid':             os.getpid(),
             'device':          self.device,
+            'node':            self._node,
             'baud':            self.baud,
             'via':             (f'tcp:{self._given_tcp[0]}:{self._given_tcp[1]}'
                                if self._given_tcp else 'direct'),
@@ -1152,6 +1186,7 @@ class Daemon:
 
         backoff = 1.0
         _absent_since = None   # wall-clock when a local device node first went missing
+        _last_err = ''         # dedupe the repeated connect-error line while a node is gone
         while not self._stop.is_set():
             # On-demand: park until a relay client connects.
             if on_demand and not self._relay_clients:
@@ -1178,6 +1213,7 @@ class Daemon:
             try:
                 rfd = self._connect()
                 backoff = 1.0
+                _last_err = ''
                 _absent_since = None
                 # Reconnect-gap marker: while the port was DEAD nobody held it, so any
                 # board output in that window was lost.  Make the gap VISIBLE in the log
@@ -1192,7 +1228,9 @@ class Daemon:
                 t_connected = now()
                 _probe_sent = False
                 _t_last_idle_probe = t_connected
-                print(f'[serial-agent] {self.device} connected '
+                _moved = ('' if self._node == self.device
+                          else f' (now {self._node})')
+                print(f'[serial-agent] {self.device} connected{_moved} '
                       f'via {"ser2net" if self._given_tcp else "direct"}', flush=True)
                 # Refresh status so port_held reflects the now-open port.  Without
                 # this the field keeps the value it had at daemon startup (False)
@@ -1352,8 +1390,11 @@ class Daemon:
                         _delay = DEVICE_ABSENT_POLL
                     else:
                         _delay = backoff
-                        backoff = min(backoff * 2, 30)
-                    print(f'[serial-agent] connect error: {e} — retry in {_delay}s', flush=True)
+                        backoff = min(backoff * 2, DEVICE_ABSENT_MAX_POLL if _absent else 30)
+                    _msg = f'[serial-agent] connect error: {e} — retry in {_delay}s'
+                    if _msg != _last_err:
+                        print(_msg, flush=True)
+                        _last_err = _msg
                     # Record the DEAD transition once, not on every poll iteration.
                     if self.state != 'DEAD':
                         _prev = self._prev_state
@@ -4455,6 +4496,44 @@ def cmd_test(args):
         check(_got == _want,
               f'_needs_login: {_st}{"←" + _qf if _qf else ""}'
               f'{" --login" if _ex else ""} → {_want}', f'got {_got}')
+
+    # ── Unit: adapter re-enumeration (by-id re-resolution) ───────────────────
+    # A USB adapter that drops off and returns can land on a different ttyUSBn.
+    # A daemon pinned to the old path then retries a node that no longer exists
+    # while the board is fine, and can attach to another board if that number
+    # gets reused.  Reopening through the serial-keyed by-id link follows the move.
+    print('  adapter re-enumeration / by-id re-resolution (unit)')
+
+    def _mkdaemon(dev):
+        d = Daemon.__new__(Daemon)
+        d.device = dev; d._byid = ''; d._node = dev; d._given_tcp = None
+        return d
+
+    _bi = _mkdaemon('/dev/ttyX')
+    check(_bi._stable_device() == '/dev/ttyX', 'by-id: unlearned daemon uses the pinned path')
+
+    _bi._byid = '/dev/serial/by-id/usb-NO_SUCH_ADAPTER-if01-port0'
+    check(_bi._stable_device() == '/dev/ttyX', 'by-id: dangling link ignored, falls back')
+
+    _real = sorted(glob.glob('/dev/ttyUSB*') + glob.glob('/dev/ttyACM*'))
+    if not _real:
+        print('    SKIP  no USB serial adapter attached — learning path not exercised')
+    else:
+        _learned, _crossed = [], False
+        for _n in _real:
+            _d = _mkdaemon(_n); _d._learn_byid(_n)
+            _ok = bool(_d._byid) and os.path.realpath(_d._byid) == os.path.realpath(_n)
+            check(_ok, f'by-id: {_n} resolves to its own link', _d._byid or '<none>')
+            if _ok:
+                check(_d._stable_device() == _d._byid,
+                      f'by-id: {_n} reopens through the link, not the number')
+                _learned.append(_d._byid)
+        check(len(set(_learned)) == len(_learned),
+              'by-id: every node learned a distinct link (never crosses adapters)')
+
+    _tcp = _mkdaemon('/dev/ttyX'); _tcp._given_tcp = ('127.0.0.1', 4000)
+    _tcp._learn_byid('/dev/ttyX')
+    check(_tcp._byid == '', 'by-id: tcp/ser2net mode learns nothing')
 
     # ── Unit: one daemon per tty (duplicate-daemon guard) ─────────────────────
     # Two daemons on one tty make the kernel hand each byte to exactly one of
