@@ -135,12 +135,35 @@ respawns getty. The command never runs, the password prompt echoes nothing, and 
 `--wait`/`--until` pattern misses — which reads as *the board dropping input characters*,
 not as a login prompt. Shortening the command does not help; length was never the variable.
 
-`send`, `run` and `watch --send` now auto-login at LOGIN/PASSWORD by default and say so on
-stderr. `--no-login` opts out; `--login` additionally waits through BOOTING for the prompt.
-A bare `watch` never auto-logs-in, so `--until 'login:'` still works for boot capture.
+`send`, `run`, `watch --send`, `boot --reset-cmd` and `upload` auto-login at LOGIN/PASSWORD
+by default and say so on stderr. `--no-login` opts out on every one of them, and
+`SERIAL_NO_LOGIN=1` opts out globally for callers that cannot reach the flag. `--login`
+additionally waits through BOOTING for the prompt. A bare `watch` never auto-logs-in, so
+`--until 'login:'` still works for boot capture.
 
 `--login` is not the same flag on every subcommand — on `send`/`run`/`watch` it adds the
 BOOTING wait; on `reboot` it is a documented no-op (auto-login is already the default there).
+
+### Which account, and when not to log in at all
+
+The account is resolved, not assumed. In order: `--user`, `SERIAL_LOGIN_USER`, `LOGIN_USER=`
+in `serial-boards.conf`, whoever the console itself named, then `root`. The console names
+its user in two places the daemon watches — an `agetty --autologin` banner
+(`host login: NAME (automatic login)`) and a `user@host:~$` prompt — and publishes it in
+`status.json` as `console_user`. A board that autologins someone other than root therefore
+needs no configuration at all.
+
+A console that is logging *itself* in is left alone. After a banner, `serial-agent` waits up
+to `AUTOLOGIN_GRACE` (10 s) for a shell instead of typing a username; a bare `login:` prompt
+with no banner gets a 2.5 s settle window for the same reason. Typing into that window
+produces a username the getty never asked for, and on a board whose autologin is
+misconfigured (`agetty -o` without `-f`, which drops the `-f USER` that `--autologin` would
+otherwise add) the two sides then re-prompt each other indefinitely.
+
+A rejected login is not retried for `LOGIN_RETRY_BACKOFF` (75 s, longer than agetty's own
+60 s `LOGIN_TIMEOUT`), doubling on each further rejection up to 10 min. Retrying sooner only
+answers a prompt that is about to be replaced. The state lives in `login.attempt` in the
+device directory and is removed as soon as a login succeeds. `--user` overrides it.
 
 The state check below is still the explicit form, and is what a polling loop should use —
 poll `wait-state SHELL`, not a command whose output you expect to see.
@@ -221,7 +244,8 @@ echo "Board came back as: $matched"   # READY / PANIC / UBOOT / LOGIN
 ## 5. Reboot and Recovery
 
 ```bash
-# Standard TI board reboot (no password, root login)
+# Standard TI board reboot (no password, root login — --user is only needed
+# when the console never names its own account)
 serial-agent reboot "$DEV" --setup-terminal --timeout 120
 
 # Reboot with explicit login (if password required)

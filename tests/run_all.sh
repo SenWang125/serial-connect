@@ -10,10 +10,10 @@ for t in "$HERE"/selftest_*.py "$HERE"/selftest_*.sh; do
     rc=$?
     (( rc == 0 )) || { echo "  ^ RED (exit $rc)"; fails=$((fails+1)); }
 done
-# The built-in gate is the other half: 57 assertions on a virtual pty pair.
+# The built-in gate is the other half: assertions on virtual pty pairs.
 # One command must run both, or one of them stops being run.
 AGENT="$HERE/serial-agent"; [[ -x "$AGENT" ]] || AGENT="$HERE/../bin/serial-agent"
-echo "── serial-agent test (built-in, 57 assertions)"
+echo "── serial-agent test (built-in gate)"
 _gate_out=$(timeout 120 "$AGENT" test 2>&1); _gate_rc=$?   # rc of the gate, not of a pipe
 echo "$_gate_out" | tail -1
 (( _gate_rc == 0 )) || { echo "  ^ RED (exit $_gate_rc)"; fails=$((fails+1)); }

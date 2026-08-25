@@ -121,7 +121,8 @@ EMBEDDED MPU DEVELOPMENT PATTERNS (TI AM62x, AM62D2, etc.)
   SHELL    at shell prompt          → send commands
   RUNNING  command executing        → wait-state SHELL (never send to RUNNING)
   UBOOT    U-Boot "=>" prompt       → send U-Boot commands
-  LOGIN    "login:" prompt          → serial-agent login DEVICE
+  LOGIN    "login:" prompt          → serial-agent login DEVICE  (auto by default;
+                                     account inferred from the console, not root)
   PASSWORD "Password:" prompt       → serial-agent login DEVICE
   BOOTING  kernel log timestamps    → wait-state SHELL --timeout 120
   PANIC    "Kernel panic"/BUG/OOPS  → serial-agent reboot DEVICE
@@ -308,6 +309,13 @@ MAX_EVENTS    = 200      # events.log rotation threshold
 # Silence before state → QUIET/FROZEN (EOF/connect-error still → DEAD).  Env-tunable
 # mainly so the self-test can force a fast freeze without a 30s wait.
 DEAD_AFTER    = _env_float('SERIAL_DEAD_AFTER', 30.0, 0.2)
+# Login pacing.  agetty's own LOGIN_TIMEOUT is 60 s and it re-prints the prompt
+# when it expires, so a retry loop faster than that just collides with getty
+# forever — which is what an unconditional retry did on a board with autologin.
+AUTOLOGIN_GRACE     = 10.0  # s an announced autologin gets to reach a shell untouched
+LOGIN_SETTLE        = 2.5   # s a bare login: prompt gets to resolve itself first
+LOGIN_RETRY_BACKOFF = 75.0  # s before a failed login is retried (> getty's 60 s)
+LOGIN_MAX_BACKOFF   = 600.0 # s ceiling on the escalating backoff
 IDLE_PROBE_INTERVAL = 15.0  # seconds of silence before sending a keepalive CR (must be < DEAD_AFTER)
 RUNNING_AFTER = 3.0      # seconds of output without a prompt → state = RUNNING
 EXITCODE_TAG  = 'SERIAL_EXITCODE'  # sentinel prefix injected by --exit-code
@@ -336,6 +344,14 @@ RE_KERNEL_TS = re.compile(r'^\[\s*\d+\.\d+\]')
 RE_SHELL2   = re.compile(r'\w[\w.\-]*@[\w.\-]+[:#~/][^\n]*[\$#>]\s*$')
 RE_LOGIN    = re.compile(r'(login|Username)\s*:\s*$', re.I)
 RE_PASSWORD = re.compile(r'(Password|passwd)\s*:\s*$', re.I)
+# agetty --autologin prints the name it is logging in as. The console is about
+# to reach a shell on its own, so typing anything now collides with it.
+RE_AUTOLOGIN = re.compile(r'login:\s*(\S+?)\s*\(automatic login\)', re.I)
+# login(1) / PAM rejection. Used only to time a backoff, never to drive state.
+RE_LOGIN_FAIL = re.compile(r'Login incorrect|Authentication failure|Login timed out',
+                           re.I)
+# 'user@host:~$' — the console naming its own user, so a later login need not guess.
+RE_PROMPT_USER = re.compile(r'([\w.\-]+)@[\w.\-]+[:~/]')
 RE_BOOT     = re.compile(r'\[\s*\d+\.\d{3,6}\]')
 RE_UBOOT    = re.compile(r'^(=>|u-boot[#>])\s*$', re.I)   # U-Boot prompt
 # Annotations this daemon injects into its own stream (see the GAP marker in
@@ -620,6 +636,13 @@ class Daemon:
         self._t_last_client  = 0.0   # monotonic time of last relay client connect/disconnect
         self._out_fd         = None  # lazily-opened O_WRONLY|O_NONBLOCK to output_fifo
         self._dead_since     = 0.0   # monotonic time the port went DEAD (for reconnect-gap marker)
+        # Who the console says its user is, so no caller has to assume 'root'.
+        # Learned from an autologin banner or from a user@host prompt; exported
+        # in status.json for the CLI, which cannot see the raw byte stream.
+        self.console_user    = ''
+        self.autologin_user  = ''
+        self.t_autologin     = 0.0   # monotonic time an autologin was announced
+        self.t_login_fail    = 0.0   # monotonic time login(1) last rejected credentials
         # A USB adapter that re-enumerates can come back on a different ttyUSBn
         # (an FT4232H that was ttyUSB0-3 reappears as ttyUSB4-7), leaving the
         # daemon retrying a path that no longer exists while the board is fine.
@@ -840,6 +863,17 @@ class Daemon:
                  if l.strip() and not RE_SELF_ANNOT.match(l.strip())]
         last = lines[-1] if lines else ''
 
+        # Learned before the state chain: an autologin banner is a full line and
+        # is followed within a second or two by either a shell or a password
+        # prompt, so it must be recorded even when the state ends up PASSWORD.
+        _al = RE_AUTOLOGIN.search(clean)
+        if _al:
+            self.autologin_user = _al.group(1)
+            self.console_user   = self.autologin_user
+            self.t_autologin    = t
+        if RE_LOGIN_FAIL.search(clean):
+            self.t_login_fail = t
+
         prev = self.state
         if RE_PANIC.search(clean[-500:]):
             self.state = 'PANIC'             # kernel panic / oops — board needs reboot
@@ -858,6 +892,9 @@ class Daemon:
             self.t_prompt = t
             self.prompt_seq += 1
             self.prompt_text = last.strip()
+            _pu = RE_PROMPT_USER.search(self.prompt_text)
+            if _pu:
+                self.console_user = _pu.group(1)
         elif RE_BOOT.search(clean[-300:]):
             self.state = 'BOOTING'
         # (IDLE is detected only via the idle-timeout in run(), not here, since
@@ -1001,6 +1038,15 @@ class Daemon:
             'last_prompt_ago': round(t - self.t_prompt, 1) if self.t_prompt else None,
             'prompt_seq':      self.prompt_seq,
             'prompt_text':     self.prompt_text,
+            # The console's own account of who logs in here, and how long ago it
+            # said so.  A caller that guesses 'root' on a board whose getty
+            # autologins someone else fights that getty until one of them gives up.
+            'console_user':    self.console_user,
+            'autologin_user':  self.autologin_user,
+            'autologin_ago':   (round(t - self.t_autologin, 1)
+                               if self.t_autologin else None),
+            'login_failed_ago': (round(t - self.t_login_fail, 1)
+                               if self.t_login_fail else None),
             'pid':             os.getpid(),
             'device':          self.device,
             'node':            self._node,
@@ -2282,9 +2328,10 @@ def cmd_boot(args):
         sys.exit(2)
     baseline = _stream_size(device)
     if args.reset_cmd:
-        _maybe_auto_login(argparse.Namespace(device=device, user='root',
-                                             password=None, no_login=False,
-                                             login=False))
+        _maybe_auto_login(argparse.Namespace(
+            device=device, user=getattr(args, 'user', None),
+            password=getattr(args, 'password', None),
+            no_login=getattr(args, 'no_login', False), login=False))
         try:
             _stj = json.loads((devdir(device) / 'status.json').read_text())
         except (OSError, ValueError):
@@ -2411,42 +2458,198 @@ def _reboot_exit_code(went_down: bool, state: str) -> int:
     return 0 if (went_down and state in ('SHELL', 'UBOOT')) else 1
 
 
+def _read_status(device) -> dict:
+    """status.json, or {} when there is no daemon or it is mid-rename."""
+    try:
+        return json.loads((devdir(device) / 'status.json').read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def _conf_login_user() -> str:
+    """LOGIN_USER from serial-boards.conf, or '' — same two-layer model as
+    _relay_base_port (system config first for a global install, user config
+    overrides)."""
+    confs: list = [_resolve_board_cfg()]
+    if str(_SCRIPT_DIR).startswith(('/usr/', '/opt/')):
+        confs.insert(0, Path('/etc/serial-boards.conf'))
+    for cfg in confs:
+        try:
+            for line in cfg.read_text().splitlines():
+                line = line.split('#')[0].strip()
+                if line.upper().startswith('LOGIN_USER'):
+                    _, _, val = line.partition('=')
+                    val = val.strip().strip('"\'')
+                    if val:
+                        return val
+        except Exception:
+            continue
+    return ''
+
+
+def _resolve_login_user(st: dict, explicit=None) -> str:
+    """Who to log in as, most specific source first.
+
+    'root' is the last resort, not the assumption. A board whose getty
+    autologins someone else names that user on the console, and a board that has
+    ever reached a shell names it in the prompt — both reach here via
+    status.json, so no device or distro is hardcoded.
+    """
+    if explicit:
+        return explicit
+    return (os.environ.get('SERIAL_LOGIN_USER')
+            or _conf_login_user()
+            or st.get('console_user')
+            or 'root')
+
+
+def _autologin_pending(st: dict) -> bool:
+    """True while a getty autologin announced on the console is still in flight.
+
+    agetty --autologin prints 'host login: NAME (automatic login)' and then execs
+    login(1); the shell appears a second or two later. Typing during that window
+    is typed into whatever getty hands over to, and on a board where the
+    autologin instead falls through to a password prompt the two sides retry
+    against each other indefinitely.
+    """
+    ago = st.get('autologin_ago')
+    return ago is not None and ago < AUTOLOGIN_GRACE
+
+
+def _login_attempt_file(device) -> Path:
+    return devdir(device) / 'login.attempt'
+
+
+def _login_backoff_left(device) -> float:
+    """Seconds still owed before another login may be typed; 0.0 when clear.
+
+    Retrying immediately after a rejection lands inside getty's own 60 s
+    LOGIN_TIMEOUT, so the prompt the retry answers is the one about to be
+    replaced. The wait escalates because a credential that failed once with the
+    console unchanged fails again.
+    """
+    try:
+        a = json.loads(_login_attempt_file(device).read_text())
+    except (OSError, ValueError):
+        return 0.0
+    fails = max(1, int(a.get('fails', 1)))
+    wait = min(LOGIN_RETRY_BACKOFF * fails, LOGIN_MAX_BACKOFF)
+    left = wait - (time.time() - float(a.get('t', 0)))
+    return left if left > 0 else 0.0
+
+
+def _record_login_attempt(device, user: str, ok: bool):
+    """Remember a rejection so the next caller waits; forget it on success."""
+    f = _login_attempt_file(device)
+    if ok:
+        try: f.unlink(missing_ok=True)
+        except OSError: pass
+        return
+    try:
+        prev = json.loads(f.read_text())
+    except (OSError, ValueError):
+        prev = {}
+    fails = int(prev.get('fails', 0)) + 1 if prev.get('user') == user else 1
+    try:
+        f.write_text(json.dumps({'t': time.time(), 'user': user, 'fails': fails}))
+    except OSError:
+        pass
+
+
+def _login_suppressed(args) -> bool:
+    """--no-login on any subcommand, or SERIAL_NO_LOGIN in the environment.
+
+    The environment form exists because the flag can only be passed where a
+    subcommand defines it, and a caller that wants a console left alone wants it
+    left alone by every path, including the ones it did not invoke directly.
+    """
+    if getattr(args, 'no_login', False):
+        return True
+    return os.environ.get('SERIAL_NO_LOGIN', '') not in ('', '0', 'false', 'no')
+
+
 def _maybe_auto_login(args):
     """Log in first when the console is sitting at a login prompt.
 
     On by default — sending a shell command to `login` is never what the caller
     meant, and it fails in a way that looks like a transport fault rather than a
-    login prompt. --no-login opts out; --login additionally covers BOOTING.
-    Board-agnostic: reuses cmd_login's credential handling (default root, no
-    password).
+    login prompt. --no-login (or SERIAL_NO_LOGIN) opts out; --login additionally
+    covers BOOTING.
+
+    Never types into a login the board is already completing by itself: an
+    announced autologin is waited out, and a bare login: prompt is given a short
+    settle window first, because a console that reaches a shell on its own needs
+    no credentials from us and typing into it produces a stray username.
     """
-    if getattr(args, 'no_login', False):
+    if _login_suppressed(args):
         return
-    try:
-        st = json.loads((devdir(args.device) / 'status.json').read_text())
-    except (OSError, ValueError):
+    device = args.device
+    st = _read_status(device)
+    if not st or not _needs_login(st, getattr(args, 'login', False)):
         return
-    if not _needs_login(st, getattr(args, 'login', False)):
+
+    # 1. The board is logging itself in — wait for it rather than compete.
+    if _autologin_pending(st):
+        _who = st.get('autologin_user') or 'the console user'
+        _left = max(1.0, AUTOLOGIN_GRACE - (st.get('autologin_ago') or 0.0))
+        print(f"[serial-agent] {device}: autologin as {_who} in progress — "
+              f"waiting up to {_left:.0f}s instead of logging in", file=sys.stderr)
+        _wait_state(device, 'SHELL', _left, print_output=False)
+        st = _read_status(device)
+        if not _needs_login(st, getattr(args, 'login', False)):
+            return
+    elif st.get('state') == 'LOGIN':
+        # No banner, but a getty that hands straight to a shell looks identical
+        # for the first moment. Give it that moment before typing a username.
+        _wait_state(device, 'SHELL', LOGIN_SETTLE, print_output=False)
+        st = _read_status(device)
+        if not _needs_login(st, getattr(args, 'login', False)):
+            return
+
+    # 2. A credential that was just rejected is still rejected.
+    _left = _login_backoff_left(device)
+    if _left > 0:
+        print(f"[serial-agent] {device}: console at {st.get('state','?')} and the "
+              f"last login was rejected — not retrying for {_left:.0f}s "
+              f"(serial-agent login {device} --user USER to override)",
+              file=sys.stderr)
         return
-    user = getattr(args, 'user', 'root') or 'root'
+
+    user = _resolve_login_user(st, getattr(args, 'user', None))
+    _src = ('--user' if getattr(args, 'user', None)
+            else 'SERIAL_LOGIN_USER' if os.environ.get('SERIAL_LOGIN_USER')
+            else 'serial-boards.conf' if _conf_login_user()
+            else 'console' if st.get('console_user') else 'default')
     print(f"[serial-agent] console at {st.get('state','?')} — logging in as "
-          f"{user} first (--no-login to disable)", file=sys.stderr)
-    ns = argparse.Namespace(device=args.device,
+          f"{user} (from {_src}; --no-login to disable)", file=sys.stderr)
+    ns = argparse.Namespace(device=device,
                             user=user,
-                            password=getattr(args, 'password', None),
-                            timeout=90)
+                            password=_resolve_login_password(
+                                getattr(args, 'password', None)),
+                            no_login=False,
+                            autologin_waited=True,
+                            # An auto-login inside `send --timeout 10` must not
+                            # spend several times the caller's own budget.
+                            timeout=max(10.0, min(30.0,
+                                        getattr(args, 'timeout', 30.0) or 30.0)))
     try:
         cmd_login(ns)
     except SystemExit:
         pass
-    try:
-        st2 = json.loads((devdir(args.device) / 'status.json').read_text())
-    except (OSError, ValueError):
-        return
-    if _needs_login(st2):
-        print(f"[serial-agent] auto-login did NOT reach a shell — console still at "
-              f"{st2.get('state','?')}; the command below will be typed into login",
-              file=sys.stderr)
+    st2 = _read_status(device)
+    _ok = not _needs_login(st2)
+    if not _ok:
+        print(f"[serial-agent] auto-login as {user} did NOT reach a shell — console "
+              f"still at {st2.get('state','?')}; the command below will be typed "
+              f"into login. Name the right account with --user or LOGIN_USER= in "
+              f"serial-boards.conf.", file=sys.stderr)
+
+
+def _resolve_login_password(explicit=None):
+    """Password to answer a Password: prompt with, or None to send an empty one."""
+    if explicit is not None:
+        return explicit
+    return os.environ.get('SERIAL_LOGIN_PASSWORD')
 
 
 def cmd_send(args):
@@ -2603,9 +2806,11 @@ def _send_impl(args):
                   f"autoboot / runs as a U-Boot command, not a shell command. "
                   f"Send 'boot' to resume Linux.", file=sys.stderr)
         elif _cst in ('LOGIN', 'PASSWORD') and (' ' in cmd or ';' in cmd):
+            _who = _resolve_login_user(_stj)
             print(f"{args.device}: console is at a {_cst} prompt — this command "
                   f"will be typed as a username, not executed. Log in first "
-                  f"(serial-agent send DEVICE root).", file=sys.stderr)
+                  f"(serial-agent login {args.device} --user {_who}).",
+                  file=sys.stderr)
         elif _cst == 'QUIET' and _stj.get('quiet_from') in ('LOGIN', 'PASSWORD') \
                 and (' ' in cmd or ';' in cmd):
             print(f"{args.device}: console went quiet at a {_stj['quiet_from']} "
@@ -3188,7 +3393,9 @@ def cmd_connect(args):
         cur = json.loads(sf.read_text()).get('state', '') if sf.exists() else ''
         # Auto-login if board landed at LOGIN (consistent with reboot behaviour)
         if cur == 'LOGIN':
-            _do_send(device, getattr(args, 'user', 'root'), wait=r'Password|[\$#>]\s*$', timeout=10)
+            _do_send(device, _resolve_login_user(_read_status(device),
+                                                getattr(args, 'user', None)),
+                     wait=r'Password|[\$#>]\s*$', timeout=10)
             cur = json.loads(sf.read_text()).get('state', '') if sf.exists() else ''
             if cur == 'PASSWORD':
                 _do_send(device, getattr(args, 'password', None) or '', wait=r'[\$#>]\s*$', timeout=10)
@@ -3371,9 +3578,10 @@ def cmd_reboot(args):
     # A console parked at login: swallows the reboot command as a username, so
     # log in first; --no-login governs the post-reboot login only.
     if _reboot_login_action(_stj) == 'login':
-        _maybe_auto_login(argparse.Namespace(device=device, user=args.user,
-                                             password=args.password,
-                                             no_login=False, login=False))
+        _maybe_auto_login(argparse.Namespace(
+            device=device, user=getattr(args, 'user', None),
+            password=getattr(args, 'password', None),
+            no_login=False, login=False))
         try:
             _stj = json.loads(sf.read_text()) if sf.exists() else {}
         except (OSError, ValueError):
@@ -3473,8 +3681,14 @@ def cmd_reboot(args):
 def cmd_login(args):
     """Handle the board login sequence (username + optional password).
 
-    Detects current state and sends credentials accordingly.
-    TI boards: root with no password (default).
+    Detects current state and sends credentials accordingly.  The account is
+    resolved, not assumed: --user, then SERIAL_LOGIN_USER, then LOGIN_USER= in
+    serial-boards.conf, then whoever the console itself named (autologin banner
+    or a user@host prompt), then root.
+
+    A console whose getty is autologging in is left alone until it finishes —
+    typing a username into it produces a stray login attempt that races the
+    getty's own, and neither side wins.
 
     Can be called after reboot or whenever the board is at a login prompt.
     """
@@ -3487,6 +3701,19 @@ def cmd_login(args):
     state = _st.get('state', 'UNKNOWN')
     if state == 'SHELL' or (state == 'QUIET' and _st.get('quiet_from') == 'SHELL'):
         print('Already at shell'); return
+    if _login_suppressed(args):
+        print(f'{device}: login suppressed (--no-login / SERIAL_NO_LOGIN)',
+              file=sys.stderr)
+        sys.exit(1)
+    if _autologin_pending(_st) and not getattr(args, 'autologin_waited', False):
+        _left = max(1.0, AUTOLOGIN_GRACE - (_st.get('autologin_ago') or 0.0))
+        print(f"{device}: autologin as {_st.get('autologin_user') or '?'} in "
+              f'progress — waiting {_left:.0f}s for it', file=sys.stderr)
+        _wait_state(device, 'SHELL', _left, print_output=False)
+        _st = json.loads(sf.read_text())
+        state = _st.get('state', 'UNKNOWN')
+        if state == 'SHELL' or (state == 'QUIET' and _st.get('quiet_from') == 'SHELL'):
+            print(f'Logged in: state=SHELL (autologin)'); return
     if state == 'BOOTING':
         _wait_state(device, 'LOGIN', getattr(args, 'timeout', 90) or 90)
         _st = json.loads(sf.read_text())
@@ -3498,19 +3725,27 @@ def cmd_login(args):
     if state not in ('LOGIN', 'PASSWORD', 'UNKNOWN'):
         print(f'Unexpected state: {state} (need LOGIN or PASSWORD)', file=sys.stderr); sys.exit(1)
 
+    user = _resolve_login_user(_st, getattr(args, 'user', None))
+    password = _resolve_login_password(getattr(args, 'password', None))
+    _budget = getattr(args, 'timeout', 90.0) or 90.0
+    _step = max(5.0, min(10.0, _budget / 3))
+
     # Skip username if already at PASSWORD prompt
     if state != 'PASSWORD':
-        _do_send(device, args.user, wait=r'Password|[\$#>]\s*$', timeout=10)
+        _do_send(device, user, wait=r'Password|[\$#>]\s*$', timeout=_step)
 
     # Check if password was requested
     state = json.loads(sf.read_text()).get('state', '') if sf.exists() else ''
     if state == 'PASSWORD':
-        _do_send(device, args.password or '', wait=r'[\$#>]\s*$', timeout=10)
+        _do_send(device, password or '', wait=r'[\$#>]\s*$', timeout=_step)
 
-    # Verify shell
-    _wait_state(device, 'SHELL', 15)
+    # Verify shell.  Bounded by the caller's timeout: an auto-login inside a
+    # `send --timeout 10` must not add 15 s of its own on a board that is never
+    # going to reach a shell.
+    _wait_state(device, 'SHELL', min(15.0, _budget))
     state = json.loads(sf.read_text()).get('state', '?') if sf.exists() else '?'
-    print(f'Logged in: state={state}')
+    _record_login_attempt(device, user, state == 'SHELL')
+    print(f'Logged in as {user}: state={state}')
     sys.exit(0 if state == 'SHELL' else 1)
 
 
@@ -3625,9 +3860,10 @@ def cmd_upload(args):
     """
     # A base64 chunk stream typed into getty is the worst version of this bug:
     # every chunk becomes a failed username. Ask first, like every other sender.
-    _maybe_auto_login(argparse.Namespace(device=args.device, user="root",
-                                         password=None, no_login=False,
-                                         login=False))
+    _maybe_auto_login(argparse.Namespace(
+        device=args.device, user=getattr(args, 'user', None),
+        password=getattr(args, 'password', None),
+        no_login=getattr(args, 'no_login', False), login=False))
     if args.via_network:
         _upload_via_network(args)
         return
@@ -4535,6 +4771,111 @@ def cmd_test(args):
     _tcp._learn_byid('/dev/ttyX')
     check(_tcp._byid == '', 'by-id: tcp/ser2net mode learns nothing')
 
+    # ── Functional: a console that logs itself in is never typed over ────────
+    # agetty --autologin prints 'host login: NAME (automatic login)' and hands
+    # over to login(1) a second or two later.  Answering that prompt with a
+    # hardcoded 'root' loses the race, and the retry lands inside agetty's own
+    # 60 s timeout, so the two sides re-prompt each other and every send is
+    # typed into getty.  Fixture is a bare pty: the daemon opens the slave, this
+    # side plays the board on the master.
+    print('  autologin race (functional, pty)')
+    import pty as _pty
+    _am, _as = _pty.openpty()
+    _adev = os.ttyname(_as)
+    os.close(_as)
+    fcntl.fcntl(_am, fcntl.F_SETFL, fcntl.fcntl(_am, fcntl.F_GETFL) | os.O_NONBLOCK)
+    _atd = Path(tempfile.mkdtemp(prefix='sa-autologin-'))
+    _aenv = os.environ.copy()
+    _aenv['SERIAL_AGENT_BASE'] = str(_atd)
+    for _k in ('SERIAL_LOGIN_USER', 'SERIAL_NO_LOGIN', 'SERIAL_LOGIN_PASSWORD'):
+        _aenv.pop(_k, None)
+    _asf = _atd / Path(_adev).name / 'status.json'
+
+    def _board_read():
+        """Everything the board has received since the last call."""
+        _out = b''
+        while True:
+            try:
+                _c = os.read(_am, 4096)
+            except OSError:
+                break
+            if not _c:
+                break
+            _out += _c
+        return _out
+
+    def _await_status(pred, timeout=6.0):
+        _dl = time.time() + timeout
+        while time.time() < _dl:
+            try:
+                _s = json.loads(_asf.read_text())
+                if pred(_s):
+                    return _s
+            except (OSError, ValueError):
+                pass
+            time.sleep(0.05)
+        try:
+            return json.loads(_asf.read_text())
+        except (OSError, ValueError):
+            return {}
+
+    _aproc = None
+    try:
+        _ao, _ae = _atd / '.out', _atd / '.err'
+        with open(_ao, 'w') as _fo, open(_ae, 'w') as _fe:
+            subprocess.run([sys.argv[0], 'start', _adev, '--idle-timeout', '0'],
+                           stdout=_fo, stderr=_fe, env=_aenv, timeout=30)
+        check(_asf.exists(), 'autologin: daemon started on the pty', _ao.read_text())
+
+        os.write(_am, b'\r\n[    5.283114] EXT4-fs (mmcblk1p1): re-mounted.\r\n')
+        time.sleep(0.3)
+        # The banner, then the login prompt still on screen while login(1) is
+        # starting: the exact window in which the old code typed 'root'.
+        os.write(_am, b'Ubuntu 24.04.4 LTS op5-plus ttyS2\r\n'
+                      b'op5-plus login: sen (automatic login)\r\n')
+        time.sleep(0.2)
+        os.write(_am, b'op5-plus login: ')
+        _st = _await_status(lambda s: s.get('console_user') == 'sen'
+                            and s.get('state') == 'LOGIN')
+        check(_st.get('state') == 'LOGIN',
+              'autologin: console is parked at a login prompt', repr(_st.get('state')))
+        check(_st.get('console_user') == 'sen',
+              'autologin: the banner puts the console user in status.json',
+              repr(_st.get('console_user')))
+        check(_st.get('autologin_ago') is not None,
+              'autologin: status.json times the announcement')
+
+        _board_read()   # discard the daemon's startup CR
+        _aproc = subprocess.Popen(
+            [sys.argv[0], 'send', _adev, 'echo AUTOLOGIN_OK', '--timeout', '15'],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=_aenv)
+        time.sleep(2.0)
+        _during = _board_read()
+        check(b'root' not in _during,
+              'autologin: nothing is typed while the board logs itself in',
+              repr(_during))
+
+        # The board completes its own login; only now may the command go out.
+        os.write(_am, b'\r\nsen@op5-plus:~$ ')
+        _await_status(lambda s: s.get('state') == 'SHELL')
+        _after = b''
+        _dl = time.time() + 8
+        while time.time() < _dl and b'AUTOLOGIN_OK' not in _after:
+            _after += _board_read()
+            time.sleep(0.1)
+        check(b'echo AUTOLOGIN_OK' in _after,
+              'autologin: the command runs once the shell is up', repr(_after[-120:]))
+        check(b'root' not in _after,
+              'autologin: root is never typed at any point', repr(_after[-120:]))
+    finally:
+        if _aproc:
+            _aproc.kill(); _aproc.communicate()
+        subprocess.run([sys.argv[0], 'stop', '--force', _adev],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                       env=_aenv)
+        os.close(_am)
+        shutil.rmtree(_atd, ignore_errors=True)
+
     # ── Unit: one daemon per tty (duplicate-daemon guard) ─────────────────────
     # Two daemons on one tty make the kernel hand each byte to exactly one of
     # them, so a console shows roughly every other character.  daemon.pid alone
@@ -4952,7 +5293,7 @@ def main():
     sp.add_argument('--setup-terminal', action='store_true',
                     help='After --wait-shell, run stty cols 220 rows 50 to prevent wrapping')
     sp.add_argument('--timeout',    type=float, default=90.0)
-    sp.add_argument('--user',       default='root', help='Login username (default: root)')
+    sp.add_argument('--user',       default=None, help='Login username (default: whoever the console names — an autologin banner or a user@host prompt — else SERIAL_LOGIN_USER, LOGIN_USER= in serial-boards.conf, else root)')
     sp.add_argument('--password',   default=None,   help='Login password (None=skip if not prompted)')
     sp.add_argument('--json',       action='store_true')
 
@@ -4971,7 +5312,7 @@ def main():
     sp.add_argument('--timeout',        type=float, default=120.0)
     sp.add_argument('--no-login',       action='store_true', help='Do not auto-login after reboot (a console already at login: is still logged in first, or the reboot would be typed as a username)')
     sp.add_argument('--login',          action='store_true', help='(no-op, auto-login is default)')
-    sp.add_argument('--user',           default='root')
+    sp.add_argument('--user',           default=None, help='Login username (default: whoever the console names — an autologin banner or a user@host prompt — else SERIAL_LOGIN_USER, LOGIN_USER= in serial-boards.conf, else root)')
     sp.add_argument('--password',       default=None, help='Login password (None=skip if not prompted)')
     sp.add_argument('--setup-terminal', action='store_true', help='Run stty cols 220 after shell')
     sp.add_argument('--quiet',          action='store_true')
@@ -4989,6 +5330,10 @@ def main():
     dev(sp); sp.set_defaults(func=cmd_boot)
     sp.add_argument('--reset-cmd',      metavar='CMD', default=None,
                     help='Send CMD first to trigger the boot (e.g. reboot); default: wait for external reset')
+    sp.add_argument('--no-login',       action='store_true',
+                    help='Do not auto-login before sending --reset-cmd')
+    sp.add_argument('--user',           default=None, help='Login username (default: whoever the console names — an autologin banner or a user@host prompt — else SERIAL_LOGIN_USER, LOGIN_USER= in serial-boards.conf, else root)')
+    sp.add_argument('--password',       default=None)
     sp.add_argument('--timeout',        type=float, default=120.0)
     sp.add_argument('--capture-file',   metavar='PATH', default=None)
     sp.add_argument('--digest-lines',   type=int, default=BOOT_DIGEST_TAIL)
@@ -4998,8 +5343,12 @@ def main():
     sp = sub.add_parser('login',
         help='Send username/password and wait for shell prompt')
     dev(sp); sp.set_defaults(func=cmd_login)
-    sp.add_argument('--user',     default='root')
-    sp.add_argument('--password', default=None)
+    sp.add_argument('--user',     default=None, help='Login username (default: whoever the console names — an autologin banner or a user@host prompt — else SERIAL_LOGIN_USER, LOGIN_USER= in serial-boards.conf, else root)')
+    sp.add_argument('--password', default=None,
+                    help='Password (default: SERIAL_LOGIN_PASSWORD, else empty)')
+    sp.add_argument('--no-login', action='store_true',
+                    help='Refuse to log in (matches every other subcommand; '
+                         'SERIAL_NO_LOGIN=1 does the same globally)')
     sp.add_argument('--timeout',  type=float, default=90.0)
 
     sp = sub.add_parser('upload',
@@ -5013,6 +5362,10 @@ def main():
                     help='Board IP (auto-detected if omitted; only for --via-network)')
     sp.add_argument('--http-port',     type=int, default=8877,
                     help='Temporary HTTP server port (default 8877)')
+    sp.add_argument('--no-login',      action='store_true',
+                    help='Do not auto-login when the console is at a login prompt')
+    sp.add_argument('--user',          default=None, help='Login username (default: whoever the console names — an autologin banner or a user@host prompt — else SERIAL_LOGIN_USER, LOGIN_USER= in serial-boards.conf, else root)')
+    sp.add_argument('--password',      default=None)
     sp.add_argument('--quiet',         action='store_true')
 
     sp = sub.add_parser('run',
