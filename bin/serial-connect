@@ -206,7 +206,7 @@ launch() {
         # relay yields a silent PTY that looks like a working console.
         if ! timeout 2 bash -c "exec 3<>/dev/tcp/${agent_tcp%%:*}/${agent_tcp##*:}" 2>/dev/null; then
             echo -e "  ${RED}✗${NC}  serial-agent relay $agent_tcp is not accepting connections." >&2
-            echo -e "  Restart it:  serial-agent stop $dev --force && serial-agent start $dev --idle-timeout 0" >&2
+            echo -e "  Restart it:  serial-agent stop $dev --force && serial-agent start $dev --baud $baud --idle-timeout 0" >&2
             return 1
         fi
         # The accept loop runs from daemon start in its own thread and accepts
@@ -216,7 +216,7 @@ launch() {
         if [[ -f "$_sj" ]] && grep -q '"port_held": *false' "$_sj" 2>/dev/null; then
             echo -e "  ${RED}✗${NC}  the daemon is running but is NOT holding $dev." >&2
             echo -e "  The console would be silent and swallow every keystroke." >&2
-            echo -e "  Check the device still exists, then:  serial-agent stop $dev --force && serial-agent start $dev --idle-timeout 0" >&2
+            echo -e "  Check the device still exists, then:  serial-agent stop $dev --force && serial-agent start $dev --baud $baud --idle-timeout 0" >&2
             return 1
         fi
         local _relay_label="ser2net"

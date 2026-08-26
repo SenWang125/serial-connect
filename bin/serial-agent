@@ -529,13 +529,30 @@ def devdir(device: str) -> Path:
 
 # Baud → termios constant. Shared by initial open (_connect) and live
 # reprogramming (_set_baud_live) so the two paths can never drift apart.
+# A rate this platform's termios does not define is left OUT of the table, not
+# mapped onto B115200. Answering a request for 1500000 with 115200 is how a
+# board ends up transmitting at one rate while the host reads at another, and
+# the only symptom is an unreadable log.
 _BAUD_CONST = {
     9600: termios.B9600,   19200: termios.B19200,  38400: termios.B38400,
     57600: termios.B57600, 115200: termios.B115200, 230400: termios.B230400,
     460800: termios.B460800, 921600: termios.B921600,
-    1000000: getattr(termios, 'B1000000', termios.B115200),
-    1500000: getattr(termios, 'B1500000', termios.B115200),
 }
+for _r in (500000, 576000, 921600, 1000000, 1152000, 1500000, 2000000, 3000000):
+    _c = getattr(termios, f'B{_r}', None)
+    if _c is not None:
+        _BAUD_CONST[_r] = _c
+del _r, _c
+
+
+def _baud_const(baud: int) -> int:
+    """termios constant for a rate, or SystemExit naming what is supported."""
+    c = _BAUD_CONST.get(baud)
+    if c is None:
+        ok = ', '.join(str(b) for b in sorted(_BAUD_CONST))
+        raise SystemExit(f'serial-agent: {baud} baud is not supported by this '
+                         f'platform\'s termios.\n  supported: {ok}')
+    return c
 
 def ensure_symlink():
     """Keep /tmp/serial-agent pointing to the current user's storage.
@@ -696,7 +713,7 @@ class Daemon:
         else:
             _dev = self._stable_device()
             fd = os.open(_dev, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
-            bconst = _BAUD_CONST.get(self.baud, termios.B115200)
+            bconst = _baud_const(self.baud)
             saved = termios.tcgetattr(fd)
             attrs = list(saved)
             # Full raw-mode setup (cfmakeraw equivalent + daemon-specific flags).
@@ -755,7 +772,7 @@ class Daemon:
         """
         if self._fd is None or self._given_tcp:
             return False
-        bconst = _BAUD_CONST.get(new_baud, termios.B115200)
+        bconst = _baud_const(new_baud)
         attrs = termios.tcgetattr(self._fd)
         attrs[4] = bconst; attrs[5] = bconst
         termios.tcsetattr(self._fd, termios.TCSANOW, attrs)
@@ -1810,6 +1827,16 @@ def cmd_start(args):
         host, port = args.tcp.rsplit(':', 1)
         tcp = (host, int(port))
 
+    # An omitted --baud means "whatever this board is configured for", not
+    # 115200. The argparse default used to win over the config, so a board
+    # pinned at 1500000 came up at 115200 and its console read as noise.
+    pinned = _conf_baud(args.device)
+    if getattr(args, 'baud', None) is None:
+        args.baud = pinned if pinned else 115200
+    elif pinned and pinned != args.baud:
+        print(f'serial-agent: {args.device}: starting at {args.baud} baud, but '
+              f'serial-boards.conf pins this board at {pinned}', file=sys.stderr)
+
     ensure_symlink()
     AGENT_BASE.mkdir(parents=True, exist_ok=True)
 
@@ -2466,6 +2493,92 @@ def _read_status(device) -> dict:
         return {}
 
 
+def _parse_baud(s: str):
+    """Integer baud for '1.5M' / '115.2K' / '115200', or None. None means the
+    text is not a baud - never a default, so a typo cannot read as a choice."""
+    s = s.strip().upper()
+    try:
+        if s.endswith('M'):
+            return int(float(s[:-1]) * 1_000_000)
+        if s.endswith('K'):
+            return int(float(s[:-1]) * 1_000)
+        return int(s)
+    except ValueError:
+        return None
+
+
+def _dev_usb_ids(device: str):
+    """(serial, 'vid:pid') for a tty from sysfs, or (None, None) if unreadable.
+
+    (None, None) means "could not identify this adapter", which is not the same
+    as "the config says nothing about it" - the caller must not collapse them.
+    """
+    name = Path(device).name
+    d = Path('/sys/class/tty') / name / 'device'
+    try:
+        d = d.resolve(strict=True)
+    except OSError:
+        return None, None
+    for _ in range(8):
+        vid, pid = d / 'idVendor', d / 'idProduct'
+        if vid.exists() and pid.exists():
+            try:
+                ser = (d / 'serial').read_text().strip() if (d / 'serial').exists() else ''
+                return ser, f'{vid.read_text().strip()}:{pid.read_text().strip()}'
+            except OSError:
+                return None, None
+        if d.parent == d:
+            break
+        d = d.parent
+    return None, None
+
+
+def _conf_baud(device: str):
+    """Baud for this device from serial-boards.conf, or None if it says nothing.
+
+    Same precedence as serial-common.sh get_baud(): per-board pin, then the chip
+    table, then the vendor wildcard. Two-layer file model as _conf_login_user.
+    """
+    ser, vidpid = _dev_usb_ids(device)
+    if vidpid is None:
+        return None
+    vid = vidpid.split(':')[0]
+    by_serial, by_chip, by_vendor = {}, {}, {}
+    confs: list = [_resolve_board_cfg()]
+    if str(_SCRIPT_DIR).startswith(('/usr/', '/opt/')):
+        confs.insert(0, Path('/etc/serial-boards.conf'))
+    for cfg in confs:
+        try:
+            lines = cfg.read_text().splitlines()
+        except OSError:
+            continue
+        for line in lines:
+            line = line.split('#')[0].strip()
+            key, sep, val = line.partition('=')
+            if not sep:
+                continue
+            key, val = key.strip(), val.strip()
+            if ':' not in val:
+                continue
+            b = _parse_baud(val.rsplit(':', 1)[1])
+            if b is None:
+                print(f'serial-boards.conf: {key}={val}: not a baud rate, ignoring',
+                      file=sys.stderr)
+                continue
+            kl = key.lower()
+            if re.fullmatch(r'[0-9a-f]{4}:xxxx', kl):
+                by_vendor.setdefault(kl.split(':')[0], b)
+            elif re.fullmatch(r'[0-9a-f]{4}:[0-9a-f]{4}', kl):
+                by_chip.setdefault(kl, b)
+            else:
+                by_serial.setdefault(key, b)
+    if ser and ser in by_serial:
+        return by_serial[ser]
+    if vidpid.lower() in by_chip:
+        return by_chip[vidpid.lower()]
+    return by_vendor.get(vid.lower())
+
+
 def _conf_login_user() -> str:
     """LOGIN_USER from serial-boards.conf, or '' — same two-layer model as
     _relay_base_port (system config first for a global install, user config
@@ -2584,6 +2697,13 @@ def _maybe_auto_login(args):
     if _login_suppressed(args):
         return
     device = args.device
+    # A human at the console is already logging in, or deliberately is not.
+    # Typing a username underneath them lands as stray characters in their
+    # terminal and reads as the link dropping input.
+    if _human_session_active(device):
+        print(f'[serial-agent] {device}: human session active — not logging in',
+              file=sys.stderr)
+        return
     st = _read_status(device)
     if not st or not _needs_login(st, getattr(args, 'login', False)):
         return
@@ -3313,7 +3433,7 @@ def cmd_connect(args):
     if getattr(args, 'device', None):
         _d = args.device if args.device.startswith('/dev/') else f'/dev/{args.device}'
         if not _daemon_running(_d):
-            cmd_start(argparse.Namespace(device=_d, baud=115200, lines=500,
+            cmd_start(argparse.Namespace(device=_d, baud=None, lines=500,
                                          idle_timeout=0, tcp=None, no_ser2net=False))
         if args.wait_shell and not _wait_state(_d, 'SHELL,LOGIN,PASSWORD,UBOOT',
                                                args.timeout,
@@ -5163,7 +5283,9 @@ def main():
                     help='Connect via this TCP endpoint (ser2net). Overrides auto-detect.')
     sp.add_argument('--no-ser2net', action='store_true',
                     help='Force direct port access even if ser2net is configured for it')
-    sp.add_argument('--baud', type=int, default=115200)
+    sp.add_argument('--baud', type=int, default=None,
+                    help='Override the rate. Default: the pin for this board in '
+                         'serial-boards.conf, else 115200.')
     sp.add_argument('--lines',type=int, default=DEFAULT_LINES)
     sp.add_argument('--idle-timeout', type=int, default=0, dest='idle_timeout',
                     metavar='SECS',

@@ -97,6 +97,11 @@ _daemon_board_state() {
 
 # ── parse_baud ─────────────────────────────────────────────────────────────────
 # Convert human-readable baud string to integer: 1.5M→1500000, 115.2K→115200
+# Prints the integer baud and returns 0, or prints nothing and returns 1 when the
+# input is not a baud. It must not answer with a valid rate for an invalid input:
+# returning PROBE_BAUDS[0] here made every "(( b > 0 ))" guard below unable to
+# fail, and turned a typo in serial-boards.conf into a silent 115200 that is
+# indistinguishable from a deliberate one.
 parse_baud() {
     local s="${1^^}"; s="${s//[[:space:]]/}"
     local int frac flen fi
@@ -111,8 +116,16 @@ parse_baud() {
         (( flen > 0 )) && fi=$(( frac * 1000 / (10 ** flen) ))
         echo $(( int * 1000 + fi ))
     elif [[ "$s" =~ ^[0-9]+$ ]]; then echo "$s"
-    else echo "${PROBE_BAUDS[0]}"
+    else return 1
     fi
+}
+
+# ── _baud_reject ───────────────────────────────────────────────────────────────
+# Say which file, key and value were dropped. A baud that is silently ignored is
+# the same failure as one that is silently defaulted.
+_baud_reject() {
+    echo "serial-boards.conf: ${2}=${3}: '${4}' is not a baud rate, ignoring" >&2
+    echo "  (accepted: 115200, 115.2K, 1.5M)  file: ${1}" >&2
 }
 
 # ── baud_display ───────────────────────────────────────────────────────────────
@@ -151,7 +164,8 @@ _load_conf_file() {
         [[ "$key" =~ ^[[:space:]]*# || -z "${key// /}" ]] && continue
         key="${key// /}"; val="${val%%#*}"; val="${val// /}"
         if (( labels_only )); then
-            # User label conf: only process board serial→label entries
+            # User conf: board serial entries only — the label and, if given,
+            # that board's pinned baud. Chip table and probe tuning stay global.
             [[ "$key" =~ ^[0-9a-fA-F]{4}: ]] && continue  # skip chip table
             [[ "$key" =~ ^(PROBE_|REPROBE_) ]] && continue # skip probe tuning
         fi
@@ -172,8 +186,11 @@ _load_conf_file() {
             IFS=',' read -ra _blist <<< "$val"
             for _b in "${_blist[@]}"; do
                 _b="${_b// /}"
-                _braw=$(parse_baud "$_b")
-                (( _braw > 0 )) && PROBE_BAUDS+=("$_braw")
+                if _braw=$(parse_baud "$_b"); then
+                    PROBE_BAUDS+=("$_braw")
+                else
+                    _baud_reject "$file" PROBE_BAUDS "$val" "$_b"
+                fi
             done
             continue
         fi
@@ -182,8 +199,12 @@ _load_conf_file() {
             local chip_name="${val%%:*}"
             [[ -n "$chip_name" ]] && CHIP_NAMES["$key"]="$chip_name"
             if [[ "$val" == *:* ]]; then
-                local cb; cb=$(parse_baud "${val##*:}")
-                (( cb > 0 )) && CHIP_BAUD["$key"]="$cb"
+                local cb
+                if cb=$(parse_baud "${val##*:}"); then
+                    CHIP_BAUD["$key"]="$cb"
+                else
+                    _baud_reject "$file" "$key" "$val" "${val##*:}"
+                fi
             fi
             continue
         fi
@@ -192,8 +213,12 @@ _load_conf_file() {
             local vid="${key%%:*}" wname="${val%%:*}"
             [[ -n "$wname" ]] && CHIP_WILDCARD["$vid"]="$wname"
             if [[ "$val" == *:* ]]; then
-                local wcb; wcb=$(parse_baud "${val##*:}")
-                (( wcb > 0 )) && CHIP_BAUD_WILDCARD["$vid"]="$wcb"
+                local wcb
+                if wcb=$(parse_baud "${val##*:}"); then
+                    CHIP_BAUD_WILDCARD["$vid"]="$wcb"
+                else
+                    _baud_reject "$file" "$key" "$val" "${val##*:}"
+                fi
             fi
             continue
         fi
@@ -201,8 +226,12 @@ _load_conf_file() {
         local label="${val%%:*}" extra="${val##*:}"
         CFG_LABEL["$key"]="$label"
         if [[ "$val" == *:* && -n "$extra" ]]; then
-            local b; b=$(parse_baud "$extra")
-            (( b > 9600 )) && CFG_BAUD["$key"]="$b"
+            local b
+            if b=$(parse_baud "$extra"); then
+                CFG_BAUD["$key"]="$b"
+            else
+                _baud_reject "$file" "$key" "$val" "$extra"
+            fi
         fi
     done < "$file"
 }
@@ -210,7 +239,7 @@ _load_conf_file() {
 load_config() {
     _load_conf_file "$_SYSTEM_CFG" 0          # chip table + probe settings + shared labels
     [[ "$_LABEL_CFG" != "$_SYSTEM_CFG" ]] && \
-        _load_conf_file "$_LABEL_CFG" 1        # per-user label overrides (labels only)
+        _load_conf_file "$_LABEL_CFG" 1        # per-user board labels and baud pins
 }
 
 # ── get_baud ───────────────────────────────────────────────────────────────────

@@ -55,6 +55,28 @@ if not d['daemon_running']:
 subprocess.run(['serial-agent','wait-alive', dev,'--timeout','60'], check=True)
 ```
 
+### Where a daemon's initial baud comes from
+
+`serial-agent start` with no `--baud` takes the rate from `serial-boards.conf`,
+in the same order `serial-common.sh` `get_baud()` uses:
+
+1. the board's own pin, `SERIAL=NAME:BAUD`
+2. the chip table, `VID:PID=NAME:BAUD`
+3. the vendor wildcard, `VID:xxxx=NAME:BAUD`
+4. 115200
+
+Pin the rate on the **board**, not the adapter, when the two disagree — the rate
+belongs to the board's console, and the same USB adapter gets moved between
+boards. Passing `--baud` explicitly still wins, but prints a warning if it
+contradicts the config.
+
+Nothing in this path substitutes a rate it could not work out. An unparseable
+value in the config is reported and skipped, a rate this platform's termios does
+not define is an error rather than a fallback to 115200, and an adapter that
+cannot be identified resolves to "no answer" rather than to a rate. A console
+where the two ends disagree on the rate produces a log that looks like a
+transport fault, so a wrong-but-plausible answer costs more than no answer.
+
 ### Changing baud on an already-running daemon
 
 A running daemon owns the real device — `--baud` on `serial-agent start` only
