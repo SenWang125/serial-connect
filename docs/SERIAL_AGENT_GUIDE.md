@@ -55,6 +55,15 @@ if not d['daemon_running']:
 subprocess.run(['serial-agent','wait-alive', dev,'--timeout','60'], check=True)
 ```
 
+### Auto-login stands down for a human session
+
+`send`, `watch`, `run`, `upload`, `boot` and `reboot` log in first when the
+console sits at a login prompt — except while `serial-connect`'s state file says
+a person has a tio session open on that device. Typing a username underneath
+someone lands as stray characters in their terminal and looks like the link
+dropping input. `serial-agent login <dev>` is the explicit path and is not
+affected.
+
 ### Where a daemon's initial baud comes from
 
 `serial-agent start` with no `--baud` takes the rate from `serial-boards.conf`,
